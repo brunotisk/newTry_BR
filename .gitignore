@@ -1,0 +1,18 @@
+# Dependências
+.venv/
+venv/
+ENV/
+
+# Builds e Saídas de Compilação
+/.next/
+/out/
+/build
+/dist
+*.egg-info/
+
+# Arquivos de Ambiente e Credenciais (MUITO IMPORTANTE)
+.env
+.env*.local
+.env.production
+.env.staging
+!.env.example
