@@ -3,6 +3,7 @@ import streamlit as st
 from telas.produtos import tela_produtos
 from telas.categorias import tela_categorias
 from telas.importar_nf import tela_importar_nf
+from telas.report import tela_report
 from auth import autenticar_usuario, renderizar_logout_sidebar
 
 
@@ -24,7 +25,8 @@ opcao = st.sidebar.radio(
     [
         "📦 Listar Produtos",
         "🏷️ Cadastrar Categorias",
-        "📄 Importar NF"
+        "📄 Importar NF",
+        "📊 Relatórios"
     ]
 )
 
@@ -37,3 +39,6 @@ elif opcao == "🏷️ Cadastrar Categorias":
 
 elif opcao == "📄 Importar NF":
     tela_importar_nf()
+
+elif opcao == "📊 Relatórios":
+    tela_report()
