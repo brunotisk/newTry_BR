@@ -4,7 +4,6 @@ from db import supabase
 
 
 def tela_produtos():
-    # CSS para diminuir o espaçamento do divisor (linha)
     st.markdown("""
         <style>
         div[data-testid="stDivider"] {
@@ -25,7 +24,6 @@ def tela_produtos():
         )
         categorias = response_cat.data or []
 
-        # Dicionário de consulta rápida para preencher a tabela e o dropdown
         cat_dict = {
             cat["id"]: {
                 "categoria": cat["categoria"],
@@ -45,40 +43,50 @@ def tela_produtos():
         with col_filtro:
             filtrar_sem_cat = st.toggle("Apenas sem categoria", value=False)
 
-        # 2. Construção da query no Supabase com paginação (50 itens por página)
-        # Inicializa o estado da página se não existir ou se os filtros mudarem
+        # Inicializa o estado da página
         if "pagina_atual" not in st.session_state:
             st.session_state.pagina_atual = 1
+
+        # Reseta para a página 1 se qualquer filtro mudar
+        chave_filtro = f"{busca_codigo}_{filtrar_sem_cat}"
+        if st.session_state.get("chave_filtro_ant") != chave_filtro:
+            st.session_state.pagina_atual = 1
+            st.session_state.chave_filtro_ant = chave_filtro
 
         itens_por_pagina = 50
         offset = (st.session_state.pagina_atual - 1) * itens_por_pagina
 
+        # 2. Construção da query com contagem total
         query = supabase.table("produtos").select("id, codigo_interno, descricao, categoria_id, ultima_compra, nr_compras", count="exact")
 
-        # Aplicar filtros na query
         if filtrar_sem_cat:
             query = query.is_("categoria_id", "null")
 
         if busca_codigo:
             query = query.ilike("codigo_interno", f"%{busca_codigo.strip()}%")
 
-        # Executa a query com paginação ordenada por id
+        # Primeira tentativa de busca
         response_prod = query.order("id").range(offset, offset + itens_por_pagina - 1).execute()
-        produtos = response_prod.data or []
-        total_itens = response_prod.count if response_prod.count is not None else len(produtos)
+        total_itens = response_prod.count if response_prod.count is not None else 0
 
+        # Trava de segurança: se o offset for maior que o total retornado, força volta para a página 1
+        if offset >= total_itens and total_itens > 0:
+            st.session_state.pagina_atual = 1
+            offset = 0
+            response_prod = query.order("id").range(offset, offset + itens_por_pagina - 1).execute()
+
+        produtos = response_prod.data or []
         total_paginas = math.ceil(total_itens / itens_por_pagina) if total_itens > 0 else 1
 
         with col_titulo:
             st.header(f"📦 Produtos ({total_itens} Itens)")
 
         if not produtos:
-            st.info("Nenhum produto encontrado.")
+            st.info("Nenhum produto encontrado para o filtro digitado.")
             return
 
-        # 3. Tabela dentro de Container com borda externa
+        # 3. Tabela dentro de Container
         with st.container(border=True):
-            # Cabeçalho da Tabela (removida 'unidade', adicionadas 'ultima_compra' e 'nr_compras')
             c_id, c_cod, c_desc, c_cat, c_banho, c_ult_compra, c_nr_compra, c_acao = st.columns([1, 2, 3, 2, 2, 2, 1, 1])
 
             c_id.markdown("**id**")
@@ -92,7 +100,6 @@ def tela_produtos():
 
             st.divider()
 
-            # Linhas da Tabela
             for prod in produtos:
                 col_id, col_cod, col_desc, col_cat, col_banho, col_ult_compra, col_nr_compra, col_acao = st.columns([1, 2, 3, 2, 2, 2, 1, 1])
 
@@ -113,7 +120,6 @@ def tela_produtos():
                 col_ult_compra.write(str(prod.get("ultima_compra")) if prod.get("ultima_compra") else "-")
                 col_nr_compra.write(str(prod.get("nr_compras", 0)))
 
-                # Botão Lápis com Popover
                 if cat_ids:
                     with col_acao.popover("✏️"):
                         st.markdown("**Vincular Categoria**")
