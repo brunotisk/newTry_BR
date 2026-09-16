@@ -44,17 +44,17 @@ def tela_produtos():
             filtrar_sem_cat = st.toggle("Apenas sem categoria", value=False)
 
         # Inicializa o estado da página
-        if "pagina_atual" not in st.session_state:
-            st.session_state.pagina_atual = 1
+        if "pagina_atual_produtos" not in st.session_state:
+            st.session_state.pagina_atual_produtos = 1
 
         # Reseta para a página 1 se qualquer filtro mudar
         chave_filtro = f"{busca_codigo}_{filtrar_sem_cat}"
         if st.session_state.get("chave_filtro_ant") != chave_filtro:
-            st.session_state.pagina_atual = 1
+            st.session_state.pagina_atual_produtos = 1
             st.session_state.chave_filtro_ant = chave_filtro
 
         itens_por_pagina = 50
-        offset = (st.session_state.pagina_atual - 1) * itens_por_pagina
+        offset = (st.session_state.pagina_atual_produtos - 1) * itens_por_pagina
 
         # 2. Construção da query com contagem total
         query = supabase.table("produtos").select("id, codigo_interno, descricao, categoria_id, ultima_compra, nr_compras", count="exact")
@@ -71,7 +71,7 @@ def tela_produtos():
 
         # Trava de segurança: se o offset for maior que o total retornado, força volta para a página 1
         if offset >= total_itens and total_itens > 0:
-            st.session_state.pagina_atual = 1
+            st.session_state.pagina_atual_produtos = 1
             offset = 0
             response_prod = query.order("id").range(offset, offset + itens_por_pagina - 1).execute()
 
@@ -153,15 +153,15 @@ def tela_produtos():
                     f"Página (1 de {total_paginas})",
                     min_value=1,
                     max_value=total_paginas,
-                    value=st.session_state.pagina_atual,
+                    value=st.session_state.pagina_atual_produtos,
                     step=1,
                     key="input_pagina_nav"
                 )
-                if nova_pagina != st.session_state.pagina_atual:
-                    st.session_state.pagina_atual = nova_pagina
+                if nova_pagina != st.session_state.pagina_atual_produtos:
+                    st.session_state.pagina_atual_produtos = nova_pagina
                     st.rerun()
 
-        st.caption(f"Exibindo página {st.session_state.pagina_atual} de {total_paginas} ({total_itens} registros no total).")
+        st.caption(f"Exibindo página {st.session_state.pagina_atual_produtos} de {total_paginas} ({total_itens} registros no total).")
 
     except Exception as e:
         st.error(f"Erro ao consultar produtos: {e}")

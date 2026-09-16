@@ -106,7 +106,7 @@ def upsert_produto(sb: Client, item, data_emissao) -> int:
     return resp.data[0]["id"]
 
 
-def inserir_item_e_atualizar_estoque(sb: Client, compra_id: int, produto_id: int, item, data_emissao):
+def inserir_item_e_atualizar_estoque(sb: Client, compra_id: int, produto_id: int, item):
     item_resp = sb.table("compras_itens").insert({
         "compra_id": compra_id,
         "produto_id": produto_id,
@@ -116,6 +116,7 @@ def inserir_item_e_atualizar_estoque(sb: Client, compra_id: int, produto_id: int
         "valor_desconto": float(item.valor_desconto),
         "valor_total": float(item.valor_total),
     }).execute()
+    compra_item_id = item_resp.data[0]["id"]
 
     # saldo atual do produto (0 se ainda não existir linha de estoque)
     estoque_resp = sb.table("estoque").select("quantidade_atual").eq("produto_id", produto_id).execute()
@@ -127,15 +128,12 @@ def inserir_item_e_atualizar_estoque(sb: Client, compra_id: int, produto_id: int
         "quantidade_atual": novo_saldo,
     }, on_conflict="produto_id").execute()
 
-    data_movimento = data_emissao.isoformat()[:10] if hasattr(data_emissao, "isoformat") else str(data_emissao)[:10]
-
     sb.table("estoque_movimentos").insert({
         "produto_id": produto_id,
-        "compra_id": compra_id,
+        "compra_item_id": compra_item_id,
         "tipo": "entrada",
         "quantidade": float(item.quantidade),
         "saldo_apos": novo_saldo,
-        "data_movimento": data_movimento,
     }).execute()
 
 
@@ -153,7 +151,7 @@ def importar_nfe(caminho_xml: str) -> dict:
     for item in nota.itens:
         # Passa a data da nota para calcular ultima_compra e nr_compras
         produto_id = upsert_produto(sb, item, nota.data_emissao)
-        inserir_item_e_atualizar_estoque(sb, compra_id, produto_id, item, nota.data_emissao)
+        inserir_item_e_atualizar_estoque(sb, compra_id, produto_id, item)
 
     return {
         "status": "importado",
