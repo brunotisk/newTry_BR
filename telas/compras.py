@@ -1,11 +1,10 @@
 import streamlit as st
 from datetime import datetime
 from db import supabase
+from telas.importar_nf import tela_importar_nf
 
 
-def tela_compras():
-    st.header("Compras")
-
+def _secao_listagem():
     try:
         # 1. Consulta dos dados na tabela 'compras'
         response = (
@@ -134,3 +133,15 @@ def tela_compras():
 
     except Exception as e:
         st.error(f"Erro ao carregar dados de compras: {e}")
+
+
+def tela_compras():
+    st.header("🛍️ Compras")
+
+    aba_listagem, aba_importar = st.tabs(["Compras registradas", "Importar NF-e (XML)"])
+
+    with aba_listagem:
+        _secao_listagem()
+
+    with aba_importar:
+        tela_importar_nf()

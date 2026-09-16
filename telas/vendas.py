@@ -4,6 +4,7 @@ from datetime import datetime
 
 from db import supabase
 from vendas_import import ler_planilha, importar_vendas_excel
+from telas.vendas_manual import tela_vendas_manual
 
 
 def _fmt_moeda(valor) -> str:
@@ -138,10 +139,15 @@ def _secao_listagem():
 def tela_vendas():
     st.header("💰 Gestão de Vendas")
 
-    aba_importar, aba_listagem = st.tabs(["Importar planilha", "Vendas registradas"])
+    aba_listagem, aba_importar, aba_manual = st.tabs(
+        ["Vendas registradas", "Importar planilha", "Cadastrar venda"]
+    )
+
+    with aba_listagem:
+        _secao_listagem()
 
     with aba_importar:
         _secao_importar()
 
-    with aba_listagem:
-        _secao_listagem()
+    with aba_manual:
+        tela_vendas_manual()

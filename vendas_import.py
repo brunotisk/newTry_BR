@@ -149,7 +149,7 @@ def ler_planilha(caminho_arquivo) -> pd.DataFrame:
     return df
 
 
-def _buscar_produto_id(sb: Client, codigo_interno: str) -> int | None:
+def buscar_produto_id(sb: Client, codigo_interno: str) -> int | None:
     resp = (
         sb.table("produtos")
         .select("id")
@@ -159,7 +159,7 @@ def _buscar_produto_id(sb: Client, codigo_interno: str) -> int | None:
     return resp.data[0]["id"] if resp.data else None
 
 
-def _venda_ja_existe(sb: Client, produto_id: int, data_venda: str, valor_total: float, cliente: str) -> bool:
+def venda_ja_existe(sb: Client, produto_id: int, data_venda: str, valor_total: float, cliente: str) -> bool:
     """Checagem de duplicidade: mesma combinação de produto + data + valor + cliente.
     A planilha não tem um identificador único por linha, então essa é uma
     aproximação razoável para evitar reimportar a mesma venda duas vezes."""
@@ -175,7 +175,7 @@ def _venda_ja_existe(sb: Client, produto_id: int, data_venda: str, valor_total: 
     return len(resp.data) > 0
 
 
-def _inserir_venda_e_baixar_estoque(sb: Client, linha: dict, produto_id: int) -> int:
+def inserir_venda_e_baixar_estoque(sb: Client, linha: dict, produto_id: int) -> int:
     venda_resp = sb.table("vendas").insert({
         "produto_id": produto_id,
         "canal_venda": linha["canal_venda"],
@@ -226,7 +226,7 @@ def importar_vendas_excel(caminho_arquivo) -> dict:
         numero_linha = idx + 2  # aproximação da linha na planilha original
         try:
             codigo = str(row["codigo_interno"]).strip()
-            produto_id = _buscar_produto_id(sb, codigo)
+            produto_id = buscar_produto_id(sb, codigo)
             if produto_id is None:
                 erros.append(f"Linha {numero_linha}: produto com código '{codigo}' não encontrado.")
                 continue
@@ -242,11 +242,11 @@ def importar_vendas_excel(caminho_arquivo) -> dict:
                 "cliente": str(row.get("cliente") or "").strip(),
             }
 
-            if _venda_ja_existe(sb, produto_id, linha["data_venda"], float(linha["valor_total"]), linha["cliente"]):
+            if venda_ja_existe(sb, produto_id, linha["data_venda"], float(linha["valor_total"]), linha["cliente"]):
                 duplicadas += 1
                 continue
 
-            _inserir_venda_e_baixar_estoque(sb, linha, produto_id)
+            inserir_venda_e_baixar_estoque(sb, linha, produto_id)
             importadas += 1
 
         except Exception as e:
