@@ -27,6 +27,7 @@ Instalar: pip install pandas openpyxl
 """
 from __future__ import annotations
 import os
+import re
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 
@@ -35,6 +36,11 @@ from dotenv import load_dotenv
 from supabase import create_client, Client
 
 load_dotenv()
+
+# Formato do código interno no banco: string numérica com zeros à esquerda,
+# ex.: "0024727". Ajuste a largura abaixo se o padrão do seu banco for diferente.
+LARGURA_CODIGO_INTERNO = 7
+PADRAO_CODIGO_INTERNO = re.compile(rf"^\d{{{LARGURA_CODIGO_INTERNO}}}$")
 
 # Ordem das colunas quando a planilha NÃO tem cabeçalho
 COLUNAS_SEM_CABECALHO = [
@@ -77,6 +83,36 @@ MAPA_CABECALHO = {
 }
 
 COLUNAS_OBRIGATORIAS = ["codigo_interno", "quantidade", "valor_total", "data_venda"]
+
+
+def normalizar_codigo_interno(valor) -> str:
+    """Normaliza o código interno lido do Excel para o mesmo formato usado no banco:
+    string numérica com zeros à esquerda (ex.: "0024727").
+
+    O Excel/pandas costuma guardar/ler esse tipo de código como número, o que
+    derruba os zeros à esquerda (0024727 -> 24727, ou até 24727.0). Aqui a gente
+    reconstrói o texto original antes de comparar com o banco.
+    """
+    if valor is None or (isinstance(valor, float) and pd.isna(valor)):
+        return ""
+
+    if isinstance(valor, (int, float)):
+        texto = str(int(valor))
+    else:
+        texto = str(valor).strip()
+        if texto.endswith(".0"):  # ex.: célula veio como texto "24727.0"
+            texto = texto[:-2]
+
+    if texto.isdigit():
+        texto = texto.zfill(LARGURA_CODIGO_INTERNO)
+
+    return texto
+
+
+def validar_codigo_interno(codigo: str) -> bool:
+    """Confere se o código já normalizado bate com o formato esperado
+    (LARGURA_CODIGO_INTERNO dígitos numéricos)."""
+    return bool(PADRAO_CODIGO_INTERNO.fullmatch(codigo))
 
 
 def get_client() -> Client:
@@ -225,7 +261,19 @@ def importar_vendas_excel(caminho_arquivo) -> dict:
     for idx, row in df.iterrows():
         numero_linha = idx + 2  # aproximação da linha na planilha original
         try:
-            codigo = str(row["codigo_interno"]).strip()
+            codigo = normalizar_codigo_interno(row["codigo_interno"])
+
+            if not codigo:
+                erros.append(f"Linha {numero_linha}: código interno vazio.")
+                continue
+
+            if not validar_codigo_interno(codigo):
+                erros.append(
+                    f"Linha {numero_linha}: código '{codigo}' fora do formato esperado "
+                    f"({LARGURA_CODIGO_INTERNO} dígitos numéricos, ex.: '0024727')."
+                )
+                continue
+
             produto_id = buscar_produto_id(sb, codigo)
             if produto_id is None:
                 erros.append(f"Linha {numero_linha}: produto com código '{codigo}' não encontrado.")
