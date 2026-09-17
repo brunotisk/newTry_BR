@@ -93,7 +93,6 @@ PAGINAS = {
     "💰 Vendas": tela_vendas,
     "📊 Controle de Estoque": tela_estoque,
     "👤 Clientes": tela_clientes,
-    "🏷️ Cadastrar Categorias": tela_categorias,
     "📈 Relatórios": tela_report,
 }
 
@@ -120,6 +119,7 @@ with st.sidebar:
 renderizar_botao_sair()
 
 #    "📄 Importar NF": tela_importar_nf,
+#    "🏷️ Cadastrar Categorias": tela_categorias,
 # 5. Cabeçalho e roteamento da página selecionada
 st.title("Sistema de Semijoias - Bruno I.")
 

@@ -1,9 +1,10 @@
 import streamlit as st
 import math
 from db import supabase
+from telas.categorias import tela_categorias
 
 
-def tela_produtos():
+def _secao_consulta():
     st.markdown("""
         <style>
         div[data-testid="stDivider"] {
@@ -165,3 +166,13 @@ def tela_produtos():
 
     except Exception as e:
         st.error(f"Erro ao consultar produtos: {e}")
+
+
+def tela_produtos():
+    aba_consulta, aba_categorias = st.tabs(["Consulta Produto", "Cadastrar categorias"])
+
+    with aba_consulta:
+        _secao_consulta()
+
+    with aba_categorias:
+        tela_categorias()
