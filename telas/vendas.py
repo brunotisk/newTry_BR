@@ -1,11 +1,19 @@
 import streamlit as st
 import tempfile
-from datetime import datetime
+import math
+from datetime import date, datetime
+from typing import Optional
 
 from db import supabase
 from vendas_import import ler_planilha, importar_vendas_excel
 from telas.vendas_manual import tela_vendas_manual
 from telas.cadastros_auxiliares import tela_cadastros_auxiliares
+
+MESES_PT = {
+    1: "Janeiro", 2: "Fevereiro", 3: "Março", 4: "Abril",
+    5: "Maio", 6: "Junho", 7: "Julho", 8: "Agosto",
+    9: "Setembro", 10: "Outubro", 11: "Novembro", 12: "Dezembro",
+}
 
 
 def _fmt_moeda(valor) -> str:
@@ -15,6 +23,54 @@ def _fmt_moeda(valor) -> str:
         .replace(".", ",")
         .replace("X", ".")
     )
+
+
+def _parse_data_segura(valor):
+    """Converte 'YYYY-MM-DD...' (ou vazio/None/inválido) em date, sem lançar exceção."""
+    texto = str(valor or "")[:10]
+    if not texto:
+        return None
+    try:
+        return datetime.strptime(texto, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def _injetar_estilo_kpi():
+    """Evita que o valor dos st.metric seja cortado com reticências quando
+    o card fica estreito (ex.: 4 cartões numa linha)."""
+    st.markdown(
+        """
+        <style>
+        div[data-testid="stMetricValue"] {
+            overflow: visible;
+            white-space: normal;
+            word-break: break-word;
+            font-size: 1.35rem;
+            line-height: 1.2;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _kpi_card(titulo: str, qtd: int, valor: float, subtitulo: Optional[str] = None):
+    with st.container(border=True):
+        st.markdown(
+            f"<div style='text-align:center; font-weight:700; margin-bottom:0.1rem;'>{titulo}</div>",
+            unsafe_allow_html=True,
+        )
+        if subtitulo:
+            st.markdown(
+                f"<div style='text-align:center; font-size:0.75rem; color:#9aa0ab; margin-bottom:0.3rem;'>{subtitulo}</div>",
+                unsafe_allow_html=True,
+            )
+        col_qtd, col_valor = st.columns(2)
+        with col_qtd:
+            st.metric("Qtd. Vendas", qtd)
+        with col_valor:
+            st.metric("Valor", _fmt_moeda(valor))
 
 
 def _secao_importar():
@@ -57,54 +113,211 @@ def _secao_importar():
                     st.write(f"- {erro}")
 
 
+def _resetar_filtros_vendas():
+    """Callback do botão 'Limpar filtros'. Precisa ser um on_click (e não um
+    'if st.button(...)' com atribuição direta), porque alterar
+    st.session_state de uma key que já foi usada por um widget nessa MESMA
+    execução do script dispara StreamlitWidgetAlreadyInstantiatedError. Um
+    callback roda ANTES do script ser reexecutado do zero, então é seguro."""
+    st.session_state["vendas_filtro_mes"] = "Todos"
+    st.session_state["vendas_filtro_canal"] = "Todos"
+    st.session_state["pagina_atual_vendas"] = 1
+
+
 def _secao_listagem():
+    # ------------------------------------------------------------------
+    # 1) Dataset leve com TODAS as vendas (valor_total, data_venda e o nome
+    #    do canal), usado para os KPIs fixos (Total/Ano/Mês atual), para o
+    #    KPI "Filtros" e para montar as opções do filtro de mês/ano.
+    # ------------------------------------------------------------------
     try:
-        response = (
+        response_kpi = (
+            supabase
+            .table("vendas")
+            .select("valor_total, data_venda, canais_venda(nome)")
+            .execute()
+        )
+        vendas_kpi = response_kpi.data or []
+    except Exception as e:
+        st.error(f"Erro ao carregar vendas: {e}")
+        return
+
+    hoje = date.today()
+    ano_atual, mes_atual = hoje.year, hoje.month
+
+    def _acumula(filtro):
+        qtd, soma = 0, 0.0
+        for v in vendas_kpi:
+            dt = _parse_data_segura(v.get("data_venda"))
+            if dt is None or not filtro(v, dt):
+                continue
+            qtd += 1
+            soma += float(v.get("valor_total") or 0)
+        return qtd, soma
+
+    qtd_total = len(vendas_kpi)
+    soma_total = sum(float(v.get("valor_total") or 0) for v in vendas_kpi)
+    qtd_ano, soma_ano = _acumula(lambda v, dt: dt.year == ano_atual)
+    qtd_mes_atual, soma_mes_atual = _acumula(lambda v, dt: dt.year == ano_atual and dt.month == mes_atual)
+
+    # ------------------------------------------------------------------
+    # 2) Opções de filtro (mês/ano e canal), calculadas antes dos cards
+    #    para que o card "Filtros" já reflita a seleção atual.
+    # ------------------------------------------------------------------
+    meses_disponiveis = sorted(
+        {
+            (dt.year, dt.month)
+            for v in vendas_kpi
+            if (dt := _parse_data_segura(v.get("data_venda"))) is not None
+        },
+        reverse=True,
+    )
+    opcoes_mes = ["Todos"] + [f"{MESES_PT[m]}/{a}" for (a, m) in meses_disponiveis]
+
+    try:
+        response_canais = (
+            supabase.table("canais_venda")
+            .select("id, nome")
+            .order("nome")
+            .execute()
+        )
+        canais_disponiveis = response_canais.data or []
+    except Exception:
+        canais_disponiveis = []  # filtro de canal fica indisponível se a consulta falhar
+
+    opcoes_canal = ["Todos"] + [c["nome"] for c in canais_disponiveis]
+
+    # Seleção atual dos filtros (lida do session_state, com fallback seguro
+    # caso a lista de opções tenha mudado desde a última execução)
+    mes_selecionado_atual = st.session_state.get("vendas_filtro_mes", "Todos")
+    if mes_selecionado_atual not in opcoes_mes:
+        mes_selecionado_atual = "Todos"
+    canal_selecionado_atual = st.session_state.get("vendas_filtro_canal", "Todos")
+    if canal_selecionado_atual not in opcoes_canal:
+        canal_selecionado_atual = "Todos"
+
+    def _bate_filtro_atual(v, dt):
+        if mes_selecionado_atual != "Todos":
+            ano_f, mes_f = meses_disponiveis[opcoes_mes.index(mes_selecionado_atual) - 1]
+            if dt.year != ano_f or dt.month != mes_f:
+                return False
+        if canal_selecionado_atual != "Todos":
+            if ((v.get("canais_venda") or {}).get("nome")) != canal_selecionado_atual:
+                return False
+        return True
+
+    qtd_filtro, soma_filtro = _acumula(_bate_filtro_atual)
+    subtitulo_filtro = (
+        f"{mes_selecionado_atual if mes_selecionado_atual != 'Todos' else 'Todo período'} · "
+        f"{canal_selecionado_atual if canal_selecionado_atual != 'Todos' else 'Todos canais'}"
+    )
+
+    # ------------------------------------------------------------------
+    # 3) Os 4 cartões de KPI
+    # ------------------------------------------------------------------
+    _injetar_estilo_kpi()
+    col_kpi1, col_kpi2, col_kpi3, col_kpi4 = st.columns(4)
+    with col_kpi1:
+        _kpi_card("Total", qtd_total, soma_total)
+    with col_kpi2:
+        _kpi_card("Ano Atual", qtd_ano, soma_ano)
+    with col_kpi3:
+        _kpi_card(f"Mês Atual ({MESES_PT[mes_atual]})", qtd_mes_atual, soma_mes_atual)
+    with col_kpi4:
+        _kpi_card("Filtros", qtd_filtro, soma_filtro, subtitulo=subtitulo_filtro)
+
+    st.markdown("---")
+
+    if not vendas_kpi:
+        st.info("Nenhuma venda registrada.")
+        return
+
+    # ------------------------------------------------------------------
+    # 4) Widgets de filtro (Mês/Ano da venda e Canal de venda) + botão
+    #    para limpar os filtros
+    # ------------------------------------------------------------------
+    col_filtro_mes, col_filtro_canal, col_limpar = st.columns([2, 2, 1])
+    with col_filtro_mes:
+        mes_selecionado = st.selectbox("Mês da venda", opcoes_mes, key="vendas_filtro_mes")
+    with col_filtro_canal:
+        canal_selecionado = st.selectbox("Canal", opcoes_canal, key="vendas_filtro_canal")
+    with col_limpar:
+        # Espaçador para alinhar o botão com a altura dos selects (que têm label acima)
+        st.markdown("<div style='margin-top:1.85rem;'></div>", unsafe_allow_html=True)
+        st.button(
+            "🔄 Limpar filtros",
+            use_container_width=True,
+            key="vendas_btn_limpar_filtros",
+            on_click=_resetar_filtros_vendas,
+        )
+
+    # Reseta a página para 1 sempre que algum filtro mudar
+    assinatura_filtros = f"{mes_selecionado}|{canal_selecionado}"
+    if st.session_state.get("vendas_assinatura_filtros") != assinatura_filtros:
+        st.session_state.pagina_atual_vendas = 1
+        st.session_state.vendas_assinatura_filtros = assinatura_filtros
+
+    # ------------------------------------------------------------------
+    # 5) Paginação (50 por página) + consulta da página filtrada
+    # ------------------------------------------------------------------
+    ITENS_POR_PAGINA = 50
+    if "pagina_atual_vendas" not in st.session_state:
+        st.session_state.pagina_atual_vendas = 1
+
+    # Embed do canal como inner join só quando o filtro de canal está ativo,
+    # para não excluir vendas sem canal preenchido quando não há filtro.
+    canal_embed = "canais_venda!inner(nome)" if canal_selecionado != "Todos" else "canais_venda(nome)"
+
+    def _monta_query():
+        query = (
             supabase
             .table("vendas")
             .select(
                 "id, quantidade, valor_unitario, valor_desconto,"
                 " valor_total, data_venda, cliente,"
-                " produtos(descricao, codigo_interno),"
-                " canais_venda(nome), status_venda(nome)"
+                f" produtos(descricao, codigo_interno), {canal_embed}, status_venda(nome)",
+                count="exact",
             )
-            .order("data_venda", desc=True)
-            .execute()
         )
-        vendas = response.data or []
+
+        if mes_selecionado != "Todos":
+            ano_f, mes_f = meses_disponiveis[opcoes_mes.index(mes_selecionado) - 1]
+            inicio = date(ano_f, mes_f, 1)
+            fim = date(ano_f + 1, 1, 1) if mes_f == 12 else date(ano_f, mes_f + 1, 1)
+            query = query.gte("data_venda", inicio.isoformat()).lt("data_venda", fim.isoformat())
+
+        if canal_selecionado != "Todos":
+            query = query.eq("canais_venda.nome", canal_selecionado)
+
+        return query
+
+    try:
+        total_resp = _monta_query().order("data_venda", desc=True).range(0, 0).execute()
+        total_filtrado = total_resp.count or 0
     except Exception as e:
         st.error(f"Erro ao carregar vendas: {e}")
         return
 
-    total_vendas = len(vendas)
-    soma_total = sum(float(v.get("valor_total") or 0) for v in vendas)
+    total_paginas = math.ceil(total_filtrado / ITENS_POR_PAGINA) if total_filtrado > 0 else 1
+    if st.session_state.pagina_atual_vendas > total_paginas:
+        st.session_state.pagina_atual_vendas = total_paginas
 
-    data_ultima = "-"
-    if vendas and vendas[0].get("data_venda"):
-        dt_ultima = datetime.fromisoformat(str(vendas[0]["data_venda"])[:10])
-        data_ultima = dt_ultima.strftime("%d/%m/%y")
+    offset = (st.session_state.pagina_atual_vendas - 1) * ITENS_POR_PAGINA
 
-    col_kpi1, col_kpi2, col_kpi3 = st.columns(3)
+    if total_filtrado == 0:
+        st.info("Nenhuma venda encontrada para os filtros selecionados.")
+        return
 
-    with col_kpi1:
-        with st.container(border=True):
-            st.caption("Total de Vendas")
-            st.title(f"{total_vendas}")
-
-    with col_kpi2:
-        with st.container(border=True):
-            st.caption("Valor Vendido")
-            st.title(_fmt_moeda(soma_total))
-
-    with col_kpi3:
-        with st.container(border=True):
-            st.caption("Última Venda")
-            st.title(data_ultima)
-
-    st.markdown("---")
-
-    if not vendas:
-        st.info("Nenhuma venda registrada.")
+    try:
+        response = (
+            _monta_query()
+            .order("data_venda", desc=True)
+            .range(offset, offset + ITENS_POR_PAGINA - 1)
+            .execute()
+        )
+        vendas = response.data or []
+    except Exception as e:
+        st.error(f"Erro ao carregar a página de vendas: {e}")
         return
 
     with st.container(border=True):
@@ -136,6 +349,27 @@ def _secao_listagem():
             col_total.write(_fmt_moeda(v.get("valor_total")))
             col_status.write((v.get("status_venda") or {}).get("nome") or "-")
             col_cliente.write(v.get("cliente") or "-")
+
+    # Navegação de páginas
+    if total_paginas > 1:
+        col_espaco, col_paginacao = st.columns([2, 1])
+        with col_paginacao:
+            nova_pagina = st.number_input(
+                f"Página (1 de {total_paginas})",
+                min_value=1,
+                max_value=total_paginas,
+                value=st.session_state.pagina_atual_vendas,
+                step=1,
+                key="input_pagina_vendas",
+            )
+            if nova_pagina != st.session_state.pagina_atual_vendas:
+                st.session_state.pagina_atual_vendas = nova_pagina
+                st.rerun()
+
+    st.caption(
+        f"Exibindo página {st.session_state.pagina_atual_vendas} de {total_paginas} "
+        f"({total_filtrado} venda(s) no total para o filtro selecionado)."
+    )
 
 
 def tela_vendas():
