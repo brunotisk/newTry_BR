@@ -48,11 +48,11 @@ def _parse_data_segura(valor):
 
 
 def _injetar_estilo_kpi():
-    """Garante altura idêntica para todos os cards de KPI e ajusta o layout interno."""
+    """Garante altura idêntica para todos os cards de KPI fixando a altura do subtítulo."""
     st.markdown(
         """
         <style>
-        /* Desativa corte de texto nos rótulos e valores dos KPIs */
+        /* Desativa corte de texto nos valores dos KPIs */
         div[data-testid="stMetricValue"] {
             overflow: visible;
             white-space: normal;
@@ -61,29 +61,17 @@ def _injetar_estilo_kpi():
             line-height: 1.2;
         }
         
-        /* Fixa altura exata e alinhamento vertical dos containers de KPI */
-        div[data-testid="stColumn"] div[data-testid="stVerticalBlockBorderWrapper"] {
-            min-height: 160px !important;
-            height: 160px !important;
-        }
-        
-        div[data-testid="stColumn"] div[data-testid="stVerticalBlockBorderWrapper"] > div {
-            height: 100%;
-        }
-        
-        div[data-testid="stColumn"] div[data-testid="stVerticalBlockBorderWrapper"] div[data-testid="stVerticalBlock"] {
-            height: 100%;
-            display: flex;
-            flex-direction: column;
-            justify-content: space-between;
-        }
-        
-        /* Fallback para versões legadas do Streamlit */
-        div[data-testid="stColumn"] > div[data-testid="stVerticalBlock"] > div[data-testid="stElementContainer"] > div[data-testid="stContainer"] {
-            min-height: 160px !important;
-            display: flex;
-            flex-direction: column;
-            justify-content: space-between;
+        /* Container do subtítulo com altura fixa para padronização */
+        .kpi-subtitulo {
+            text-align: center;
+            font-size: 0.75rem;
+            color: #9aa0ab;
+            height: 18px;
+            line-height: 18px;
+            margin-bottom: 0.3rem;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
         }
         </style>
         """,
@@ -97,11 +85,14 @@ def _kpi_card(titulo: str, qtd: int, valor: float, subtitulo: Optional[str] = No
             f"<div style='text-align:center; font-weight:700; margin-bottom:0.1rem;'>{titulo}</div>",
             unsafe_allow_html=True,
         )
-        if subtitulo:
-            st.markdown(
-                f"<div style='text-align:center; font-size:0.75rem; color:#9aa0ab; margin-bottom:0.3rem;'>{subtitulo}</div>",
-                unsafe_allow_html=True,
-            )
+        
+        # Garante que sempre haverá a linha do subtítulo para manter a mesma altura em todos os cards
+        sub_texto = subtitulo if subtitulo else "&nbsp;"
+        st.markdown(
+            f"<div class='kpi-subtitulo'>{sub_texto}</div>",
+            unsafe_allow_html=True,
+        )
+
         col_qtd, col_valor = st.columns(2)
         with col_qtd:
             st.metric("Qtd. Vendas", qtd)
@@ -366,16 +357,20 @@ def _secao_listagem():
     )
 
     # ------------------------------------------------------------------
-    # 3) Os 4 cartões de KPI
+    # 3) Os 4 cartões de KPI (Todos padronizados com subtítulo)
     # ------------------------------------------------------------------
     _injetar_estilo_kpi()
     col_kpi1, col_kpi2, col_kpi3, col_kpi4 = st.columns(4)
+    
     with col_kpi1:
-        _kpi_card("Total", qtd_total, soma_total)
+        _kpi_card("Total", qtd_total, soma_total, subtitulo="Todo período")
+        
     with col_kpi2:
-        _kpi_card("Ano Atual", qtd_ano, soma_ano)
+        _kpi_card("Ano Atual", qtd_ano, soma_ano, subtitulo=f"Ano de {ano_atual}")
+        
     with col_kpi3:
-        _kpi_card(f"Mês Atual ({MESES_PT[mes_atual]})", qtd_mes_atual, soma_mes_atual)
+        _kpi_card("Mês Atual", qtd_mes_atual, soma_mes_atual, subtitulo=MESES_PT[mes_atual])
+        
     with col_kpi4:
         _kpi_card("Filtros", qtd_filtro, soma_filtro, subtitulo=subtitulo_filtro)
 
