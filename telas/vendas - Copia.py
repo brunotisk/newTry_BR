@@ -1,40 +1,32 @@
+import streamlit as st
 import tempfile
 from datetime import date, datetime
-import streamlit as st
 
 from db import supabase
-from telas.vendas_manual import tela_vendas_manual
 from vendas_import import (
+    ler_planilha,
+    importar_vendas_excel,
     buscar_produto_id,
+    normalizar_codigo_interno,
     editar_venda,
     excluir_venda,
     get_client,
-    importar_vendas_excel,
-    ler_planilha,
-    normalizar_codigo_interno,
 )
+from telas.vendas_manual import tela_vendas_manual
 
-# Compatibilidade com st.dialog
+# Compatibilidade: st.dialog é o nome estável (Streamlit >= 1.31); versões
+# um pouco mais antigas ainda expõem a mesma coisa como st.experimental_dialog.
 _dialog = getattr(st, "dialog", None) or st.experimental_dialog
 
 MESES_PT = {
-    1: "Janeiro",
-    2: "Fevereiro",
-    3: "Março",
-    4: "Abril",
-    5: "Maio",
-    6: "Junho",
-    7: "Julho",
-    8: "Agosto",
-    9: "Setembro",
-    10: "Outubro",
-    11: "Novembro",
-    12: "Dezembro",
+    1: "Janeiro", 2: "Fevereiro", 3: "Março", 4: "Abril",
+    5: "Maio", 6: "Junho", 7: "Julho", 8: "Agosto",
+    9: "Setembro", 10: "Outubro", 11: "Novembro", 12: "Dezembro",
 }
 
 
 def _parse_data_segura(valor):
-    """Converte 'YYYY-MM-DD...' em date de forma segura."""
+    """Converte 'YYYY-MM-DD...' (ou vazio/None/inválido) em date, sem lançar exceção."""
     texto = str(valor or "")[:10]
     if not texto:
         return None
@@ -53,119 +45,57 @@ def _fmt_moeda(valor) -> str:
     )
 
 
-@_dialog("✏️ Editar Venda")
+@_dialog("✏️ Editar venda")
 def _dialog_editar_venda(venda: dict):
-    # CSS para centralizar e expandir a largura do pop-up
-    st.markdown(
-        """
-        <style>
-        div[data-testid="stDialog"] > div {
-            max-width: 780px !important;
-            width: 90vw !important;
-        }
-        </style>
-    """,
-        unsafe_allow_html=True,
-    )
-
     produto = venda.get("produtos") or {}
     codigo_atual = produto.get("codigo_interno") or ""
+
     data_atual = datetime.fromisoformat(str(venda["data_venda"])[:10]).date()
 
     st.caption(f"Venda #{venda['id']}")
 
     with st.form(f"form_editar_venda_{venda['id']}"):
-        # --- LINHA 1: Cód. Interno + Canal de Venda | Status ---
-        col_cod, col_canal, col_status = st.columns([1.5, 1.5, 1])
-        with col_cod:
-            st.text_input(
-                "Código Interno", value=codigo_atual, disabled=True
-            )
-        with col_canal:
-            st.text_input(
-                "Canal de Venda",
-                value=venda.get("canal_venda") or "",
-                disabled=True,
-            )
-        with col_status:
-            status = st.text_input(
-                "Status", value=venda.get("status") or "Pendente"
-            )
-
-        # --- LINHA 2: Quantidade | Valor Unitário | Desconto | Valor Total ---
-        col_qtd, col_vunit, col_desc, col_vtot = st.columns(4)
-        with col_qtd:
-            quantidade = st.number_input(
-                "Quantidade",
-                min_value=0.01,
-                step=1.0,
-                format="%.2f",
-                value=float(venda.get("quantidade") or 0.01),
-            )
-        with col_vunit:
-            valor_unitario = st.number_input(
-                "Valor Unitário (R$)",
-                min_value=0.0,
-                step=0.01,
-                format="%.2f",
-                value=float(venda.get("valor_unitario") or 0),
-            )
-        with col_desc:
-            valor_desconto = st.number_input(
-                "Desconto (R$)",
-                min_value=0.0,
-                step=0.01,
-                format="%.2f",
-                value=float(venda.get("valor_desconto") or 0),
-            )
-        with col_vtot:
-            valor_total = st.number_input(
-                "Valor Total (R$)",
-                min_value=0.0,
-                step=0.01,
-                format="%.2f",
-                value=float(venda.get("valor_total") or 0),
-            )
-
-        # --- LINHA 3: Data Venda | Cliente ---
-        col_data, col_cliente = st.columns([1, 2])
-        with col_data:
-            data_venda = st.date_input("Data da Venda", value=data_atual)
-        with col_cliente:
-            cliente = st.text_input("Cliente", value=venda.get("cliente") or "")
-
-        st.divider()
-
-        # --- BOTÕES DE AÇÃO ---
-        col_salvar, col_cancelar, col_excluir = st.columns([2, 1, 1])
-        salvar = col_salvar.form_submit_button(
-            "💾 Salvar alterações", type="primary", use_container_width=True
+        codigo_interno = st.text_input("Código interno do produto", value=codigo_atual)
+        canal_venda = st.text_input("Canal de venda", value=venda.get("canal_venda") or "")
+        quantidade = st.number_input(
+            "Quantidade", min_value=0.01, step=1.0, format="%.2f",
+            value=float(venda.get("quantidade") or 0.01),
         )
-        cancelar = col_cancelar.form_submit_button(
-            "Cancelar", use_container_width=True
+        valor_unitario = st.number_input(
+            "Valor unitário", min_value=0.0, step=0.01, format="%.2f",
+            value=float(venda.get("valor_unitario") or 0),
         )
-        excluir = col_excluir.form_submit_button(
-            "🗑️ Excluir", use_container_width=True
+        valor_desconto = st.number_input(
+            "Desconto", min_value=0.0, step=0.01, format="%.2f",
+            value=float(venda.get("valor_desconto") or 0),
         )
+        valor_total = st.number_input(
+            "Valor total", min_value=0.0, step=0.01, format="%.2f",
+            value=float(venda.get("valor_total") or 0),
+        )
+        status = st.text_input("Status", value=venda.get("status") or "Pendente")
+        data_venda = st.date_input("Data da venda", value=data_atual)
+        cliente = st.text_input("Cliente", value=venda.get("cliente") or "")
+
+        col_salvar, col_cancelar = st.columns(2)
+        salvar = col_salvar.form_submit_button("💾 Salvar alterações", type="primary", use_container_width=True)
+        cancelar = col_cancelar.form_submit_button("Cancelar", use_container_width=True)
 
     if cancelar:
         st.rerun()
 
-    if excluir:
-        try:
-            sb = get_client()
-            excluir_venda(sb, venda)
-            st.success("Venda excluída e estoque ajustado com sucesso!")
-            st.rerun()
-        except Exception as e:
-            st.error(f"Erro ao excluir venda: {e}")
-
     if salvar:
         try:
             sb = get_client()
+            codigo_normalizado = normalizar_codigo_interno(codigo_interno)
+            novo_produto_id = buscar_produto_id(sb, codigo_normalizado)
+            if novo_produto_id is None:
+                st.error(f"Produto com código '{codigo_interno}' não encontrado.")
+                return
+
             dados_novos = {
-                "produto_id": venda.get("produto_id"),
-                "canal_venda": (venda.get("canal_venda") or "").strip(),
+                "produto_id": novo_produto_id,
+                "canal_venda": canal_venda.strip(),
                 "quantidade": float(quantidade),
                 "valor_unitario": float(valor_unitario),
                 "valor_desconto": float(valor_desconto),
@@ -176,10 +106,31 @@ def _dialog_editar_venda(venda: dict):
             }
 
             editar_venda(sb, venda, dados_novos)
-            st.success("Venda atualizada com sucesso!")
+            st.success("Venda atualizada e estoque ajustado com sucesso!")
             st.rerun()
         except Exception as e:
             st.error(f"Erro ao salvar alterações: {e}")
+
+
+@_dialog("🗑️ Excluir venda")
+def _dialog_excluir_venda(venda: dict):
+    produto = venda.get("produtos") or {}
+    st.warning(
+        f"Tem certeza que deseja excluir a venda **#{venda['id']}** "
+        f"({produto.get('descricao') or '-'} — cliente: {venda.get('cliente') or '-'})?\n\n"
+        "Essa ação não pode ser desfeita. A quantidade vendida será devolvida ao estoque."
+    )
+    col_confirmar, col_cancelar = st.columns(2)
+    if col_confirmar.button("Sim, excluir", type="primary", use_container_width=True):
+        try:
+            sb = get_client()
+            excluir_venda(sb, venda)
+            st.success("Venda excluída e estoque ajustado.")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Erro ao excluir venda: {e}")
+    if col_cancelar.button("Cancelar", use_container_width=True):
+        st.rerun()
 
 
 def _secao_importar():
@@ -189,9 +140,7 @@ def _secao_importar():
         "Valor Unitário | Desconto | Valor Total | Status | Data | Cliente"
     )
 
-    arquivo = st.file_uploader(
-        "Selecione o arquivo .xlsx", type=["xlsx"], key="upload_vendas"
-    )
+    arquivo = st.file_uploader("Selecione o arquivo .xlsx", type=["xlsx"], key="upload_vendas")
 
     if arquivo is None:
         return
@@ -214,18 +163,12 @@ def _secao_importar():
             resultado = importar_vendas_excel(tmp_path)
 
         st.success(
-            f"{resultado['importadas']} vendas importadas de"
-            f" {resultado['total_linhas']} linhas."
+            f"{resultado['importadas']} vendas importadas de {resultado['total_linhas']} linhas."
         )
         if resultado["duplicadas"]:
-            st.warning(
-                f"{resultado['duplicadas']} linha(s) ignorada(s) por já"
-                " existirem."
-            )
+            st.warning(f"{resultado['duplicadas']} linha(s) ignorada(s) por já existirem.")
         if resultado["erros"]:
-            with st.expander(
-                f"⚠️ {len(resultado['erros'])} linha(s) com erro"
-            ):
+            with st.expander(f"⚠️ {len(resultado['erros'])} linha(s) com erro"):
                 for erro in resultado["erros"]:
                     st.write(f"- {erro}")
 
@@ -233,10 +176,11 @@ def _secao_importar():
 def _secao_listagem():
     try:
         response = (
-            supabase.table("vendas")
+            supabase
+            .table("vendas")
             .select(
-                "id, produto_id, canal_venda, quantidade, valor_unitario,"
-                " valor_desconto, valor_total, status, data_venda, cliente,"
+                "id, produto_id, canal_venda, quantidade, valor_unitario, valor_desconto,"
+                " valor_total, status, data_venda, cliente,"
                 " produtos(descricao, codigo_interno)"
             )
             .order("data_venda", desc=True)
@@ -301,6 +245,7 @@ def _secao_listagem():
         st.info("Nenhuma venda registrada.")
         return
 
+    # Opções de filtro construídas a partir dos dados carregados
     meses_disponiveis = sorted(
         {
             (dt.year, dt.month)
@@ -309,15 +254,9 @@ def _secao_listagem():
         },
         reverse=True,
     )
-    opcoes_mes = ["Todos"] + [
-        f"{MESES_PT[m]}/{a}" for (a, m) in meses_disponiveis
-    ]
+    opcoes_mes = ["Todos"] + [f"{MESES_PT[m]}/{a}" for (a, m) in meses_disponiveis]
     opcoes_canal = ["Todos"] + sorted(
-        {
-            (v.get("canal_venda") or "").strip()
-            for v in vendas
-            if (v.get("canal_venda") or "").strip()
-        }
+        {(v.get("canal_venda") or "").strip() for v in vendas if (v.get("canal_venda") or "").strip()}
     )
 
     col_filtro_mes, col_filtro_canal = st.columns(2)
@@ -328,21 +267,14 @@ def _secao_listagem():
 
     vendas_filtradas = vendas
     if mes_selecionado != "Todos":
-        ano_f, mes_f = meses_disponiveis[
-            opcoes_mes.index(mes_selecionado) - 1
-        ]
+        ano_f, mes_f = meses_disponiveis[opcoes_mes.index(mes_selecionado) - 1]
         vendas_filtradas = [
-            v
-            for v in vendas_filtradas
-            if (dt := _parse_data_segura(v.get("data_venda")))
-            and dt.year == ano_f
-            and dt.month == mes_f
+            v for v in vendas_filtradas
+            if (dt := _parse_data_segura(v.get("data_venda"))) and dt.year == ano_f and dt.month == mes_f
         ]
     if canal_selecionado != "Todos":
         vendas_filtradas = [
-            v
-            for v in vendas_filtradas
-            if (v.get("canal_venda") or "").strip() == canal_selecionado
+            v for v in vendas_filtradas if (v.get("canal_venda") or "").strip() == canal_selecionado
         ]
 
     if not vendas_filtradas:
@@ -350,16 +282,9 @@ def _secao_listagem():
         return
 
     with st.container(border=True):
-        (
-            c_data,
-            c_canal,
-            c_prod,
-            c_qtd,
-            c_total,
-            c_status,
-            c_cliente,
-            c_acoes,
-        ) = st.columns([1.4, 1.3, 2.8, 0.9, 1.4, 1.3, 1.7, 0.8])
+        c_data, c_canal, c_prod, c_qtd, c_total, c_status, c_cliente, c_acoes = st.columns(
+            [1.4, 1.3, 2.8, 0.9, 1.4, 1.3, 1.7, 1.2]
+        )
         c_data.markdown("**Data**")
         c_canal.markdown("**Canal**")
         c_prod.markdown("**Produto**")
@@ -373,15 +298,9 @@ def _secao_listagem():
 
         for v in vendas_filtradas:
             (
-                col_data,
-                col_canal,
-                col_prod,
-                col_qtd,
-                col_total,
-                col_status,
-                col_cliente,
-                col_acoes,
-            ) = st.columns([1.4, 1.3, 2.8, 0.9, 1.4, 1.3, 1.7, 0.8])
+                col_data, col_canal, col_prod, col_qtd,
+                col_total, col_status, col_cliente, col_acoes,
+            ) = st.columns([1.4, 1.3, 2.8, 0.9, 1.4, 1.3, 1.7, 1.2])
 
             col_data.write(str(v.get("data_venda") or "-")[:10])
             col_canal.write(v.get("canal_venda") or "-")
@@ -395,13 +314,11 @@ def _secao_listagem():
             col_cliente.write(v.get("cliente") or "-")
 
             with col_acoes:
-                if st.button(
-                    "✏️",
-                    key=f"editar_venda_{v['id']}",
-                    help="Editar ou excluir venda",
-                    use_container_width=True,
-                ):
+                col_editar, col_excluir = st.columns(2)
+                if col_editar.button("✏️", key=f"editar_venda_{v['id']}", help="Editar venda", use_container_width=True):
                     _dialog_editar_venda(v)
+                if col_excluir.button("🗑️", key=f"excluir_venda_{v['id']}", help="Excluir venda", use_container_width=True):
+                    _dialog_excluir_venda(v)
 
 
 def tela_vendas():

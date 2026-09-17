@@ -83,12 +83,12 @@ def _secao_listagem():
                 [1.5, 2, 2, 2, 2, 4]
             )
 
-            c_nf.markdown("**numero_nf**")
+            c_nf.markdown("**Número NF**")
             c_dt.markdown("**Data Compra**")
-            c_prod.markdown("**valor_produto_HD**")
-            c_desc.markdown("**valor_desconto_HD**")
-            c_tot.markdown("**valor_total_HD**")
-            c_chave.markdown("**chave_acesso**")
+            c_prod.markdown("**Valor Produto**")
+            c_desc.markdown("**Desconto (-)**")
+            c_tot.markdown("**Valor Total**")
+            c_chave.markdown("**Chave Acesso**")
 
             st.divider()
 

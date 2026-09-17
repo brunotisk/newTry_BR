@@ -88,10 +88,10 @@ def _injetar_estilo_sidebar():
 
 # 3. Estrutura de páginas: rótulo (com ícone) -> função da tela
 PAGINAS = {
-    "📦 Listar Produtos": tela_produtos,
+    "📦 Produtos": tela_produtos,
     "🛍️ Compras": tela_compras,
     "💰 Vendas": tela_vendas,
-    "📊 Controle de Estoque": tela_estoque,
+    "📊 Estoque": tela_estoque,
     "👤 Clientes": tela_clientes,
     "📈 Relatórios": tela_report,
 }
@@ -118,9 +118,10 @@ with st.sidebar:
 
 renderizar_botao_sair()
 
-#    "📄 Importar NF": tela_importar_nf,
-#    "🏷️ Cadastrar Categorias": tela_categorias,
 # 5. Cabeçalho e roteamento da página selecionada
-st.title("Sistema de Semijoias - Bruno I.")
+st.title("Sistema de Semijoias - Bruno & AC")
 
 PAGINAS[st.session_state.pagina_atual]()
+
+#    "📄 Importar NF": tela_importar_nf,
+#    "🏷️ Cadastrar Categorias": tela_categorias,
