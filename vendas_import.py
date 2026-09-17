@@ -27,22 +27,14 @@ Instalar: pip install pandas openpyxl
 """
 from __future__ import annotations
 import os
-import re
-from datetime import date, datetime
+from datetime import datetime
 from decimal import Decimal, InvalidOperation
 
 import pandas as pd
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
-from estoque_ajuste import registrar_ajuste
-
 load_dotenv()
-
-# Formato do código interno no banco: string numérica com zeros à esquerda,
-# ex.: "0024727". Ajuste a largura abaixo se o padrão do seu banco for diferente.
-LARGURA_CODIGO_INTERNO = 7
-PADRAO_CODIGO_INTERNO = re.compile(rf"^\d{{{LARGURA_CODIGO_INTERNO}}}$")
 
 # Ordem das colunas quando a planilha NÃO tem cabeçalho
 COLUNAS_SEM_CABECALHO = [
@@ -86,35 +78,35 @@ MAPA_CABECALHO = {
 
 COLUNAS_OBRIGATORIAS = ["codigo_interno", "quantidade", "valor_total", "data_venda"]
 
+# O Excel guarda "0024727" apenas como formatação visual: o valor real salvo
+# na célula é o número 24727, sem os zeros à esquerda. No banco, porém,
+# produtos.codigo_interno é salvo como texto já com o zero-padding (ex.:
+# "0024727", 7 dígitos). Sem repor esses zeros, a busca do produto pelo
+# código falha. Ajuste este número se o padrão de código mudar.
+TAMANHO_CODIGO_INTERNO = 7
+
 
 def normalizar_codigo_interno(valor) -> str:
-    """Normaliza o código interno lido do Excel para o mesmo formato usado no banco:
-    string numérica com zeros à esquerda (ex.: "0024727").
+    """Normaliza um código interno lido da planilha (ou digitado manualmente)
+    para o mesmo formato armazenado no banco: string numérica com zeros à
+    esquerda até TAMANHO_CODIGO_INTERNO dígitos.
 
-    O Excel/pandas costuma guardar/ler esse tipo de código como número, o que
-    derruba os zeros à esquerda (0024727 -> 24727, ou até 24727.0). Aqui a gente
-    reconstrói o texto original antes de comparar com o banco.
+    Códigos não puramente numéricos (ex.: com letras) são apenas limpos de
+    espaços, sem receber padding.
     """
     if valor is None or (isinstance(valor, float) and pd.isna(valor)):
         return ""
 
-    if isinstance(valor, (int, float)):
-        texto = str(int(valor))
-    else:
-        texto = str(valor).strip()
-        if texto.endswith(".0"):  # ex.: célula veio como texto "24727.0"
-            texto = texto[:-2]
+    texto = str(valor).strip()
+
+    # Remove ".0" que aparece quando o pandas lê um código inteiro como float
+    if texto.endswith(".0"):
+        texto = texto[:-2]
 
     if texto.isdigit():
-        texto = texto.zfill(LARGURA_CODIGO_INTERNO)
+        texto = texto.zfill(TAMANHO_CODIGO_INTERNO)
 
     return texto
-
-
-def validar_codigo_interno(codigo: str) -> bool:
-    """Confere se o código já normalizado bate com o formato esperado
-    (LARGURA_CODIGO_INTERNO dígitos numéricos)."""
-    return bool(PADRAO_CODIGO_INTERNO.fullmatch(codigo))
 
 
 def get_client() -> Client:
@@ -184,6 +176,7 @@ def ler_planilha(caminho_arquivo) -> pd.DataFrame:
         df.columns = COLUNAS_SEM_CABECALHO
 
     df = df.dropna(how="all").reset_index(drop=True)
+    df["codigo_interno"] = df["codigo_interno"].apply(normalizar_codigo_interno)
     return df
 
 
@@ -213,15 +206,31 @@ def venda_ja_existe(sb: Client, produto_id: int, data_venda: str, valor_total: f
     return len(resp.data) > 0
 
 
+def obter_ou_criar_lista_id(sb: Client, tabela: str, nome: str) -> int:
+    """Busca o id de um item em canais_venda/status_venda pelo nome; cadastra
+    automaticamente se ainda não existir (ex.: a planilha traz um canal ou
+    status que ainda não foi cadastrado na tela de vendas)."""
+    nome = (nome or "").strip()
+    if not nome:
+        raise ValueError(f"Valor vazio para '{tabela}'.")
+
+    resp = sb.table(tabela).select("id").eq("nome", nome).execute()
+    if resp.data:
+        return resp.data[0]["id"]
+
+    criado = sb.table(tabela).insert({"nome": nome}).execute()
+    return criado.data[0]["id"]
+
+
 def inserir_venda_e_baixar_estoque(sb: Client, linha: dict, produto_id: int) -> int:
     venda_resp = sb.table("vendas").insert({
         "produto_id": produto_id,
-        "canal_venda": linha["canal_venda"],
+        "canal_venda_id": linha["canal_venda_id"],
         "quantidade": float(linha["quantidade"]),
         "valor_unitario": float(linha["valor_unitario"]),
         "valor_desconto": float(linha["valor_desconto"]),
         "valor_total": float(linha["valor_total"]),
-        "status": linha["status"] or "Pendente",
+        "status_id": linha["status_id"],
         "data_venda": linha["data_venda"],
         "cliente": linha["cliente"],
     }).execute()
@@ -248,75 +257,6 @@ def inserir_venda_e_baixar_estoque(sb: Client, linha: dict, produto_id: int) -> 
     return venda_id
 
 
-def editar_venda(sb: Client, venda_antiga: dict, dados_novos: dict) -> None:
-    """Atualiza os campos de uma venda existente e ajusta o estoque de acordo
-    com a diferença entre os valores antigos e os novos.
-
-    `venda_antiga` precisa conter ao menos `id`, `produto_id` e `quantidade`
-    (os valores como estavam antes da edição).
-    `dados_novos` deve conter todos os campos da tabela `vendas` já com os
-    valores finais a gravar, incluindo `produto_id` e `quantidade`.
-    """
-    venda_id = venda_antiga["id"]
-    produto_id_antigo = venda_antiga["produto_id"]
-    quantidade_antiga = float(venda_antiga.get("quantidade") or 0)
-
-    produto_id_novo = dados_novos["produto_id"]
-    quantidade_nova = float(dados_novos["quantidade"])
-    hoje = date.today().isoformat()
-
-    if produto_id_novo != produto_id_antigo:
-        # devolve a quantidade antiga ao estoque do produto antigo
-        registrar_ajuste(
-            sb,
-            produto_id=produto_id_antigo,
-            quantidade=quantidade_antiga,
-            motivo=f"Estorno por edição da venda #{venda_id} (produto alterado)",
-            data_movimento=hoje,
-        )
-        # dá baixa da quantidade nova no estoque do produto novo
-        registrar_ajuste(
-            sb,
-            produto_id=produto_id_novo,
-            quantidade=-quantidade_nova,
-            motivo=f"Ajuste por edição da venda #{venda_id} (produto alterado)",
-            data_movimento=hoje,
-        )
-    else:
-        # mesmo produto: só a diferença de quantidade precisa ser ajustada
-        delta = quantidade_antiga - quantidade_nova
-        if delta != 0:
-            registrar_ajuste(
-                sb,
-                produto_id=produto_id_novo,
-                quantidade=delta,
-                motivo=f"Ajuste por edição da venda #{venda_id} (quantidade alterada)",
-                data_movimento=hoje,
-            )
-
-    sb.table("vendas").update(dados_novos).eq("id", venda_id).execute()
-
-
-def excluir_venda(sb: Client, venda: dict) -> None:
-    """Exclui uma venda e devolve a quantidade correspondente ao estoque do
-    produto, registrando o estorno no ledger de movimentações.
-
-    `venda` precisa conter `id`, `produto_id` e `quantidade`.
-    """
-    venda_id = venda["id"]
-    produto_id = venda["produto_id"]
-    quantidade = float(venda.get("quantidade") or 0)
-
-    registrar_ajuste(
-        sb,
-        produto_id=produto_id,
-        quantidade=quantidade,
-        motivo=f"Estorno da venda #{venda_id} (exclusão)",
-        data_movimento=date.today().isoformat(),
-    )
-    sb.table("vendas").delete().eq("id", venda_id).execute()
-
-
 def importar_vendas_excel(caminho_arquivo) -> dict:
     """Importa todas as linhas válidas de uma planilha de vendas.
     Não interrompe no primeiro erro: cada linha é processada de forma
@@ -332,31 +272,28 @@ def importar_vendas_excel(caminho_arquivo) -> dict:
     for idx, row in df.iterrows():
         numero_linha = idx + 2  # aproximação da linha na planilha original
         try:
-            codigo = normalizar_codigo_interno(row["codigo_interno"])
-
-            if not codigo:
-                erros.append(f"Linha {numero_linha}: código interno vazio.")
-                continue
-
-            if not validar_codigo_interno(codigo):
-                erros.append(
-                    f"Linha {numero_linha}: código '{codigo}' fora do formato esperado "
-                    f"({LARGURA_CODIGO_INTERNO} dígitos numéricos, ex.: '0024727')."
-                )
-                continue
-
+            codigo = str(row["codigo_interno"]).strip()
             produto_id = buscar_produto_id(sb, codigo)
             if produto_id is None:
                 erros.append(f"Linha {numero_linha}: produto com código '{codigo}' não encontrado.")
                 continue
 
+            canal_nome = str(row.get("canal_venda") or "").strip()
+            if not canal_nome:
+                erros.append(f"Linha {numero_linha}: canal de venda vazio.")
+                continue
+            status_nome = str(row.get("status") or "Pendente").strip()
+
+            canal_venda_id = obter_ou_criar_lista_id(sb, "canais_venda", canal_nome)
+            status_id = obter_ou_criar_lista_id(sb, "status_venda", status_nome)
+
             linha = {
-                "canal_venda": str(row.get("canal_venda") or "").strip(),
+                "canal_venda_id": canal_venda_id,
+                "status_id": status_id,
                 "quantidade": Decimal(str(row["quantidade"])),
                 "valor_unitario": _parse_moeda(row.get("valor_unitario")),
                 "valor_desconto": _parse_moeda(row.get("valor_desconto")),
                 "valor_total": _parse_moeda(row.get("valor_total")),
-                "status": str(row.get("status") or "Pendente").strip(),
                 "data_venda": _parse_data(row["data_venda"]),
                 "cliente": str(row.get("cliente") or "").strip(),
             }

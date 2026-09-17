@@ -1,47 +1,11 @@
-import tempfile
-from datetime import date, datetime
 import streamlit as st
+import tempfile
+from datetime import datetime
 
 from db import supabase
+from vendas_import import ler_planilha, importar_vendas_excel
 from telas.vendas_manual import tela_vendas_manual
-from vendas_import import (
-    buscar_produto_id,
-    editar_venda,
-    excluir_venda,
-    get_client,
-    importar_vendas_excel,
-    ler_planilha,
-    normalizar_codigo_interno,
-)
-
-# Compatibilidade com st.dialog
-_dialog = getattr(st, "dialog", None) or st.experimental_dialog
-
-MESES_PT = {
-    1: "Janeiro",
-    2: "Fevereiro",
-    3: "Março",
-    4: "Abril",
-    5: "Maio",
-    6: "Junho",
-    7: "Julho",
-    8: "Agosto",
-    9: "Setembro",
-    10: "Outubro",
-    11: "Novembro",
-    12: "Dezembro",
-}
-
-
-def _parse_data_segura(valor):
-    """Converte 'YYYY-MM-DD...' em date de forma segura."""
-    texto = str(valor or "")[:10]
-    if not texto:
-        return None
-    try:
-        return datetime.strptime(texto, "%Y-%m-%d").date()
-    except ValueError:
-        return None
+from telas.cadastros_auxiliares import tela_cadastros_auxiliares
 
 
 def _fmt_moeda(valor) -> str:
@@ -53,135 +17,6 @@ def _fmt_moeda(valor) -> str:
     )
 
 
-@_dialog("✏️ Editar Venda")
-def _dialog_editar_venda(venda: dict):
-    # CSS para centralizar e expandir a largura do pop-up
-    st.markdown(
-        """
-        <style>
-        div[data-testid="stDialog"] > div {
-            max-width: 780px !important;
-            width: 90vw !important;
-        }
-        </style>
-    """,
-        unsafe_allow_html=True,
-    )
-
-    produto = venda.get("produtos") or {}
-    codigo_atual = produto.get("codigo_interno") or ""
-    data_atual = datetime.fromisoformat(str(venda["data_venda"])[:10]).date()
-
-    st.caption(f"Venda #{venda['id']}")
-
-    with st.form(f"form_editar_venda_{venda['id']}"):
-        # --- LINHA 1: Cód. Interno + Canal de Venda | Status ---
-        col_cod, col_canal, col_status = st.columns([1.5, 1.5, 1])
-        with col_cod:
-            st.text_input(
-                "Código Interno", value=codigo_atual, disabled=True
-            )
-        with col_canal:
-            st.text_input(
-                "Canal de Venda",
-                value=venda.get("canal_venda") or "",
-                disabled=True,
-            )
-        with col_status:
-            status = st.text_input(
-                "Status", value=venda.get("status") or "Pendente"
-            )
-
-        # --- LINHA 2: Quantidade | Valor Unitário | Desconto | Valor Total ---
-        col_qtd, col_vunit, col_desc, col_vtot = st.columns(4)
-        with col_qtd:
-            quantidade = st.number_input(
-                "Quantidade",
-                min_value=0.01,
-                step=1.0,
-                format="%.2f",
-                value=float(venda.get("quantidade") or 0.01),
-            )
-        with col_vunit:
-            valor_unitario = st.number_input(
-                "Valor Unitário (R$)",
-                min_value=0.0,
-                step=0.01,
-                format="%.2f",
-                value=float(venda.get("valor_unitario") or 0),
-            )
-        with col_desc:
-            valor_desconto = st.number_input(
-                "Desconto (R$)",
-                min_value=0.0,
-                step=0.01,
-                format="%.2f",
-                value=float(venda.get("valor_desconto") or 0),
-            )
-        with col_vtot:
-            valor_total = st.number_input(
-                "Valor Total (R$)",
-                min_value=0.0,
-                step=0.01,
-                format="%.2f",
-                value=float(venda.get("valor_total") or 0),
-            )
-
-        # --- LINHA 3: Data Venda | Cliente ---
-        col_data, col_cliente = st.columns([1, 2])
-        with col_data:
-            data_venda = st.date_input("Data da Venda", value=data_atual)
-        with col_cliente:
-            cliente = st.text_input("Cliente", value=venda.get("cliente") or "")
-
-        st.divider()
-
-        # --- BOTÕES DE AÇÃO ---
-        col_salvar, col_cancelar, col_excluir = st.columns([2, 1, 1])
-        salvar = col_salvar.form_submit_button(
-            "💾 Salvar alterações", type="primary", use_container_width=True
-        )
-        cancelar = col_cancelar.form_submit_button(
-            "Cancelar", use_container_width=True
-        )
-        excluir = col_excluir.form_submit_button(
-            "🗑️ Excluir", use_container_width=True
-        )
-
-    if cancelar:
-        st.rerun()
-
-    if excluir:
-        try:
-            sb = get_client()
-            excluir_venda(sb, venda)
-            st.success("Venda excluída e estoque ajustado com sucesso!")
-            st.rerun()
-        except Exception as e:
-            st.error(f"Erro ao excluir venda: {e}")
-
-    if salvar:
-        try:
-            sb = get_client()
-            dados_novos = {
-                "produto_id": venda.get("produto_id"),
-                "canal_venda": (venda.get("canal_venda") or "").strip(),
-                "quantidade": float(quantidade),
-                "valor_unitario": float(valor_unitario),
-                "valor_desconto": float(valor_desconto),
-                "valor_total": float(valor_total),
-                "status": status.strip() or "Pendente",
-                "data_venda": data_venda.isoformat(),
-                "cliente": cliente.strip(),
-            }
-
-            editar_venda(sb, venda, dados_novos)
-            st.success("Venda atualizada com sucesso!")
-            st.rerun()
-        except Exception as e:
-            st.error(f"Erro ao salvar alterações: {e}")
-
-
 def _secao_importar():
     st.subheader("📥 Importar vendas de planilha Excel")
     st.caption(
@@ -189,9 +24,7 @@ def _secao_importar():
         "Valor Unitário | Desconto | Valor Total | Status | Data | Cliente"
     )
 
-    arquivo = st.file_uploader(
-        "Selecione o arquivo .xlsx", type=["xlsx"], key="upload_vendas"
-    )
+    arquivo = st.file_uploader("Selecione o arquivo .xlsx", type=["xlsx"], key="upload_vendas")
 
     if arquivo is None:
         return
@@ -214,18 +47,12 @@ def _secao_importar():
             resultado = importar_vendas_excel(tmp_path)
 
         st.success(
-            f"{resultado['importadas']} vendas importadas de"
-            f" {resultado['total_linhas']} linhas."
+            f"{resultado['importadas']} vendas importadas de {resultado['total_linhas']} linhas."
         )
         if resultado["duplicadas"]:
-            st.warning(
-                f"{resultado['duplicadas']} linha(s) ignorada(s) por já"
-                " existirem."
-            )
+            st.warning(f"{resultado['duplicadas']} linha(s) ignorada(s) por já existirem.")
         if resultado["erros"]:
-            with st.expander(
-                f"⚠️ {len(resultado['erros'])} linha(s) com erro"
-            ):
+            with st.expander(f"⚠️ {len(resultado['erros'])} linha(s) com erro"):
                 for erro in resultado["erros"]:
                     st.write(f"- {erro}")
 
@@ -233,11 +60,13 @@ def _secao_importar():
 def _secao_listagem():
     try:
         response = (
-            supabase.table("vendas")
+            supabase
+            .table("vendas")
             .select(
-                "id, produto_id, canal_venda, quantidade, valor_unitario,"
-                " valor_desconto, valor_total, status, data_venda, cliente,"
-                " produtos(descricao, codigo_interno)"
+                "id, quantidade, valor_unitario, valor_desconto,"
+                " valor_total, data_venda, cliente,"
+                " produtos(descricao, codigo_interno),"
+                " canais_venda(nome), status_venda(nome)"
             )
             .order("data_venda", desc=True)
             .execute()
@@ -250,30 +79,12 @@ def _secao_listagem():
     total_vendas = len(vendas)
     soma_total = sum(float(v.get("valor_total") or 0) for v in vendas)
 
-    hoje = date.today()
-    mes_atual, ano_atual = hoje.month, hoje.year
-    if mes_atual == 1:
-        mes_anterior, ano_anterior = 12, ano_atual - 1
-    else:
-        mes_anterior, ano_anterior = mes_atual - 1, ano_atual
+    data_ultima = "-"
+    if vendas and vendas[0].get("data_venda"):
+        dt_ultima = datetime.fromisoformat(str(vendas[0]["data_venda"])[:10])
+        data_ultima = dt_ultima.strftime("%d/%m/%y")
 
-    soma_mes_atual = 0.0
-    soma_mes_anterior = 0.0
-    for v in vendas:
-        dt_venda = _parse_data_segura(v.get("data_venda"))
-        if dt_venda is None:
-            continue
-
-        valor = float(v.get("valor_total") or 0)
-        if dt_venda.year == ano_atual and dt_venda.month == mes_atual:
-            soma_mes_atual += valor
-        elif dt_venda.year == ano_anterior and dt_venda.month == mes_anterior:
-            soma_mes_anterior += valor
-
-    label_mes_atual = f"Vendas Mês ({MESES_PT[mes_atual]})"
-    label_mes_anterior = f"Vendas Mês Anterior ({MESES_PT[mes_anterior]})"
-
-    col_kpi1, col_kpi2, col_kpi3, col_kpi4 = st.columns(4)
+    col_kpi1, col_kpi2, col_kpi3 = st.columns(3)
 
     with col_kpi1:
         with st.container(border=True):
@@ -287,13 +98,8 @@ def _secao_listagem():
 
     with col_kpi3:
         with st.container(border=True):
-            st.caption(label_mes_atual)
-            st.title(_fmt_moeda(soma_mes_atual))
-
-    with col_kpi4:
-        with st.container(border=True):
-            st.caption(label_mes_anterior)
-            st.title(_fmt_moeda(soma_mes_anterior))
+            st.caption("Última Venda")
+            st.title(data_ultima)
 
     st.markdown("---")
 
@@ -301,65 +107,10 @@ def _secao_listagem():
         st.info("Nenhuma venda registrada.")
         return
 
-    meses_disponiveis = sorted(
-        {
-            (dt.year, dt.month)
-            for v in vendas
-            if (dt := _parse_data_segura(v.get("data_venda"))) is not None
-        },
-        reverse=True,
-    )
-    opcoes_mes = ["Todos"] + [
-        f"{MESES_PT[m]}/{a}" for (a, m) in meses_disponiveis
-    ]
-    opcoes_canal = ["Todos"] + sorted(
-        {
-            (v.get("canal_venda") or "").strip()
-            for v in vendas
-            if (v.get("canal_venda") or "").strip()
-        }
-    )
-
-    col_filtro_mes, col_filtro_canal = st.columns(2)
-    with col_filtro_mes:
-        mes_selecionado = st.selectbox("Mês da venda", opcoes_mes)
-    with col_filtro_canal:
-        canal_selecionado = st.selectbox("Canal", opcoes_canal)
-
-    vendas_filtradas = vendas
-    if mes_selecionado != "Todos":
-        ano_f, mes_f = meses_disponiveis[
-            opcoes_mes.index(mes_selecionado) - 1
-        ]
-        vendas_filtradas = [
-            v
-            for v in vendas_filtradas
-            if (dt := _parse_data_segura(v.get("data_venda")))
-            and dt.year == ano_f
-            and dt.month == mes_f
-        ]
-    if canal_selecionado != "Todos":
-        vendas_filtradas = [
-            v
-            for v in vendas_filtradas
-            if (v.get("canal_venda") or "").strip() == canal_selecionado
-        ]
-
-    if not vendas_filtradas:
-        st.info("Nenhuma venda encontrada para os filtros selecionados.")
-        return
-
     with st.container(border=True):
-        (
-            c_data,
-            c_canal,
-            c_prod,
-            c_qtd,
-            c_total,
-            c_status,
-            c_cliente,
-            c_acoes,
-        ) = st.columns([1.4, 1.3, 2.8, 0.9, 1.4, 1.3, 1.7, 0.8])
+        c_data, c_canal, c_prod, c_qtd, c_total, c_status, c_cliente = st.columns(
+            [1.5, 1.5, 3, 1, 1.5, 1.5, 2]
+        )
         c_data.markdown("**Data**")
         c_canal.markdown("**Canal**")
         c_prod.markdown("**Produto**")
@@ -367,48 +118,31 @@ def _secao_listagem():
         c_total.markdown("**Valor Total**")
         c_status.markdown("**Status**")
         c_cliente.markdown("**Cliente**")
-        c_acoes.markdown("**Ações**")
 
         st.divider()
 
-        for v in vendas_filtradas:
-            (
-                col_data,
-                col_canal,
-                col_prod,
-                col_qtd,
-                col_total,
-                col_status,
-                col_cliente,
-                col_acoes,
-            ) = st.columns([1.4, 1.3, 2.8, 0.9, 1.4, 1.3, 1.7, 0.8])
+        for v in vendas:
+            col_data, col_canal, col_prod, col_qtd, col_total, col_status, col_cliente = (
+                st.columns([1.5, 1.5, 3, 1, 1.5, 1.5, 2])
+            )
 
             col_data.write(str(v.get("data_venda") or "-")[:10])
-            col_canal.write(v.get("canal_venda") or "-")
+            col_canal.write((v.get("canais_venda") or {}).get("nome") or "-")
 
             produto = v.get("produtos") or {}
             col_prod.write(produto.get("descricao") or "-")
 
             col_qtd.write(v.get("quantidade"))
             col_total.write(_fmt_moeda(v.get("valor_total")))
-            col_status.write(v.get("status") or "-")
+            col_status.write((v.get("status_venda") or {}).get("nome") or "-")
             col_cliente.write(v.get("cliente") or "-")
-
-            with col_acoes:
-                if st.button(
-                    "✏️",
-                    key=f"editar_venda_{v['id']}",
-                    help="Editar ou excluir venda",
-                    use_container_width=True,
-                ):
-                    _dialog_editar_venda(v)
 
 
 def tela_vendas():
     st.header("💰 Gestão de Vendas")
 
-    aba_listagem, aba_importar, aba_manual = st.tabs(
-        ["Vendas registradas", "Importar planilha", "Cadastrar venda"]
+    aba_listagem, aba_importar, aba_manual, aba_auxiliares = st.tabs(
+        ["Vendas registradas", "Importar planilha", "Cadastrar venda", "Cadastros Auxiliares"]
     )
 
     with aba_listagem:
@@ -419,3 +153,6 @@ def tela_vendas():
 
     with aba_manual:
         tela_vendas_manual()
+
+    with aba_auxiliares:
+        tela_cadastros_auxiliares()

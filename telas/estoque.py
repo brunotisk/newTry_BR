@@ -20,65 +20,6 @@ def _fmt_qtd(valor) -> str:
     return f"{valor:g}"
 
 
-POR_PAGINA = 50
-
-
-def _paginacao(total_itens: int, chave: str, por_pagina: int = POR_PAGINA, assinatura: str = None) -> tuple[int, int]:
-    """Controla o estado de paginação de uma listagem e renderiza os botões de
-    navegação (Anterior / Próxima + "Página X de Y"). Retorna (inicio, fim)
-    para fatiar a lista de itens já filtrada/ordenada na página atual.
-
-    `assinatura` deve representar os filtros ativos (ex.: texto de busca + toggles);
-    quando ela muda, a página é automaticamente resetada para a primeira.
-    """
-    total_paginas = max(1, -(-total_itens // por_pagina))  # divisão com arredondamento pra cima
-    chave_pagina = f"{chave}_pagina"
-    chave_assinatura = f"{chave}_assinatura"
-
-    if assinatura is not None and st.session_state.get(chave_assinatura) != assinatura:
-        st.session_state[chave_pagina] = 1
-        st.session_state[chave_assinatura] = assinatura
-
-    if chave_pagina not in st.session_state:
-        st.session_state[chave_pagina] = 1
-
-    # garante que a página guardada continue válida se o total de itens mudou
-    if st.session_state[chave_pagina] > total_paginas:
-        st.session_state[chave_pagina] = total_paginas
-
-    pagina_atual = st.session_state[chave_pagina]
-
-    col_ant, col_info, col_prox = st.columns([1, 3, 1])
-    with col_ant:
-        if st.button(
-            "◀ Anterior",
-            key=f"{chave}_btn_ant",
-            disabled=pagina_atual <= 1,
-            use_container_width=True,
-        ):
-            st.session_state[chave_pagina] -= 1
-            st.rerun()
-    with col_info:
-        st.markdown(
-            f"<div style='text-align:center; padding-top:0.45rem; color:#555;'>"
-            f"Página {pagina_atual} de {total_paginas} — {total_itens} registro(s)</div>",
-            unsafe_allow_html=True,
-        )
-    with col_prox:
-        if st.button(
-            "Próxima ▶",
-            key=f"{chave}_btn_prox",
-            disabled=pagina_atual >= total_paginas,
-            use_container_width=True,
-        ):
-            st.session_state[chave_pagina] += 1
-            st.rerun()
-
-    inicio = (pagina_atual - 1) * por_pagina
-    fim = inicio + por_pagina
-    return inicio, fim
-
-
 # ---------------------------------------------------------------------------
 # Aba 1: Estoque atual
 # ---------------------------------------------------------------------------
@@ -176,7 +117,7 @@ def _secao_estoque_atual():
             label_visibility="collapsed",
         )
     with col_toggle:
-        apenas_alerta = st.toggle("Apenas zerado/negativo", value=False)
+        mostrar_negativo = st.toggle("Mostrar zerado/negativo", value=False)
 
     if busca:
         termo = busca.strip().lower()
@@ -184,8 +125,11 @@ def _secao_estoque_atual():
             i for i in itens
             if termo in i["codigo_interno"].lower() or termo in i["descricao"].lower()
         ]
-    if apenas_alerta:
+
+    if mostrar_negativo:
         itens = [i for i in itens if i["status"] != "🟢 OK"]
+    else:
+        itens = [i for i in itens if i["status"] == "🟢 OK"]
 
     # Ordena: problemas primeiro (negativo, depois zerado, depois ok), por saldo crescente
     ordem_status = {"🔴 Negativo": 0, "🔴 Zerado": 1, "🟢 OK": 2}
@@ -194,10 +138,6 @@ def _secao_estoque_atual():
     if not itens:
         st.info("Nenhum produto encontrado para o filtro selecionado.")
         return
-
-    assinatura_filtros = f"{busca.strip().lower()}|{apenas_alerta}"
-    inicio, fim = _paginacao(len(itens), chave="estoque_atual", assinatura=assinatura_filtros)
-    itens_pagina = itens[inicio:fim]
 
     with st.container(border=True):
         c_cod, c_desc, c_cat, c_saldo, c_status = st.columns([1.5, 3.5, 2, 1.5, 1.5])
@@ -209,7 +149,7 @@ def _secao_estoque_atual():
 
         st.divider()
 
-        for item in itens_pagina:
+        for item in itens:
             col_cod, col_desc, col_cat, col_saldo, col_status = st.columns(
                 [1.5, 3.5, 2, 1.5, 1.5]
             )
@@ -272,12 +212,6 @@ def _secao_movimentacoes():
 
     icone_tipo = {"entrada": "🟢 Entrada", "saida": "🔴 Saída", "ajuste": "🟡 Ajuste"}
 
-    assinatura_filtros = (
-        f"{data_inicio.isoformat()}|{data_fim.isoformat()}|{tipo_filtro}|{busca_codigo.strip().lower()}"
-    )
-    inicio, fim = _paginacao(len(movimentos), chave="movimentacoes", assinatura=assinatura_filtros)
-    movimentos_pagina = movimentos[inicio:fim]
-
     with st.container(border=True):
         c_dt, c_tipo, c_prod, c_qtd, c_saldo, c_origem = st.columns(
             [1.3, 1.3, 3, 1.2, 1.2, 2.5]
@@ -291,7 +225,7 @@ def _secao_movimentacoes():
 
         st.divider()
 
-        for m in movimentos_pagina:
+        for m in movimentos:
             col_dt, col_tipo, col_prod, col_qtd, col_saldo, col_origem = st.columns(
                 [1.3, 1.3, 3, 1.2, 1.2, 2.5]
             )

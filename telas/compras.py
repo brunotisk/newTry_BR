@@ -3,14 +3,100 @@ from datetime import datetime
 from db import supabase
 from telas.importar_nf import tela_importar_nf
 
+# Compatibilidade: st.dialog é o nome estável (Streamlit >= 1.31); versões
+# um pouco mais antigas ainda expõem a mesma coisa como st.experimental_dialog.
+_dialog = getattr(st, "dialog", None) or st.experimental_dialog
+
+
+def _fmt_moeda(valor) -> str:
+    return (
+        f"R$ {float(valor or 0):,.2f}"
+        .replace(",", "X")
+        .replace(".", ",")
+        .replace("X", ".")
+    )
+
+
+def _fmt_qtd(valor) -> str:
+    """Mostra quantidade sem casas decimais desnecessárias (ex.: 1 em vez de 1.000)."""
+    return f"{float(valor or 0):g}"
+
+
+@_dialog("📦 Itens da compra", width="large")
+def _dialog_itens_compra(compra: dict):
+    # Alarga ainda mais o popup (o width="large" do Streamlit já ajuda,
+    # mas aqui forçamos um valor maior e fixo em pixels/vw).
+    st.markdown(
+        """
+        <style>
+        div[data-testid="stDialog"] > div {
+            max-width: 1100px !important;
+            width: 92vw !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.caption(
+        f"NF nº {compra.get('numero_nf') or '-'} — "
+        f"Chave: {compra.get('chave_acesso') or '-'}"
+    )
+
+    try:
+        response = (
+            supabase.table("compras_itens")
+            .select(
+                "numero_item, quantidade, valor_unitario, valor_desconto, valor_total,"
+                " produtos(codigo_interno, descricao)"
+            )
+            .eq("compra_id", compra["id"])
+            .order("numero_item")
+            .execute()
+        )
+        itens = response.data or []
+    except Exception as e:
+        st.error(f"Erro ao carregar itens da compra: {e}")
+        return
+
+    if not itens:
+        st.info("Nenhum item encontrado para essa compra.")
+        return
+
+    with st.container(border=True):
+        c_cod, c_desc, c_qtd, c_unit, c_desc_v, c_tot = st.columns(
+            [1, 4, 0.8, 1.2, 1.2, 1.2]
+        )
+        c_cod.markdown("**Código**")
+        c_desc.markdown("**Produto**")
+        c_qtd.markdown("**Qtd**")
+        c_unit.markdown("**Vlr. Unit.**")
+        c_desc_v.markdown("**Desconto**")
+        c_tot.markdown("**Vlr. Total**")
+
+        st.divider()
+
+        for item in itens:
+            produto = item.get("produtos") or {}
+            col_cod, col_desc, col_qtd, col_unit, col_desc_v, col_tot = st.columns(
+                [1, 4, 0.8, 1.2, 1.2, 1.2]
+            )
+            col_cod.write(produto.get("codigo_interno") or "-")
+            col_desc.write(produto.get("descricao") or "-")
+            col_qtd.write(_fmt_qtd(item.get("quantidade")))
+            col_unit.write(_fmt_moeda(item.get("valor_unitario")))
+            col_desc_v.write(_fmt_moeda(item.get("valor_desconto")))
+            col_tot.write(_fmt_moeda(item.get("valor_total")))
+
 
 def _secao_listagem():
     try:
-        # 1. Consulta dos dados na tabela 'compras'
+        # 1. Consulta dos dados na tabela 'compras' (agora incluindo o id,
+        #    necessário para buscar os itens e a contagem por compra)
         response = (
             supabase.table("compras")
             .select(
-                "numero_nf, data_emissao, valor_produtos, valor_desconto,"
+                "id, numero_nf, data_emissao, valor_produtos, valor_desconto,"
                 " valor_total, chave_acesso"
             )
             .order("data_emissao", desc=True)
@@ -18,7 +104,24 @@ def _secao_listagem():
         )
         compras = response.data or []
 
-        # 2. Cálculo dos Cards (KPIs)
+        # 2. Contagem de itens por compra numa única consulta a compras_itens
+        qtd_itens_por_compra: dict[int, int] = {}
+        compra_ids = [c["id"] for c in compras]
+        if compra_ids:
+            try:
+                itens_resp = (
+                    supabase.table("compras_itens")
+                    .select("compra_id")
+                    .in_("compra_id", compra_ids)
+                    .execute()
+                )
+                for row in itens_resp.data or []:
+                    cid = row["compra_id"]
+                    qtd_itens_por_compra[cid] = qtd_itens_por_compra.get(cid, 0) + 1
+            except Exception:
+                pass  # coluna de itens fica "-" se essa consulta falhar
+
+        # 3. Cálculo dos Cards (KPIs)
         total_compras = len(compras)
         soma_valor_total = sum(
             float(item.get("valor_total") or 0) for item in compras
@@ -53,7 +156,7 @@ def _secao_listagem():
             unsafe_allow_html=True,
         )
 
-        # 3. Exibição dos Cards no Topo (KPIs)
+        # 4. Exibição dos Cards no Topo (KPIs)
         col_kpi1, col_kpi2, col_kpi3 = st.columns(3)
 
         with col_kpi1:
@@ -77,10 +180,10 @@ def _secao_listagem():
             st.info("Nenhuma compra registrada.")
             return
 
-        # 4. Tabela de Compras
+        # 5. Tabela de Compras
         with st.container(border=True):
-            c_nf, c_dt, c_prod, c_desc, c_tot, c_chave = st.columns(
-                [1.5, 2, 2, 2, 2, 4]
+            c_nf, c_dt, c_prod, c_desc, c_tot, c_itens, c_chave, c_acao = st.columns(
+                [1.3, 1.7, 1.7, 1.7, 1.7, 0.9, 3.2, 0.9]
             )
 
             c_nf.markdown("**Número NF**")
@@ -88,13 +191,15 @@ def _secao_listagem():
             c_prod.markdown("**Valor Produto**")
             c_desc.markdown("**Desconto (-)**")
             c_tot.markdown("**Valor Total**")
+            c_itens.markdown("**Itens**")
             c_chave.markdown("**Chave Acesso**")
+            c_acao.markdown("**Ações**")
 
             st.divider()
 
             for item in compras:
-                col_nf, col_dt, col_prod, col_desc, col_tot, col_chave = (
-                    st.columns([1.5, 2, 2, 2, 2, 4])
+                col_nf, col_dt, col_prod, col_desc, col_tot, col_itens, col_chave, col_acao = (
+                    st.columns([1.3, 1.7, 1.7, 1.7, 1.7, 0.9, 3.2, 0.9])
                 )
 
                 col_nf.write(item.get("numero_nf") or "-")
@@ -129,7 +234,17 @@ def _secao_listagem():
                     .replace(".", ",")
                     .replace("X", ".")
                 )
+
+                col_itens.write(str(qtd_itens_por_compra.get(item["id"], 0)))
                 col_chave.write(item.get("chave_acesso") or "-")
+
+                if col_acao.button(
+                    "🔎",
+                    key=f"ver_itens_compra_{item['id']}",
+                    help="Ver itens da compra",
+                    use_container_width=True,
+                ):
+                    _dialog_itens_compra(item)
 
     except Exception as e:
         st.error(f"Erro ao carregar dados de compras: {e}")

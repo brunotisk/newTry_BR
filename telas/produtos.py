@@ -35,11 +35,27 @@ def _secao_consulta():
         }
         cat_ids = list(cat_dict.keys())
 
-        # Topo: Filtros e Título
-        col_titulo, col_busca, col_filtro = st.columns([2, 2, 1])
+        # Lista de categorias únicas (sem o banho) para o filtro
+        categorias_unicas = list(dict.fromkeys([cat["categoria"] for cat in categorias if cat.get("categoria")]))
+        opcoes_cat = ["Todas as Categorias", "Sem Categoria"] + categorias_unicas
+
+        # Topo: Layout dos filtros em 3 colunas (1º Código, 2º Categoria, 3º Toggle)
+        col_busca, col_cat_filtro, col_filtro = st.columns([3.5, 2.5, 2])
 
         with col_busca:
-            busca_codigo = st.text_input("Filtrar por código interno", placeholder="Digite o código...", label_visibility="collapsed")
+            busca_codigo = st.text_input(
+                "Filtrar por código interno",
+                placeholder="Digite o código...",
+                label_visibility="collapsed"
+            )
+
+        with col_cat_filtro:
+            categoria_selecionada = st.selectbox(
+                "Filtrar Categoria",
+                options=opcoes_cat,
+                index=0,
+                label_visibility="collapsed"
+            )
 
         with col_filtro:
             filtrar_sem_cat = st.toggle("Apenas sem categoria", value=False)
@@ -49,7 +65,7 @@ def _secao_consulta():
             st.session_state.pagina_atual_produtos = 1
 
         # Reseta para a página 1 se qualquer filtro mudar
-        chave_filtro = f"{busca_codigo}_{filtrar_sem_cat}"
+        chave_filtro = f"{busca_codigo}_{categoria_selecionada}_{filtrar_sem_cat}"
         if st.session_state.get("chave_filtro_ant") != chave_filtro:
             st.session_state.pagina_atual_produtos = 1
             st.session_state.chave_filtro_ant = chave_filtro
@@ -62,6 +78,12 @@ def _secao_consulta():
 
         if filtrar_sem_cat:
             query = query.is_("categoria_id", "null")
+        elif categoria_selecionada == "Sem Categoria":
+            query = query.is_("categoria_id", "null")
+        elif categoria_selecionada != "Todas as Categorias":
+            ids_cat_sel = [cid for cid, info in cat_dict.items() if info["categoria"] == categoria_selecionada]
+            if ids_cat_sel:
+                query = query.in_("categoria_id", ids_cat_sel)
 
         if busca_codigo:
             query = query.ilike("codigo_interno", f"%{busca_codigo.strip()}%")
@@ -79,8 +101,7 @@ def _secao_consulta():
         produtos = response_prod.data or []
         total_paginas = math.ceil(total_itens / itens_por_pagina) if total_itens > 0 else 1
 
-        with col_titulo:
-            st.header(f"📦 Produtos ({total_itens} Itens)")
+        st.header(f"📦 Produtos ({total_itens} Itens)")
 
         if not produtos:
             st.info("Nenhum produto encontrado para o filtro digitado.")
