@@ -5,9 +5,20 @@ from datetime import date, datetime
 from typing import Optional
 
 from db import supabase
-from vendas_import import ler_planilha, importar_vendas_excel
+from vendas_import import (
+    ler_planilha,
+    importar_vendas_excel,
+    buscar_produto_id,
+    editar_venda,
+    excluir_venda,
+    get_client,
+)
 from telas.vendas_manual import tela_vendas_manual
 from telas.cadastros_auxiliares import tela_cadastros_auxiliares
+
+# Compatibilidade: st.dialog é o nome estável (Streamlit >= 1.31); versões
+# um pouco mais antigas ainda expõem a mesma coisa como st.experimental_dialog.
+_dialog = getattr(st, "dialog", None) or st.experimental_dialog
 
 MESES_PT = {
     1: "Janeiro", 2: "Fevereiro", 3: "Março", 4: "Abril",
@@ -37,17 +48,42 @@ def _parse_data_segura(valor):
 
 
 def _injetar_estilo_kpi():
-    """Evita que o valor dos st.metric seja cortado com reticências quando
-    o card fica estreito (ex.: 4 cartões numa linha)."""
+    """Garante altura idêntica para todos os cards de KPI e ajusta o layout interno."""
     st.markdown(
         """
         <style>
+        /* Desativa corte de texto nos rótulos e valores dos KPIs */
         div[data-testid="stMetricValue"] {
             overflow: visible;
             white-space: normal;
             word-break: break-word;
             font-size: 1.35rem;
             line-height: 1.2;
+        }
+        
+        /* Fixa altura exata e alinhamento vertical dos containers de KPI */
+        div[data-testid="stColumn"] div[data-testid="stVerticalBlockBorderWrapper"] {
+            min-height: 160px !important;
+            height: 160px !important;
+        }
+        
+        div[data-testid="stColumn"] div[data-testid="stVerticalBlockBorderWrapper"] > div {
+            height: 100%;
+        }
+        
+        div[data-testid="stColumn"] div[data-testid="stVerticalBlockBorderWrapper"] div[data-testid="stVerticalBlock"] {
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+        }
+        
+        /* Fallback para versões legadas do Streamlit */
+        div[data-testid="stColumn"] > div[data-testid="stVerticalBlock"] > div[data-testid="stElementContainer"] > div[data-testid="stContainer"] {
+            min-height: 160px !important;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
         }
         </style>
         """,
@@ -111,6 +147,112 @@ def _secao_importar():
             with st.expander(f"⚠️ {len(resultado['erros'])} linha(s) com erro"):
                 for erro in resultado["erros"]:
                     st.write(f"- {erro}")
+
+
+@_dialog("✏️ Editar venda", width="large")
+def _dialog_editar_venda(venda: dict, canais_disponiveis: list, status_disponiveis: list):
+    produto = venda.get("produtos") or {}
+    codigo_atual = produto.get("codigo_interno") or ""
+
+    canal_atual_nome = (venda.get("canais_venda") or {}).get("nome") or ""
+    status_atual_nome = (venda.get("status_venda") or {}).get("nome") or ""
+
+    nomes_status = [s["nome"] for s in status_disponiveis]
+
+    data_atual = datetime.fromisoformat(str(venda["data_venda"])[:10]).date()
+
+    st.caption(f"Venda #{venda['id']}")
+
+    with st.form(f"form_editar_venda_{venda['id']}"):
+        # Linha 1: Código interno | Canal de venda | Status
+        col_cod, col_canal, col_status = st.columns(3)
+        with col_cod:
+            st.text_input("Código interno do produto", value=codigo_atual, disabled=True)
+        with col_canal:
+            st.text_input("Canal de venda", value=canal_atual_nome, disabled=True)
+        with col_status:
+            status_nome = st.selectbox(
+                "Status",
+                nomes_status,
+                index=nomes_status.index(status_atual_nome) if status_atual_nome in nomes_status else 0,
+            )
+
+        # Linha 2: Quantidade | Valor unitário | Desconto | Valor total
+        col_qtd, col_unit, col_desc, col_total = st.columns(4)
+        with col_qtd:
+            quantidade = st.number_input(
+                "Quantidade", min_value=0.01, step=1.0, format="%.2f",
+                value=float(venda.get("quantidade") or 0.01),
+            )
+        with col_unit:
+            valor_unitario = st.number_input(
+                "Valor unitário", min_value=0.0, step=0.01, format="%.2f",
+                value=float(venda.get("valor_unitario") or 0),
+            )
+        with col_desc:
+            valor_desconto = st.number_input(
+                "Desconto", min_value=0.0, step=0.01, format="%.2f",
+                value=float(venda.get("valor_desconto") or 0),
+            )
+        with col_total:
+            valor_total = st.number_input(
+                "Valor total", min_value=0.0, step=0.01, format="%.2f",
+                value=float(venda.get("valor_total") or 0),
+            )
+
+        # Linha 3: Data da venda | Cliente
+        col_data, col_cliente = st.columns(2)
+        with col_data:
+            data_venda = st.date_input("Data da venda", value=data_atual)
+        with col_cliente:
+            cliente = st.text_input("Cliente", value=venda.get("cliente") or "")
+
+        col_salvar, col_cancelar, col_excluir = st.columns(3)
+        salvar = col_salvar.form_submit_button("💾 Salvar", type="primary", use_container_width=True)
+        cancelar = col_cancelar.form_submit_button("Cancelar", use_container_width=True)
+        excluir = col_excluir.form_submit_button("🗑️ Excluir", use_container_width=True)
+
+    if cancelar:
+        st.rerun()
+
+    if excluir:
+        try:
+            sb = get_client()
+            excluir_venda(sb, venda)
+            st.success("Venda excluída e estoque ajustado com sucesso!")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Erro ao excluir venda: {e}")
+
+    if salvar:
+        try:
+            sb = get_client()
+
+            # Código interno e canal não são editáveis aqui: mantém o
+            # produto e o canal originais da venda.
+            canal_id = next(
+                (c["id"] for c in canais_disponiveis if c["nome"] == canal_atual_nome),
+                None,
+            )
+            status_id = next(s["id"] for s in status_disponiveis if s["nome"] == status_nome)
+
+            dados_novos = {
+                "produto_id": venda["produto_id"],
+                "canal_venda_id": canal_id,
+                "status_id": status_id,
+                "quantidade": float(quantidade),
+                "valor_unitario": float(valor_unitario),
+                "valor_desconto": float(valor_desconto),
+                "valor_total": float(valor_total),
+                "data_venda": data_venda.isoformat(),
+                "cliente": cliente.strip(),
+            }
+
+            editar_venda(sb, venda, dados_novos)
+            st.success("Venda atualizada e estoque ajustado com sucesso!")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Erro ao salvar alterações: {e}")
 
 
 def _resetar_filtros_vendas():
@@ -186,6 +328,17 @@ def _secao_listagem():
         canais_disponiveis = []  # filtro de canal fica indisponível se a consulta falhar
 
     opcoes_canal = ["Todos"] + [c["nome"] for c in canais_disponiveis]
+
+    try:
+        response_status = (
+            supabase.table("status_venda")
+            .select("id, nome")
+            .order("nome")
+            .execute()
+        )
+        status_disponiveis = response_status.data or []
+    except Exception:
+        status_disponiveis = []  # popup de edição fica sem opções de status se a consulta falhar
 
     # Seleção atual dos filtros (lida do session_state, com fallback seguro
     # caso a lista de opções tenha mudado desde a última execução)
@@ -273,7 +426,7 @@ def _secao_listagem():
             supabase
             .table("vendas")
             .select(
-                "id, quantidade, valor_unitario, valor_desconto,"
+                "id, produto_id, quantidade, valor_unitario, valor_desconto,"
                 " valor_total, data_venda, cliente,"
                 f" produtos(descricao, codigo_interno), {canal_embed}, status_venda(nome)",
                 count="exact",
@@ -321,8 +474,8 @@ def _secao_listagem():
         return
 
     with st.container(border=True):
-        c_data, c_canal, c_prod, c_qtd, c_total, c_status, c_cliente = st.columns(
-            [1.5, 1.5, 3, 1, 1.5, 1.5, 2]
+        c_data, c_canal, c_prod, c_qtd, c_total, c_status, c_cliente, c_acoes = st.columns(
+            [1.4, 1.3, 2.8, 0.9, 1.4, 1.3, 1.7, 0.8]
         )
         c_data.markdown("**Data**")
         c_canal.markdown("**Canal**")
@@ -331,12 +484,13 @@ def _secao_listagem():
         c_total.markdown("**Valor Total**")
         c_status.markdown("**Status**")
         c_cliente.markdown("**Cliente**")
+        c_acoes.markdown("**Ações**")
 
         st.divider()
 
         for v in vendas:
-            col_data, col_canal, col_prod, col_qtd, col_total, col_status, col_cliente = (
-                st.columns([1.5, 1.5, 3, 1, 1.5, 1.5, 2])
+            col_data, col_canal, col_prod, col_qtd, col_total, col_status, col_cliente, col_acoes = (
+                st.columns([1.4, 1.3, 2.8, 0.9, 1.4, 1.3, 1.7, 0.8])
             )
 
             col_data.write(str(v.get("data_venda") or "-")[:10])
@@ -349,6 +503,14 @@ def _secao_listagem():
             col_total.write(_fmt_moeda(v.get("valor_total")))
             col_status.write((v.get("status_venda") or {}).get("nome") or "-")
             col_cliente.write(v.get("cliente") or "-")
+
+            if col_acoes.button(
+                "✏️",
+                key=f"editar_venda_{v['id']}",
+                help="Editar ou excluir venda",
+                use_container_width=True,
+            ):
+                _dialog_editar_venda(v, canais_disponiveis, status_disponiveis)
 
     # Navegação de páginas
     if total_paginas > 1:

@@ -27,12 +27,14 @@ Instalar: pip install pandas openpyxl
 """
 from __future__ import annotations
 import os
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 
 import pandas as pd
 from dotenv import load_dotenv
 from supabase import create_client, Client
+
+from estoque_ajuste import registrar_ajuste
 
 load_dotenv()
 
@@ -255,6 +257,75 @@ def inserir_venda_e_baixar_estoque(sb: Client, linha: dict, produto_id: int) -> 
     }).execute()
 
     return venda_id
+
+
+def editar_venda(sb: Client, venda_antiga: dict, dados_novos: dict) -> None:
+    """Atualiza os campos de uma venda existente e ajusta o estoque de acordo
+    com a diferença entre a quantidade antiga e a nova.
+
+    `venda_antiga` precisa conter ao menos `id`, `produto_id` e `quantidade`
+    (os valores como estavam antes da edição).
+    `dados_novos` deve conter todos os campos finais a gravar em `vendas`
+    (incluindo `produto_id`, `canal_venda_id`, `status_id` e `quantidade`).
+    """
+    venda_id = venda_antiga["id"]
+    produto_id_antigo = venda_antiga["produto_id"]
+    quantidade_antiga = float(venda_antiga.get("quantidade") or 0)
+
+    produto_id_novo = dados_novos["produto_id"]
+    quantidade_nova = float(dados_novos["quantidade"])
+    hoje = date.today().isoformat()
+
+    if produto_id_novo != produto_id_antigo:
+        # devolve a quantidade antiga ao estoque do produto antigo
+        registrar_ajuste(
+            sb,
+            produto_id=produto_id_antigo,
+            quantidade=quantidade_antiga,
+            motivo=f"Estorno por edição da venda #{venda_id} (produto alterado)",
+            data_movimento=hoje,
+        )
+        # dá baixa da quantidade nova no estoque do produto novo
+        registrar_ajuste(
+            sb,
+            produto_id=produto_id_novo,
+            quantidade=-quantidade_nova,
+            motivo=f"Ajuste por edição da venda #{venda_id} (produto alterado)",
+            data_movimento=hoje,
+        )
+    else:
+        # mesmo produto: só a diferença de quantidade precisa ser ajustada
+        delta = quantidade_antiga - quantidade_nova
+        if delta != 0:
+            registrar_ajuste(
+                sb,
+                produto_id=produto_id_novo,
+                quantidade=delta,
+                motivo=f"Ajuste por edição da venda #{venda_id} (quantidade alterada)",
+                data_movimento=hoje,
+            )
+
+    sb.table("vendas").update(dados_novos).eq("id", venda_id).execute()
+
+
+def excluir_venda(sb: Client, venda: dict) -> None:
+    """Exclui uma venda e devolve a quantidade correspondente ao estoque do
+    produto, registrando o estorno no ledger de movimentações.
+
+    `venda` precisa conter `id`, `produto_id` e `quantidade`.
+    """
+    venda_id = venda["id"]
+    produto_id = venda["produto_id"]
+    quantidade = float(venda.get("quantidade") or 0)
+
+    registrar_ajuste(
+        sb,
+        produto_id=produto_id,
+        quantidade=quantidade,
+        motivo=f"Estorno da venda #{venda_id} (exclusão)",
+        data_movimento=date.today().isoformat(),
+    )
+    sb.table("vendas").delete().eq("id", venda_id).execute()
 
 
 def importar_vendas_excel(caminho_arquivo) -> dict:
