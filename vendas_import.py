@@ -225,7 +225,14 @@ def obter_ou_criar_lista_id(sb: Client, tabela: str, nome: str) -> int:
 
 
 def inserir_venda_e_baixar_estoque(sb: Client, linha: dict, produto_id: int) -> int:
-    venda_resp = sb.table("vendas").insert({
+    """Insere uma venda e registra sua saída no estoque/ledger.
+
+    Esta é a rotina única usada tanto pela importação de Excel quanto pelo
+    cadastro manual da tela de vendas. Os campos novos de forma de pagamento
+    e feira são opcionais para manter a importação de planilhas antigas
+    compatível; quando informados, ficam gravados na venda.
+    """
+    dados_venda = {
         "produto_id": produto_id,
         "canal_venda_id": linha["canal_venda_id"],
         "quantidade": float(linha["quantidade"]),
@@ -234,24 +241,41 @@ def inserir_venda_e_baixar_estoque(sb: Client, linha: dict, produto_id: int) -> 
         "valor_total": float(linha["valor_total"]),
         "status_id": linha["status_id"],
         "data_venda": linha["data_venda"],
-        "cliente": linha["cliente"],
-    }).execute()
+        "cliente": linha.get("cliente") or "",
+    }
+
+    # Compatibilidade com vendas antigas/importações que não possuem esses
+    # dados. A tela manual passa os dois campos quando aplicável.
+    if linha.get("forma_pagamento_id") is not None:
+        dados_venda["forma_pagamento_id"] = linha["forma_pagamento_id"]
+    if linha.get("detalhe_feira_id") is not None:
+        dados_venda["detalhe_feira_id"] = linha["detalhe_feira_id"]
+
+    venda_resp = sb.table("vendas").insert(dados_venda).execute()
     venda_id = venda_resp.data[0]["id"]
 
-    estoque_resp = sb.table("estoque").select("quantidade_atual").eq("produto_id", produto_id).execute()
+    estoque_resp = (
+        sb.table("estoque")
+        .select("quantidade_atual")
+        .eq("produto_id", produto_id)
+        .execute()
+    )
     saldo_anterior = estoque_resp.data[0]["quantidade_atual"] if estoque_resp.data else 0
-    novo_saldo = float(saldo_anterior) - float(linha["quantidade"])
+    quantidade = float(linha["quantidade"])
+    novo_saldo = float(saldo_anterior) - quantidade
 
     sb.table("estoque").upsert({
         "produto_id": produto_id,
         "quantidade_atual": novo_saldo,
     }, on_conflict="produto_id").execute()
 
+    # Toda venda, inclusive a criada manualmente pelo popup, gera uma
+    # saída vinculada à venda no ledger.
     sb.table("estoque_movimentos").insert({
         "produto_id": produto_id,
         "venda_id": venda_id,
         "tipo": "saida",
-        "quantidade": float(linha["quantidade"]),
+        "quantidade": quantidade,
         "saldo_apos": novo_saldo,
         "data_movimento": linha["data_venda"],
     }).execute()

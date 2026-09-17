@@ -2,6 +2,7 @@ import streamlit as st
 from datetime import datetime
 from db import supabase
 from telas.importar_nf import tela_importar_nf
+from componentes.paginacao import render_paginacao, get_itens_por_pagina, reset_paginacao
 
 # Compatibilidade: st.dialog é o nome estável (Streamlit >= 1.31); versões
 # um pouco mais antigas ainda expõem a mesma coisa como st.experimental_dialog.
@@ -180,7 +181,31 @@ def _secao_listagem():
             st.info("Nenhuma compra registrada.")
             return
 
-        # 5. Tabela de Compras
+        # 5. Paginação da listagem
+        filtro_atual = len(compras)
+        if st.session_state.get("compras_total_anterior") != filtro_atual:
+            st.session_state["compras_total_anterior"] = filtro_atual
+            reset_paginacao("compras")
+
+        itens_por_pagina = get_itens_por_pagina("compras", 50)
+        total_compras_registros = len(compras)
+        total_paginas = max(1, (total_compras_registros + itens_por_pagina - 1) // itens_por_pagina)
+        pagina_atual = min(int(st.session_state.get("pagina_atual_compras", 1)), total_paginas)
+        st.session_state["pagina_atual_compras"] = max(1, pagina_atual)
+        inicio = (st.session_state["pagina_atual_compras"] - 1) * itens_por_pagina
+        compras_pagina = compras[inicio:inicio + itens_por_pagina]
+
+        # Paginação informativa no topo da tabela.
+        render_paginacao(
+            "compras",
+            total_compras_registros,
+            itens_por_pagina=itens_por_pagina,
+            mostrar_contagem_superior=True,
+            mostrar_contagem_inferior=False,
+            permitir_seletor=True,
+        )
+
+        # 6. Tabela de Compras
         with st.container(border=True):
             c_nf, c_dt, c_prod, c_desc, c_tot, c_itens, c_chave, c_acao = st.columns(
                 [1.3, 1.7, 1.7, 1.7, 1.7, 0.9, 3.2, 0.9]
@@ -197,7 +222,7 @@ def _secao_listagem():
 
             st.divider()
 
-            for item in compras:
+            for item in compras_pagina:
                 col_nf, col_dt, col_prod, col_desc, col_tot, col_itens, col_chave, col_acao = (
                     st.columns([1.3, 1.7, 1.7, 1.7, 1.7, 0.9, 3.2, 0.9])
                 )
@@ -245,6 +270,15 @@ def _secao_listagem():
                     use_container_width=True,
                 ):
                     _dialog_itens_compra(item)
+
+        render_paginacao(
+            "compras",
+            total_compras_registros,
+            itens_por_pagina=itens_por_pagina,
+            mostrar_contagem_superior=False,
+            mostrar_contagem_inferior=True,
+            permitir_seletor=True,
+        )
 
     except Exception as e:
         st.error(f"Erro ao carregar dados de compras: {e}")

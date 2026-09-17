@@ -1,7 +1,7 @@
 import streamlit as st
-import math
 from db import supabase
 from telas.categorias import tela_categorias
+from componentes.paginacao import render_paginacao, get_itens_por_pagina, reset_paginacao
 
 
 def _secao_consulta():
@@ -70,7 +70,7 @@ def _secao_consulta():
             st.session_state.pagina_atual_produtos = 1
             st.session_state.chave_filtro_ant = chave_filtro
 
-        itens_por_pagina = 50
+        itens_por_pagina = get_itens_por_pagina("produtos", 50)
         offset = (st.session_state.pagina_atual_produtos - 1) * itens_por_pagina
 
         # 2. Construção da query com contagem total
@@ -99,7 +99,6 @@ def _secao_consulta():
             response_prod = query.order("id").range(offset, offset + itens_por_pagina - 1).execute()
 
         produtos = response_prod.data or []
-        total_paginas = math.ceil(total_itens / itens_por_pagina) if total_itens > 0 else 1
 
         st.header(f"📦 Produtos ({total_itens} Itens)")
 
@@ -107,7 +106,19 @@ def _secao_consulta():
             st.info("Nenhum produto encontrado para o filtro digitado.")
             return
 
-        # 3. Tabela dentro de Container
+        # 3. Paginação informativa no topo da tabela
+        # O componente exibe a mesma informação da paginação inferior,
+        # sem duplicar os controles de navegação.
+        render_paginacao(
+            "produtos",
+            total_itens,
+            itens_por_pagina=itens_por_pagina,
+            mostrar_contagem_superior=True,
+            mostrar_contagem_inferior=False,
+            permitir_seletor=True,
+        )
+
+        # 4. Tabela dentro de Container
         with st.container(border=True):
             c_id, c_cod, c_desc, c_cat, c_banho, c_ult_compra, c_nr_compra, c_acao = st.columns([1, 2, 3, 2, 2, 2, 1, 1])
 
@@ -167,23 +178,15 @@ def _secao_consulta():
                 else:
                     col_acao.caption("-")
 
-        # 4. Navegação de Páginas
-        if total_paginas > 1:
-            col_espaco, col_paginacao = st.columns([2, 1])
-            with col_paginacao:
-                nova_pagina = st.number_input(
-                    f"Página (1 de {total_paginas})",
-                    min_value=1,
-                    max_value=total_paginas,
-                    value=st.session_state.pagina_atual_produtos,
-                    step=1,
-                    key="input_pagina_nav"
-                )
-                if nova_pagina != st.session_state.pagina_atual_produtos:
-                    st.session_state.pagina_atual_produtos = nova_pagina
-                    st.rerun()
-
-        st.caption(f"Exibindo página {st.session_state.pagina_atual_produtos} de {total_paginas} ({total_itens} registros no total).")
+        # 5. Paginação reutilizável
+        render_paginacao(
+            "produtos",
+            total_itens,
+            itens_por_pagina=itens_por_pagina,
+            mostrar_contagem_superior=False,
+            mostrar_contagem_inferior=True,
+            permitir_seletor=True,
+        )
 
     except Exception as e:
         st.error(f"Erro ao consultar produtos: {e}")

@@ -3,6 +3,7 @@ from datetime import date, datetime, timedelta
 
 from db import supabase
 from estoque_ajuste import get_client, registrar_ajuste
+from componentes.paginacao import render_paginacao, reset_paginacao, get_itens_por_pagina
 
 
 def _fmt_moeda(valor) -> str:
@@ -135,7 +136,27 @@ def _secao_estoque_atual():
     ordem_status = {"🔴 Negativo": 0, "🔴 Zerado": 1, "🟢 OK": 2}
     itens.sort(key=lambda i: (ordem_status[i["status"]], i["saldo"]))
 
-    if not itens:
+    # Detecta mudança nos filtros e volta para a primeira página.
+    filtro_atual = (busca.strip().lower(), bool(mostrar_negativo))
+    if st.session_state.get("estoque_filtro_atual") != filtro_atual:
+        st.session_state["estoque_filtro_atual"] = filtro_atual
+        reset_paginacao("estoque_atual")
+
+    total_itens = len(itens)
+    itens_por_pagina = get_itens_por_pagina("estoque_atual", 50)
+    total_paginas = max(1, (total_itens + itens_por_pagina - 1) // itens_por_pagina)
+    pagina_atual = min(int(st.session_state.get("pagina_atual_estoque_atual", 1)), total_paginas)
+    st.session_state["pagina_atual_estoque_atual"] = max(1, pagina_atual)
+
+    st.caption(
+        f"Exibindo página {st.session_state['pagina_atual_estoque_atual']} de {total_paginas} "
+        f"({total_itens} registros no total)."
+    )
+
+    inicio = (st.session_state["pagina_atual_estoque_atual"] - 1) * itens_por_pagina
+    itens_pagina = itens[inicio:inicio + itens_por_pagina]
+
+    if not itens_pagina:
         st.info("Nenhum produto encontrado para o filtro selecionado.")
         return
 
@@ -149,15 +170,22 @@ def _secao_estoque_atual():
 
         st.divider()
 
-        for item in itens:
-            col_cod, col_desc, col_cat, col_saldo, col_status = st.columns(
-                [1.5, 3.5, 2, 1.5, 1.5]
-            )
+        for item in itens_pagina:
+            col_cod, col_desc, col_cat, col_saldo, col_status = st.columns([1.5, 3.5, 2, 1.5, 1.5])
             col_cod.write(item["codigo_interno"])
             col_desc.write(item["descricao"])
             col_cat.write(item["categoria"])
             col_saldo.write(_fmt_qtd(item["saldo"]))
             col_status.write(item["status"])
+
+    render_paginacao(
+        "estoque_atual",
+        total_itens,
+        itens_por_pagina=itens_por_pagina,
+        mostrar_contagem_superior=False,
+        mostrar_contagem_inferior=True,
+        permitir_seletor=True,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -203,19 +231,38 @@ def _secao_movimentacoes():
             if termo in ((m.get("produtos") or {}).get("codigo_interno") or "").lower()
         ]
 
-    st.caption(f"{len(movimentos)} movimento(s) no período (máximo de 500 exibidos).")
-    st.markdown("---")
+    filtro_atual = (
+        data_inicio.isoformat(),
+        data_fim.isoformat(),
+        tipo_filtro,
+        busca_codigo.strip().lower(),
+    )
+    if st.session_state.get("movimentos_filtro_atual") != filtro_atual:
+        st.session_state["movimentos_filtro_atual"] = filtro_atual
+        reset_paginacao("estoque_movimentacoes")
 
-    if not movimentos:
+    total_itens = len(movimentos)
+    itens_por_pagina = get_itens_por_pagina("estoque_movimentacoes", 50)
+    total_paginas = max(1, (total_itens + itens_por_pagina - 1) // itens_por_pagina)
+    pagina_atual = min(int(st.session_state.get("pagina_atual_estoque_movimentacoes", 1)), total_paginas)
+    st.session_state["pagina_atual_estoque_movimentacoes"] = max(1, pagina_atual)
+
+    st.caption(
+        f"Exibindo página {st.session_state['pagina_atual_estoque_movimentacoes']} de {total_paginas} "
+        f"({total_itens} registros no total)."
+    )
+
+    inicio = (st.session_state["pagina_atual_estoque_movimentacoes"] - 1) * itens_por_pagina
+    movimentos_pagina = movimentos[inicio:inicio + itens_por_pagina]
+
+    if not movimentos_pagina:
         st.info("Nenhuma movimentação encontrada para o filtro selecionado.")
         return
 
     icone_tipo = {"entrada": "🟢 Entrada", "saida": "🔴 Saída", "ajuste": "🟡 Ajuste"}
 
     with st.container(border=True):
-        c_dt, c_tipo, c_prod, c_qtd, c_saldo, c_origem = st.columns(
-            [1.3, 1.3, 3, 1.2, 1.2, 2.5]
-        )
+        c_dt, c_tipo, c_prod, c_qtd, c_saldo, c_origem = st.columns([1.3, 1.3, 3, 1.2, 1.2, 2.5])
         c_dt.markdown("**Data**")
         c_tipo.markdown("**Tipo**")
         c_prod.markdown("**Produto**")
@@ -225,10 +272,8 @@ def _secao_movimentacoes():
 
         st.divider()
 
-        for m in movimentos:
-            col_dt, col_tipo, col_prod, col_qtd, col_saldo, col_origem = st.columns(
-                [1.3, 1.3, 3, 1.2, 1.2, 2.5]
-            )
+        for m in movimentos_pagina:
+            col_dt, col_tipo, col_prod, col_qtd, col_saldo, col_origem = st.columns([1.3, 1.3, 3, 1.2, 1.2, 2.5])
 
             if m.get("data_movimento"):
                 dt = datetime.fromisoformat(str(m["data_movimento"])[:10])
@@ -240,7 +285,6 @@ def _secao_movimentacoes():
 
             produto = m.get("produtos") or {}
             col_prod.write(produto.get("descricao") or "-")
-
             col_qtd.write(_fmt_qtd(m.get("quantidade")))
             col_saldo.write(_fmt_qtd(m.get("saldo_apos")))
 
@@ -252,6 +296,15 @@ def _secao_movimentacoes():
                 col_origem.write(m.get("motivo") or "-")
             else:
                 col_origem.write("-")
+
+    render_paginacao(
+        "estoque_movimentacoes",
+        total_itens,
+        itens_por_pagina=itens_por_pagina,
+        mostrar_contagem_superior=False,
+        mostrar_contagem_inferior=True,
+        permitir_seletor=True,
+    )
 
 
 # ---------------------------------------------------------------------------
