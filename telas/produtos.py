@@ -100,8 +100,6 @@ def _secao_consulta():
 
         produtos = response_prod.data or []
 
-        st.header(f"📦 Produtos ({total_itens} Itens)")
-
         if not produtos:
             st.info("Nenhum produto encontrado para o filtro digitado.")
             return
@@ -193,6 +191,15 @@ def _secao_consulta():
 
 
 def tela_produtos():
+    # Cabeçalho principal acima das abas, conforme o layout solicitado.
+    try:
+        total_resp = supabase.table("produtos").select("id", count="exact").range(0, 0).execute()
+        total_itens = total_resp.count if total_resp.count is not None else 0
+    except Exception:
+        total_itens = 0
+
+    st.header(f"📦 Produtos ({total_itens} Itens)")
+
     aba_consulta, aba_categorias = st.tabs(["Consulta Produto", "Cadastrar categorias"])
 
     with aba_consulta:

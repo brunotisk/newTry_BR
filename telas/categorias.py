@@ -2,7 +2,6 @@ import streamlit as st
 from db import supabase
 
 def tela_categorias():
-    st.header("🏷️ Cadastro de Categorias")
 
     # Inicializa o estado de edição
     if "categoria_editando" not in st.session_state:

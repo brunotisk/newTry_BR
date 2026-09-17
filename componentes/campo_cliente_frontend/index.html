@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <script src="https://cdn.jsdelivr.net/npm/streamlit-component-lib@2.0.0/dist/index.js"></script>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; background: transparent; color: #FAFAFA; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    .wrap { padding: 0 0 2px 0; }
+    label { display: block; font-size: 14px; font-weight: 400; margin-bottom: 6px; color: #FAFAFA; }
+    input {
+      width: 100%; height: 38px; padding: 0 12px; border: 1px solid #464B53;
+      border-radius: 6px; font-size: 16px; font-family: inherit; color: #FAFAFA; outline: none; background: #262730;
+    }
+    input::placeholder { color: #8B8D98; opacity: 1; }
+    input:focus { border-color: #FF4B4B; box-shadow: 0 0 0 1px #FF4B4B; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <label id="label"></label>
+    <input id="input" list="clientes" autocomplete="off" />
+    <datalist id="clientes"></datalist>
+  </div>
+  <script>
+    const input = document.getElementById("input");
+    const label = document.getElementById("label");
+    const datalist = document.getElementById("clientes");
+
+    function render(args) {
+      label.textContent = args.label || "";
+      input.placeholder = args.placeholder || "";
+
+      datalist.innerHTML = "";
+      (args.opcoes || []).forEach(nome => {
+        const option = document.createElement("option");
+        option.value = nome;
+        datalist.appendChild(option);
+      });
+
+      // Não sobrescreve o que o usuário está digitando quando o componente
+      // recebe uma atualização durante a interação.
+      if (document.activeElement !== input) {
+        input.value = args.value || "";
+      }
+    }
+
+    function sendValue() {
+      window.parent.postMessage({
+        isStreamlitMessage: true,
+        type: "streamlit:setComponentValue",
+        value: input.value
+      }, "*");
+    }
+
+    input.addEventListener("input", sendValue);
+
+    window.addEventListener("message", (event) => {
+      const data = event.data;
+      if (!data || !data.type) return;
+      if (data.type === "streamlit:render") render(data.args || {});
+    });
+
+    window.parent.postMessage({
+      isStreamlitMessage: true,
+      type: "streamlit:componentReady",
+      apiVersion: 1
+    }, "*");
+
+    window.parent.postMessage({
+      isStreamlitMessage: true,
+      type: "streamlit:setFrameHeight",
+      height: 72
+    }, "*");
+  </script>
+</body>
+</html>

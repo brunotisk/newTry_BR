@@ -1,6 +1,5 @@
 import streamlit as st
 import tempfile
-import math
 from datetime import date, datetime
 from typing import Optional
 
@@ -15,6 +14,8 @@ from vendas_import import (
     inserir_venda_e_baixar_estoque,
 )
 from telas.cadastros_auxiliares import tela_cadastros_auxiliares
+from componentes.campo_cliente import campo_cliente
+from componentes.campo_mascarado import campo_mascarado
 from componentes.paginacao import render_paginacao, get_itens_por_pagina, reset_paginacao
 
 # Compatibilidade: st.dialog é o nome estável (Streamlit >= 1.31); versões
@@ -148,6 +149,7 @@ def _dialog_editar_venda(
     status_disponiveis: list,
     formas_pagamento_disponiveis: list,
     feiras_disponiveis: list,
+    clientes_disponiveis: list,
 ):
     """Popup único para adicionar e editar vendas.
 
@@ -202,9 +204,14 @@ def _dialog_editar_venda(
 
     form_key = f"form_venda_{'nova' if nova_venda else venda['id']}"
 
-    with st.form(form_key):
-        # Linha 1: Produto | Canal | Status
-        col_produto, col_canal, col_status = st.columns(3)
+    # Todos os campos do popup ficam dentro de uma única borda.
+    # A primeira linha permanece fora do st.form para permitir que o canal
+    # habilite/desabilite a Feira imediatamente.
+    with st.container(border=True):
+    # Linha 1 fica fora do formulário para que a escolha do canal provoque
+    # atualização imediata e habilite/desabilite o campo Feira.
+    # Linha 1: Produto (1/2) | Canal de venda (1/4) | Feira (1/4)
+        col_produto, col_canal, col_feira = st.columns([2, 1, 1])
 
         with col_produto:
             if nova_venda:
@@ -215,6 +222,7 @@ def _dialog_editar_venda(
                         rotulos_produtos,
                         index=None,
                         placeholder="Selecione o produto...",
+                        key="venda_produto_nova",
                     )
                     produto_selecionado = produtos_opcoes.get(produto_rotulo)
                 else:
@@ -238,12 +246,127 @@ def _dialog_editar_venda(
                     nomes_canais,
                     index=None,
                     placeholder="Selecione o canal...",
+                    key="venda_canal_nome_nova",
                 ) if nomes_canais else None
             else:
                 st.text_input("Canal de venda", value=canal_atual_nome, disabled=True)
                 canal_nome = canal_atual_nome
 
-        with col_status:
+        # A feira fica sempre na primeira linha e só é habilitada quando
+        # o canal selecionado for exatamente "Feira".
+        canal_eh_feira = (canal_nome or "").strip().casefold() == "feira"
+        nomes_feiras = [f["nome_feira"] for f in feiras_disponiveis]
+        feira_atual_nome = feira_atual.get("nome_feira") or ""
+
+        with col_feira:
+            if nova_venda and not canal_eh_feira:
+                st.selectbox(
+                    "Feira",
+                    ["Selecione o canal Feira"],
+                    index=0,
+                    disabled=True,
+                    key="venda_feira_desabilitada_nova",
+                )
+                feira_nome = None
+            elif not nova_venda and not canal_eh_feira:
+                st.selectbox(
+                    "Feira",
+                    ["Não se aplica"],
+                    index=0,
+                    disabled=True,
+                    key=f"venda_feira_desabilitada_{venda.get('id')}",
+                )
+                feira_nome = None
+            else:
+                nomes_feiras_com_vazio = [""] + nomes_feiras
+                indice_feira = (
+                    nomes_feiras_com_vazio.index(feira_atual_nome)
+                    if feira_atual_nome in nomes_feiras_com_vazio else 0
+                )
+                feira_nome = st.selectbox(
+                    "Feira",
+                    nomes_feiras_com_vazio,
+                    index=indice_feira,
+                    placeholder="Selecione a feira...",
+                    key=f"venda_feira_{'nova' if nova_venda else venda.get('id')}",
+                )
+
+
+        with st.form(form_key, border=False):
+            # Linha 2: Quantidade | Valor unitário | Desconto | Valor total
+            col_qtd, col_unit, col_desc, col_total = st.columns(4)
+
+            with col_qtd:
+                quantidade = st.number_input(
+                    "Quantidade",
+                    min_value=0.01,
+                    step=1.0,
+                    format="%.2f",
+                    value=float(venda.get("quantidade") or 1),
+                )
+
+            with col_unit:
+                valor_unitario = st.number_input(
+                    "Valor unitário",
+                    min_value=0.0,
+                    step=0.01,
+                    format="%.2f",
+                    value=float(venda.get("valor_unitario") or 0),
+                )
+
+            with col_desc:
+                valor_desconto = st.number_input(
+                    "Desconto",
+                    min_value=0.0,
+                    step=0.01,
+                    format="%.2f",
+                    value=float(venda.get("valor_desconto") or 0),
+                )
+
+            with col_total:
+                valor_total = st.number_input(
+                    "Valor total",
+                    min_value=0.0,
+                    step=0.01,
+                    format="%.2f",
+                    value=float(venda.get("valor_total") or 0),
+                )
+
+            # Linha 3: Cliente (1/2) | Data da venda (1/4) | Forma de pagamento (1/4)
+            col_cliente, col_data, col_forma = st.columns([2, 1, 1])
+
+            with col_cliente:
+                nomes_clientes = [c.get("nome") for c in clientes_disponiveis if c.get("nome")]
+                cliente = campo_cliente(
+                    "Cliente",
+                    value=venda.get("cliente") or "",
+                    opcoes=nomes_clientes,
+                    placeholder="Digite ou selecione o cliente...",
+                    key=f"venda_cliente_{'nova' if nova_venda else venda.get('id')}",
+                )
+
+            with col_data:
+                data_venda_texto = campo_mascarado(
+                    "Data da venda",
+                    value=data_atual.strftime("%d/%m/%Y"),
+                    tipo="data",
+                    placeholder="DD/MM/YYYY",
+                    key=f"venda_data_mask_{'nova' if nova_venda else venda.get('id')}",
+                )
+
+            with col_forma:
+                forma_pagamento_nome = st.selectbox(
+                    "Forma de pagamento",
+                    [""] + nomes_formas,
+                    index=(
+                        (nomes_formas.index(forma_atual_desc) + 1)
+                        if forma_atual_desc in nomes_formas else 0
+                    ),
+                    placeholder="Selecione...",
+                ) if nomes_formas else None
+
+            # Status continua obrigatório, mas foi deslocado para uma linha
+            # própria para preservar exatamente a distribuição solicitada.
             status_nome = st.selectbox(
                 "Status",
                 nomes_status,
@@ -251,107 +374,29 @@ def _dialog_editar_venda(
                 if status_atual_nome in nomes_status else 0,
             ) if nomes_status else None
 
-        # Linha 2: Quantidade | Valor unitário | Desconto | Valor total
-        col_qtd, col_unit, col_desc, col_total = st.columns(4)
+            # Espaçamento proposital entre a última linha e os botões.
+            st.markdown("<div style='height: 1.25rem;'></div>", unsafe_allow_html=True)
 
-        with col_qtd:
-            quantidade = st.number_input(
-                "Quantidade",
-                min_value=0.01,
-                step=1.0,
-                format="%.2f",
-                value=float(venda.get("quantidade") or 1),
-            )
-
-        with col_unit:
-            valor_unitario = st.number_input(
-                "Valor unitário",
-                min_value=0.0,
-                step=0.01,
-                format="%.2f",
-                value=float(venda.get("valor_unitario") or 0),
-            )
-
-        with col_desc:
-            valor_desconto = st.number_input(
-                "Desconto",
-                min_value=0.0,
-                step=0.01,
-                format="%.2f",
-                value=float(venda.get("valor_desconto") or 0),
-            )
-
-        with col_total:
-            valor_total = st.number_input(
-                "Valor total",
-                min_value=0.0,
-                step=0.01,
-                format="%.2f",
-                value=float(venda.get("valor_total") or 0),
-            )
-
-        # Linha 3: Data | Cliente | Forma de pagamento
-        col_data, col_cliente, col_forma = st.columns([1.25, 1.75, 1.25])
-
-        with col_data:
-            data_venda = st.date_input("Data da venda", value=data_atual)
-
-        with col_cliente:
-            cliente = st.text_input("Cliente", value=venda.get("cliente") or "")
-
-        with col_forma:
-            forma_pagamento_nome = st.selectbox(
-                "Forma de pagamento",
-                [""] + nomes_formas,
-                index=(
-                    (nomes_formas.index(forma_atual_desc) + 1)
-                    if forma_atual_desc in nomes_formas else 0
-                ),
-                placeholder="Selecione...",
-            ) if nomes_formas else None
-
-        # Só existe quando o canal escolhido for Feira.
-        canal_eh_feira = (canal_nome or "").strip().lower() == "feira"
-
-        feira_nome = None
-        if canal_eh_feira:
-            nomes_feiras = [f["nome_feira"] for f in feiras_disponiveis]
-            nomes_feiras_com_vazio = [""] + nomes_feiras
-            feira_atual_nome = feira_atual.get("nome_feira") or ""
-            indice_feira = (
-                nomes_feiras_com_vazio.index(feira_atual_nome)
-                if feira_atual_nome in nomes_feiras_com_vazio else 0
-            )
-            feira_nome = st.selectbox(
-                "Feira",
-                nomes_feiras_com_vazio,
-                index=indice_feira,
-                placeholder="Selecione a feira...",
-            )
-
-        # Espaçamento proposital entre a última linha e os botões.
-        st.markdown("<div style='height: 1.25rem;'></div>", unsafe_allow_html=True)
-
-        if nova_venda:
-            col_salvar, col_cancelar = st.columns(2)
-            salvar = col_salvar.form_submit_button(
-                "💾 Salvar", type="primary", use_container_width=True
-            )
-            cancelar = col_cancelar.form_submit_button(
-                "Cancelar", use_container_width=True
-            )
-            excluir = False
-        else:
-            col_salvar, col_cancelar, col_excluir = st.columns(3)
-            salvar = col_salvar.form_submit_button(
-                "💾 Salvar", type="primary", use_container_width=True
-            )
-            cancelar = col_cancelar.form_submit_button(
-                "Cancelar", use_container_width=True
-            )
-            excluir = col_excluir.form_submit_button(
-                "🗑️ Excluir", use_container_width=True
-            )
+            if nova_venda:
+                col_salvar, col_cancelar = st.columns(2)
+                salvar = col_salvar.form_submit_button(
+                    "💾 Salvar", type="secondary", use_container_width=True
+                )
+                cancelar = col_cancelar.form_submit_button(
+                    "Cancelar", use_container_width=True
+                )
+                excluir = False
+            else:
+                col_salvar, col_cancelar, col_excluir = st.columns(3)
+                salvar = col_salvar.form_submit_button(
+                    "💾 Salvar", type="secondary", use_container_width=True
+                )
+                cancelar = col_cancelar.form_submit_button(
+                    "Cancelar", use_container_width=True
+                )
+                excluir = col_excluir.form_submit_button(
+                    "🗑️ Excluir", use_container_width=True
+                )
 
     if cancelar:
         st.rerun()
@@ -425,6 +470,17 @@ def _dialog_editar_venda(
                 st.error("Não foi possível identificar a feira selecionada.")
                 return
 
+        # Garante que o cliente digitado exista na tabela `clientes`.
+        # Para clientes novos, somente `nome` é preenchido.
+        cliente_nome = cliente.strip()
+        _obter_ou_criar_cliente(sb, cliente_nome)
+
+        try:
+            data_venda = datetime.strptime(data_venda_texto.strip(), "%d/%m/%Y").date()
+        except (ValueError, TypeError):
+            st.error("Data da venda inválida. Use o formato DD/MM/YYYY.")
+            return
+
         dados_novos = {
             "produto_id": produto_selecionado["id"],
             "canal_venda_id": canal_id,
@@ -467,6 +523,50 @@ def _resetar_filtros_vendas():
     st.session_state["vendas_filtro_canal"] = "Todos"
     st.session_state["pagina_atual_vendas"] = 1
 
+
+
+def _obter_ou_criar_cliente(sb, nome: str) -> int | None:
+    """Retorna o id do cliente pelo nome ou cria um cliente mínimo.
+
+    Se o usuário digitar um nome que ainda não existe, somente o campo
+    `nome` é preenchido; telefone, canal e datas permanecem nulos.
+    """
+    nome = (nome or "").strip()
+    if not nome:
+        return None
+
+    try:
+        existentes = (
+            sb.table("clientes")
+            .select("id, nome")
+            .execute()
+        ).data or []
+    except Exception as e:
+        raise RuntimeError(f"Não foi possível consultar os clientes: {e}") from e
+
+    normalizado = nome.casefold()
+    for cliente in existentes:
+        if (cliente.get("nome") or "").strip().casefold() == normalizado:
+            return cliente["id"]
+
+    try:
+        resp = sb.table("clientes").insert({"nome": nome}).execute()
+        return resp.data[0]["id"] if resp.data else None
+    except Exception as e:
+        # O índice único lower(trim(nome)) também protege contra corrida
+        # entre duas inclusões simultâneas. Se já existir, recupera o registro.
+        try:
+            existentes = (
+                sb.table("clientes")
+                .select("id, nome")
+                .execute()
+            ).data or []
+            for cliente in existentes:
+                if (cliente.get("nome") or "").strip().casefold() == normalizado:
+                    return cliente["id"]
+        except Exception:
+            pass
+        raise RuntimeError(f"Não foi possível cadastrar o cliente: {e}") from e
 
 
 def _carregar_cadastros_popup():
@@ -515,7 +615,17 @@ def _carregar_cadastros_popup():
     except Exception:
         feiras = []
 
-    return canais, status, formas, feiras
+    try:
+        clientes = (
+            supabase.table("clientes")
+            .select("id, nome")
+            .order("nome")
+            .execute()
+        ).data or []
+    except Exception:
+        clientes = []
+
+    return canais, status, formas, feiras, clientes
 
 
 
@@ -668,13 +778,14 @@ def _secao_listagem():
                 use_container_width=True,
                 key="vendas_btn_adicionar",
             ):
-                canais_popup, status_popup, formas_popup, feiras_popup = _carregar_cadastros_popup()
+                canais_popup, status_popup, formas_popup, feiras_popup, clientes_popup = _carregar_cadastros_popup()
                 _dialog_editar_venda(
                     None,
                     canais_popup,
                     status_popup,
                     formas_popup,
                     feiras_popup,
+                    clientes_popup,
                 )
 
     # Reseta a página para 1 sempre que algum filtro mudar
@@ -686,12 +797,9 @@ def _secao_listagem():
     # ------------------------------------------------------------------
     # 5) Paginação + consulta da página filtrada
     # ------------------------------------------------------------------
-    # O componente mantém a quantidade selecionada (50/25/10) no estado
-    # da sessão para que ela não volte para 50 ao trocar de página.
+    itens_por_pagina = get_itens_por_pagina("vendas", 50)
     if "pagina_atual_vendas" not in st.session_state:
         st.session_state.pagina_atual_vendas = 1
-
-    itens_por_pagina = get_itens_por_pagina("vendas", 50)
 
     # Embed do canal como inner join só quando o filtro de canal está ativo,
     # para não excluir vendas sem canal preenchido quando não há filtro.
@@ -729,18 +837,9 @@ def _secao_listagem():
         st.error(f"Erro ao carregar vendas: {e}")
         return
 
-    total_paginas = math.ceil(total_filtrado / itens_por_pagina) if total_filtrado > 0 else 1
+    total_paginas = max(1, (total_filtrado + itens_por_pagina - 1) // itens_por_pagina)
     if st.session_state.pagina_atual_vendas > total_paginas:
         st.session_state.pagina_atual_vendas = total_paginas
-
-    # Contagem no topo, antes da tabela, sem criar controles duplicados.
-    render_paginacao(
-        "vendas",
-        total_filtrado,
-        itens_por_pagina,
-        mostrar_contagem_superior=True,
-        mostrar_contagem_inferior=False,
-    )
 
     offset = (st.session_state.pagina_atual_vendas - 1) * itens_por_pagina
 
@@ -759,6 +858,16 @@ def _secao_listagem():
     except Exception as e:
         st.error(f"Erro ao carregar a página de vendas: {e}")
         return
+
+    # Informação no topo, usando o mesmo componente das demais telas.
+    render_paginacao(
+        "vendas",
+        total_filtrado,
+        itens_por_pagina=itens_por_pagina,
+        mostrar_contagem_superior=True,
+        mostrar_contagem_inferior=False,
+        permitir_seletor=True,
+    )
 
     with st.container(border=True):
         c_data, c_canal, c_prod, c_qtd, c_total, c_status, c_cliente, c_acoes = st.columns(
@@ -811,21 +920,29 @@ def _secao_listagem():
                     .order("nome_feira")
                     .execute()
                 ).data or []
+                clientes_popup = (
+                    supabase.table("clientes")
+                    .select("id, nome")
+                    .order("nome")
+                    .execute()
+                ).data or []
                 _dialog_editar_venda(
                     v,
                     canais_disponiveis,
                     status_disponiveis,
                     formas_popup,
                     feiras_popup,
+                    clientes_popup,
                 )
 
-    # Paginação completa no rodapé da tabela.
+    # Navegação/contagem no rodapé, no mesmo padrão de Compras.
     render_paginacao(
         "vendas",
         total_filtrado,
-        itens_por_pagina,
+        itens_por_pagina=itens_por_pagina,
         mostrar_contagem_superior=False,
         mostrar_contagem_inferior=True,
+        permitir_seletor=True,
     )
 
 
