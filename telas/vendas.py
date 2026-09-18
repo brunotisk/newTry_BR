@@ -1,5 +1,7 @@
 import streamlit as st
 import tempfile
+import hashlib
+from io import BytesIO
 from datetime import date, datetime
 from typing import Optional
 
@@ -12,6 +14,10 @@ from vendas_import import (
     excluir_venda,
     get_client,
     inserir_venda_e_baixar_estoque,
+    gerar_planilha_modelo_vendas,
+    validar_planilha_vendas,
+    importar_linhas_validadas,
+    _normalizar_nome,
 )
 from telas.cadastros_auxiliares import tela_cadastros_auxiliares
 from componentes.campo_cliente import campo_cliente
@@ -102,44 +108,391 @@ def _kpi_card(titulo: str, qtd: int, valor: float, subtitulo: Optional[str] = No
             st.metric("Valor", _fmt_moeda(valor))
 
 
+def _gerar_excel_linhas_nao_importadas(linhas: list[dict]) -> bytes:
+    """Gera o mesmo formato da planilha de entrada, acrescentando Motivo."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Linhas não importadas"
+    cabecalhos = [
+        "Canal", "Código Interno", "Quantidade", "Valor Lista", "Desconto",
+        "Valor Final", "Forma Pagamento", "Status", "Feira", "data_venda",
+        "Nome Cliente", "Observação", "Motivo",
+    ]
+    fill = PatternFill(fill_type="solid", fgColor="1F4E78")
+    font = Font(color="FFFFFF", bold=True)
+    for col, titulo in enumerate(cabecalhos, 1):
+        c = ws.cell(1, col, titulo)
+        c.fill = fill
+        c.font = font
+        c.alignment = Alignment(horizontal="center")
+
+    linha_excel = 2
+    for item in linhas:
+        motivos = item.get("motivos_nao_importar") or []
+        if not motivos:
+            continue
+        valores = [
+            item.get("canal_venda", ""), item.get("codigo_interno", ""), item.get("quantidade"),
+            item.get("valor_lista", 0), item.get("valor_desconto", 0), item.get("valor_final", 0),
+            item.get("forma_pagamento", ""), item.get("status", ""), item.get("feira", ""),
+            item.get("data_venda", ""), item.get("cliente", ""), item.get("observacao", ""),
+            " / ".join(motivos),
+        ]
+        for col, valor in enumerate(valores, 1):
+            ws.cell(linha_excel, col, valor)
+        ws.cell(linha_excel, 2).number_format = "@"
+        for col in (4, 5, 6):
+            ws.cell(linha_excel, col).number_format = 'R$ #,##0.00'
+        ws.cell(linha_excel, 3).number_format = '0.##'
+        linha_excel += 1
+
+    larguras = [18, 18, 12, 15, 15, 16, 24, 16, 24, 15, 30, 35, 55]
+    for i, largura in enumerate(larguras, 1):
+        ws.column_dimensions[chr(64+i) if i <= 26 else get_column_letter(i)].width = largura
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:M{max(2, linha_excel-1)}"
+    buffer = BytesIO()
+    wb.save(buffer)
+    return buffer.getvalue()
+
+def _estilo_validacao_vendas(resultado: dict):
+    """Cria uma tabela visual: vermelho para problemas críticos, amarelo para cadastros a corrigir e verde para clientes novos."""
+    import pandas as pd
+
+    linhas = resultado.get("linhas", [])
+    dados = []
+    for item in linhas:
+        dados.append({
+            "Linha": item["linha"],
+            "Canal": item["canal_venda"],
+            "Código Interno": item["codigo_interno"],
+            "Descrição": item["descricao_produto"],
+            "Qtd": item["quantidade"],
+            "Forma Pagamento": item["forma_pagamento"],
+            "Status": item["status"],
+            "Feira": item["feira"],
+            "Data": item["data_venda"],
+            "Cliente": item["cliente"],
+            "Situação": {
+                "PRODUTO_NAO_CADASTRADO": "Produto não cadastrado",
+                "ESTOQUE_INSUFICIENTE": "Estoque insuficiente",
+                "ERRO": "Corrigir cadastro",
+                "DUPLICADA": "Já existe",
+                "CLIENTE_NOVO": "Cliente será criado",
+                "OK": "OK",
+            }.get(item["status_linha"], item["status_linha"]),
+        })
+    df = pd.DataFrame(dados)
+    if df.empty:
+        return df
+
+    def aplicar_cor(row):
+        # O Styler espera uma Series indexada pelos nomes das colunas. Usar
+        # posições inteiras aqui pode gerar TypeError em versões recentes do
+        # pandas ao renderizar pelo Streamlit.
+        estilos = pd.Series("", index=df.columns, dtype="object")
+        item = linhas[row.name]
+        estilo_critico = "color: #ff0000; font-weight: bold"
+        estilo_cadastro = "color: #f0b400; font-weight: bold"
+        estilo_cliente_novo = "color: #00a000; font-weight: bold"
+        mapa = {
+            "canal_venda": "Canal",
+            "codigo_interno": "Código Interno",
+            "quantidade": "Qtd",
+            "forma_pagamento": "Forma Pagamento",
+            "status": "Status",
+            "feira": "Feira",
+            "data_venda": "Data",
+        }
+        if item.get("status_linha") in {"ERRO", "PRODUTO_NAO_CADASTRADO", "ESTOQUE_INSUFICIENTE"}:
+            for campo in item.get("campos_erro", []):
+                coluna = mapa.get(campo)
+                if coluna:
+                    estilos.loc[coluna] = estilo_cadastro
+            if item.get("status_linha") == "PRODUTO_NAO_CADASTRADO":
+                estilos.loc["Código Interno"] = estilo_critico
+                estilos.loc["Situação"] = estilo_critico
+            if item.get("status_linha") == "ESTOQUE_INSUFICIENTE":
+                estilos.loc["Qtd"] = estilo_critico
+                estilos.loc["Situação"] = estilo_critico
+            if item.get("status_linha") == "DUPLICADA":
+                estilos.loc["Situação"] = estilo_critico
+        if item.get("status_linha") == "ERRO":
+            estilos.loc["Situação"] = estilo_cadastro
+        if item.get("cliente_novo"):
+            estilos.loc["Cliente"] = estilo_cliente_novo
+        return estilos
+
+    return df.style.apply(aplicar_cor, axis=1)
+
+
+def _aplicar_correcao_validacao(indice: int, campo: str, valor):
+    """Aplica uma correção escolhida na tela e atualiza os IDs oficiais."""
+    linhas = st.session_state.get("vendas_importacao_resultado", {}).get("linhas", [])
+    resultado = st.session_state.get("vendas_importacao_resultado")
+    if not resultado or indice >= len(linhas):
+        return
+    item = linhas[indice]
+    cadastros = resultado["cadastros"]
+
+    item[campo] = valor
+    st.session_state.setdefault("vendas_importacao_correcoes", {})[(indice, campo)] = valor
+    mapas = {
+        "canal_venda": ("canais", "nome", "canal_id"),
+        "forma_pagamento": ("formas", "descricao", "forma_pagamento_id"),
+        "status": ("status", "nome", "status_id"),
+        "feira": ("feiras", "nome_feira", "detalhe_feira_id"),
+    }
+    if campo in mapas:
+        lista, chave, id_campo = mapas[campo]
+        alvo = " ".join(str(valor or "").casefold().split())
+        encontrado = next((x for x in cadastros[lista] if " ".join(str(x.get(chave) or "").casefold().split()) == alvo), None)
+        item[id_campo] = encontrado["id"] if encontrado else None
+
+    # Recalcula os erros de cadastro da própria linha. Quantidade, data,
+    # produto e estoque não são alterados por dropdown.
+    mensagens = []
+    campos = set(item.get("campos_erro", []))
+    regras = {
+        "canal_venda": ("canais", "nome", "canal_id", "Canal de venda"),
+        "forma_pagamento": ("formas", "descricao", "forma_pagamento_id", "Forma de pagamento"),
+        "status": ("status", "nome", "status_id", "Status"),
+    }
+    for campo_regra, (lista, chave, id_campo, rotulo) in regras.items():
+        valor_atual = _normalizar_nome(item.get(campo_regra))
+        encontrado = next((x for x in cadastros[lista] if _normalizar_nome(x.get(chave)) == valor_atual), None)
+        if not valor_atual:
+            mensagens.append(f"{rotulo} vazio")
+            campos.add(campo_regra)
+        elif encontrado is None:
+            mensagens.append(f"{rotulo} '{item.get(campo_regra)}' não cadastrado")
+            campos.add(campo_regra)
+        else:
+            campos.discard(campo_regra)
+            item[id_campo] = encontrado["id"]
+
+    canal_eh_feira = _normalizar_nome(item.get("canal_venda")) == "feira"
+    feira_valor = _normalizar_nome(item.get("feira"))
+    feira_encontrada = next((x for x in cadastros["feiras"] if _normalizar_nome(x.get("nome_feira")) == feira_valor), None)
+    if canal_eh_feira:
+        if not feira_valor:
+            mensagens.append("Canal Feira exige uma feira")
+            campos.add("feira")
+        elif feira_encontrada is None:
+            mensagens.append(f"Feira '{item.get('feira')}' não cadastrada")
+            campos.add("feira")
+        else:
+            campos.discard("feira")
+            item["detalhe_feira_id"] = feira_encontrada["id"]
+    else:
+        campos.discard("feira")
+        item["feira"] = ""
+        item["detalhe_feira_id"] = None
+
+    # Preserva mensagens de validações que não são de cadastro.
+    outras = [e for e in item.get("erros", []) if not any(e.lower().startswith(prefix) for prefix in ("canal", "forma de pagamento", "status", "feira"))]
+    item["erros"] = outras + mensagens
+    item["campos_erro"] = sorted(campos)
+    if item.get("status_linha") == "ERRO" and not item["erros"]:
+        item["status_linha"] = "CLIENTE_NOVO" if item.get("cliente_novo") else "OK"
+
+
+def _tela_validacao_importacao():
+    resultado = st.session_state.get("vendas_importacao_resultado")
+    if not resultado:
+        return False
+
+    st.markdown("### 🔎 Conferência antes da importação")
+    st.caption("Esta etapa consulta o banco atual. Somente as linhas liberadas serão gravadas ao prosseguir.")
+
+    col1, col2, col3, col4, col5 = st.columns(5)
+    with col1:
+        st.metric("Linhas", resultado["total"])
+    with col2:
+        st.metric("Cadastros a corrigir", resultado["erros"])
+    with col3:
+        st.metric("Produtos não cadastrados", resultado["produtos_nao_cadastrados"])
+    with col4:
+        st.metric("Estoque insuficiente", resultado.get("estoque_insuficiente", 0))
+    with col5:
+        st.metric("Clientes novos", resultado["clientes_novos"])
+
+    # Legenda consolidada em um único banner, explicando as cores e
+    # deixando explícito o comportamento de cada tipo de ocorrência.
+    st.markdown(
+        """
+        <div style="padding: 14px 16px; border-radius: 8px; background: #19324b; margin: 0 0 12px 0;">
+            <div style="display:flex; align-items:flex-start; gap:10px; margin-bottom:10px; line-height:1.45;">
+                <span style="font-size:18px; line-height:1.45; width:18px; flex:0 0 18px; text-align:center;">🔴</span>
+                <span><strong style="color:#4da3ff;">Vermelho — Crítico:</strong> produto não cadastrado ou estoque insuficiente. A linha não será importada.</span>
+            </div>
+            <div style="display:flex; align-items:flex-start; gap:10px; margin-bottom:10px; line-height:1.45;">
+                <span style="font-size:18px; line-height:1.45; width:18px; flex:0 0 18px; text-align:center;">🟡</span>
+                <span><strong style="color:#4da3ff;">Amarelo — Cadastro a corrigir:</strong> canal, forma de pagamento, status ou feira. Corrija usando o cadastro oficial e clique em <strong>Validar novamente</strong>.</span>
+            </div>
+            <div style="display:flex; align-items:flex-start; gap:10px; line-height:1.45;">
+                <span style="font-size:18px; line-height:1.45; width:18px; flex:0 0 18px; text-align:center;">🟢</span>
+                <span><strong style="color:#4da3ff;">Verde — Cliente novo:</strong> o cliente não foi encontrado no cadastro atual e será criado durante a importação.</span>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if resultado.get("nao_importaveis"):
+        excel_nao_importadas = _gerar_excel_linhas_nao_importadas(resultado["linhas"])
+        st.download_button(
+            "📥 Baixar linhas não importadas",
+            data=excel_nao_importadas,
+            file_name="linhas_nao_importadas.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="download_linhas_nao_importadas",
+        )
+
+    tabela = _estilo_validacao_vendas(resultado)
+    st.dataframe(tabela, use_container_width=True, hide_index=True)
+
+    problemas = [(i, x) for i, x in enumerate(resultado["linhas"]) if x.get("status_linha") == "ERRO"]
+    if problemas:
+        st.markdown("#### 🛠️ Corrigir cadastros")
+        st.caption("Use os dropdowns oficiais para corrigir os campos destacados. Produtos inexistentes e estoque insuficiente não podem ser corrigidos nesta tela.")
+        for indice, item in problemas:
+            with st.container(border=True):
+                st.markdown(f"**Linha {item['linha']}** — {item['descricao_produto'] or item['codigo_interno']}")
+                colunas = []
+                if "canal_venda" in item.get("campos_erro", []): colunas.append("canal_venda")
+                if "forma_pagamento" in item.get("campos_erro", []): colunas.append("forma_pagamento")
+                if "status" in item.get("campos_erro", []): colunas.append("status")
+                if "feira" in item.get("campos_erro", []): colunas.append("feira")
+                if colunas:
+                    cols = st.columns(min(3, len(colunas)))
+                    for pos, campo in enumerate(colunas):
+                        with cols[pos % len(cols)]:
+                            if campo == "canal_venda":
+                                opcoes = [x["nome"] for x in resultado["cadastros"]["canais"]]
+                            elif campo == "forma_pagamento":
+                                opcoes = [x["descricao"] for x in resultado["cadastros"]["formas"]]
+                            elif campo == "status":
+                                opcoes = [x["nome"] for x in resultado["cadastros"]["status"]]
+                            else:
+                                opcoes = [x["nome_feira"] for x in resultado["cadastros"]["feiras"]]
+                            labels = {"canal_venda":"Canal", "forma_pagamento":"Forma de Pagamento", "status":"Status", "feira":"Feira"}
+                            atual = item.get(campo) if item.get(campo) in opcoes else None
+                            novo = st.selectbox(labels[campo], opcoes, index=opcoes.index(atual) if atual else None, placeholder="Selecione...", key=f"corr_{indice}_{campo}")
+                            if novo and novo != item.get(campo):
+                                _aplicar_correcao_validacao(indice, campo, novo)
+                if item.get("erros"):
+                    st.caption(" | ".join(item["erros"]))
+
+        if st.button("🔄 Validar novamente", key="validar_importacao_novamente"):
+            # Revalida contra o BD, preservando as correções feitas nos dropdowns.
+            correcoes = st.session_state.get("vendas_importacao_correcoes", {})
+            resultado_novo = validar_planilha_vendas(st.session_state["vendas_importacao_tmp_path"], supabase)
+            st.session_state["vendas_importacao_resultado"] = resultado_novo
+            # Reaplica as correções escolhidas na tela, inclusive os IDs
+            # oficiais correspondentes.
+            for (indice, campo), valor in correcoes.items():
+                if indice < len(resultado_novo["linhas"]):
+                    _aplicar_correcao_validacao(indice, campo, valor)
+            st.rerun()
+
+    # Calcula os bloqueios a partir do estado atual das linhas, e não apenas
+    # do contador produzido na primeira validação. Isso permite que uma
+    # correção feita pelo dropdown libere o botão imediatamente, sem depender
+    # de um contador antigo em session_state.
+    bloqueios = sum(
+        1
+        for x in resultado.get("linhas", [])
+        if x.get("status_linha") == "ERRO" and bool(x.get("erros"))
+    )
+    col_cancelar, col_prosseguir = st.columns(2)
+    with col_cancelar:
+        if st.button("Cancelar", key="cancelar_validacao_importacao"):
+            for chave in ("vendas_importacao_resultado", "vendas_importacao_tmp_path", "vendas_importacao_hash", "vendas_importacao_correcoes", "vendas_importacao_pronta"):
+                st.session_state.pop(chave, None)
+            st.rerun()
+    with col_prosseguir:
+        if st.button("Prosseguir com importação →", type="primary", disabled=bloqueios > 0, key="prosseguir_importacao"):
+            with st.spinner("Importando as linhas válidas e atualizando o estoque..."):
+                resultado_importacao = importar_linhas_validadas(resultado["linhas"], supabase)
+            if resultado_importacao["erros"]:
+                st.error("A importação terminou com ocorrências:\n" + "\n".join(resultado_importacao["erros"]))
+            else:
+                st.success(
+                    f"Importação concluída: {resultado_importacao['importadas']} venda(s) importada(s) e "
+                    f"{resultado_importacao['clientes_criados']} cliente(s) criado(s)."
+                )
+            for chave in ("vendas_importacao_resultado", "vendas_importacao_tmp_path", "vendas_importacao_hash", "vendas_importacao_correcoes", "vendas_importacao_pronta"):
+                st.session_state.pop(chave, None)
+            st.rerun()
+
+    if bloqueios:
+        st.warning(
+            f"Ainda existem {bloqueios} linha(s) com cadastro para corrigir. "
+            "Corrija pelos dropdowns acima e depois clique em Validar novamente. "
+            "Linhas em vermelho (produto não cadastrado ou estoque insuficiente) são críticas e serão excluídas do lote, "
+            "mas não impedem o prosseguimento."
+        )
+    return True
+
 def _secao_importar():
     st.subheader("📥 Importar vendas de planilha Excel")
+
+    # Se já existe uma validação em andamento, a tela intermediária assume o
+    # controle. Nenhuma operação de gravação é feita nesta etapa.
+    if st.session_state.get("vendas_importacao_resultado"):
+        _tela_validacao_importacao()
+        return
+
     st.caption(
-        "Formato esperado: Canal | Código Interno | Quantidade | Produto | "
-        "Valor Unitário | Desconto | Valor Total | Status | Data | Cliente"
+        "Baixe o modelo para preencher suas vendas. O arquivo já vem com os "
+        "cadastros atuais, listas suspensas e validações."
+    )
+
+    try:
+        modelo_excel = gerar_planilha_modelo_vendas(supabase)
+        st.download_button(
+            "📥 Baixar planilha modelo",
+            data=modelo_excel,
+            file_name="modelo_importacao_vendas.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            help="Gera um modelo atualizado com canais, formas de pagamento, status, clientes, feiras e produtos/estoque atuais.",
+            key="download_modelo_vendas",
+        )
+    except Exception as e:
+        st.warning(f"Não foi possível gerar a planilha modelo agora: {e}")
+
+    st.caption(
+        "Depois de preencher a aba 'Vendas', salve o arquivo e envie-o abaixo. "
+        "Clientes novos podem ser digitados; os demais cadastros devem existir no sistema."
     )
 
     arquivo = st.file_uploader("Selecione o arquivo .xlsx", type=["xlsx"], key="upload_vendas")
-
     if arquivo is None:
         return
 
-    with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
-        tmp.write(arquivo.getvalue())
-        tmp_path = tmp.name
+    arquivo_bytes = arquivo.getvalue()
+    assinatura = hashlib.sha256(arquivo_bytes).hexdigest()
+    if st.session_state.get("vendas_importacao_hash") != assinatura:
+        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
+            tmp.write(arquivo_bytes)
+            tmp_path = tmp.name
+        try:
+            with st.spinner("Consultando os cadastros atuais e validando a planilha..."):
+                resultado = validar_planilha_vendas(tmp_path, supabase)
+        except Exception as e:
+            st.error(f"Não foi possível validar a planilha: {e}")
+            return
+        st.session_state["vendas_importacao_hash"] = assinatura
+        st.session_state["vendas_importacao_tmp_path"] = tmp_path
+        st.session_state["vendas_importacao_resultado"] = resultado
+        st.session_state.pop("vendas_importacao_pronta", None)
+        st.rerun()
 
-    try:
-        df_preview = ler_planilha(tmp_path)
-    except Exception as e:
-        st.error(f"Não foi possível ler a planilha: {e}")
-        return
-
-    st.write(f"**{len(df_preview)} linhas** encontradas na planilha.")
-    st.dataframe(df_preview, use_container_width=True)
-
-    if st.button("Confirmar e importar vendas", type="primary"):
-        with st.spinner("Importando vendas..."):
-            resultado = importar_vendas_excel(tmp_path)
-
-        st.success(
-            f"{resultado['importadas']} vendas importadas de {resultado['total_linhas']} linhas."
-        )
-        if resultado["duplicadas"]:
-            st.warning(f"{resultado['duplicadas']} linha(s) ignorada(s) por já existirem.")
-        if resultado["erros"]:
-            with st.expander(f"⚠️ {len(resultado['erros'])} linha(s) com erro"):
-                for erro in resultado["erros"]:
-                    st.write(f"- {erro}")
+    _tela_validacao_importacao()
 
 
 @_dialog("💰 Venda", width="large")
@@ -306,12 +659,12 @@ def _dialog_editar_venda(
                 )
 
             with col_unit:
-                valor_unitario = st.number_input(
-                    "Valor unitário",
+                valor_lista = st.number_input(
+                    "Valor lista",
                     min_value=0.0,
                     step=0.01,
                     format="%.2f",
-                    value=float(venda.get("valor_unitario") or 0),
+                    value=float(venda.get("valor_lista") or 0),
                 )
 
             with col_desc:
@@ -324,12 +677,12 @@ def _dialog_editar_venda(
                 )
 
             with col_total:
-                valor_total = st.number_input(
-                    "Valor total",
+                valor_final = st.number_input(
+                    "Valor final",
                     min_value=0.0,
                     step=0.01,
                     format="%.2f",
-                    value=float(venda.get("valor_total") or 0),
+                    value=float(venda.get("valor_final") or 0),
                 )
 
             # Linha 3: Cliente (1/2) | Data da venda (1/4) | Forma de pagamento (1/4)
@@ -486,9 +839,9 @@ def _dialog_editar_venda(
             "canal_venda_id": canal_id,
             "status_id": status_id,
             "quantidade": float(quantidade),
-            "valor_unitario": float(valor_unitario),
+            "valor_lista": float(valor_lista),
             "valor_desconto": float(valor_desconto),
-            "valor_total": float(valor_total),
+            "valor_final": float(valor_final),
             "data_venda": data_venda.isoformat(),
             "cliente": cliente.strip(),
             "forma_pagamento_id": forma_pagamento_id,
@@ -631,7 +984,7 @@ def _carregar_cadastros_popup():
 
 def _secao_listagem():
     # ------------------------------------------------------------------
-    # 1) Dataset leve com TODAS as vendas (valor_total, data_venda e o nome
+    # 1) Dataset leve com TODAS as vendas (valor_final, data_venda e o nome
     #    do canal), usado para os KPIs fixos (Total/Ano/Mês atual), para o
     #    KPI "Filtros" e para montar as opções do filtro de mês/ano.
     # ------------------------------------------------------------------
@@ -639,7 +992,7 @@ def _secao_listagem():
         response_kpi = (
             supabase
             .table("vendas")
-            .select("valor_total, data_venda, canais_venda(nome)")
+            .select("valor_final, data_venda, canais_venda(nome)")
             .execute()
         )
         vendas_kpi = response_kpi.data or []
@@ -657,11 +1010,11 @@ def _secao_listagem():
             if dt is None or not filtro(v, dt):
                 continue
             qtd += 1
-            soma += float(v.get("valor_total") or 0)
+            soma += float(v.get("valor_final") or 0)
         return qtd, soma
 
     qtd_total = len(vendas_kpi)
-    soma_total = sum(float(v.get("valor_total") or 0) for v in vendas_kpi)
+    soma_total = sum(float(v.get("valor_final") or 0) for v in vendas_kpi)
     qtd_ano, soma_ano = _acumula(lambda v, dt: dt.year == ano_atual)
     qtd_mes_atual, soma_mes_atual = _acumula(lambda v, dt: dt.year == ano_atual and dt.month == mes_atual)
 
@@ -810,8 +1163,8 @@ def _secao_listagem():
             supabase
             .table("vendas")
             .select(
-                "id, produto_id, quantidade, valor_unitario, valor_desconto,"
-                " valor_total, data_venda, cliente,"
+                "id, produto_id, quantidade, valor_lista, valor_desconto,"
+                " valor_final, data_venda, cliente,"
                 f" produtos(descricao, codigo_interno), {canal_embed}, "
                 "status_venda(nome), formas_pagamento(descricao), "
                 "detalhes_feira(nome_feira)",
@@ -877,7 +1230,7 @@ def _secao_listagem():
         c_canal.markdown("**Canal**")
         c_prod.markdown("**Produto**")
         c_qtd.markdown("**Qtd**")
-        c_total.markdown("**Valor Total**")
+        c_total.markdown("**Valor Final**")
         c_status.markdown("**Status**")
         c_cliente.markdown("**Cliente**")
         c_acoes.markdown("**Ações**")
@@ -896,7 +1249,7 @@ def _secao_listagem():
             col_prod.write(produto.get("descricao") or "-")
 
             col_qtd.write(v.get("quantidade"))
-            col_total.write(_fmt_moeda(v.get("valor_total")))
+            col_total.write(_fmt_moeda(v.get("valor_final")))
             col_status.write((v.get("status_venda") or {}).get("nome") or "-")
             col_cliente.write(v.get("cliente") or "-")
 
