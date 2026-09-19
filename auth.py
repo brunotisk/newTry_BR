@@ -1,5 +1,10 @@
+import os
 import streamlit as st
 from db import supabase
+
+
+def _skip_auth() -> bool:
+    return os.getenv("SKIP_AUTH", "false").lower() == "true"
 
 
 def _injetar_estilo():
@@ -145,6 +150,12 @@ def autenticar_usuario():
     if "user" not in st.session_state:
         st.session_state.user = None
 
+    # Bypass de login para desenvolvimento local
+    if _skip_auth():
+        if st.session_state.user is None:
+            st.session_state.user = type("DevUser", (), {"email": "dev@local"})()
+        return st.session_state.user
+
     if st.session_state.user is not None:
         return st.session_state.user
 
@@ -281,6 +292,11 @@ def _injetar_estilo_usuario_sidebar():
 
 def renderizar_usuario_sidebar():
     """Exibe o cartão (avatar + e-mail) do usuário logado no topo da barra lateral."""
+    if _skip_auth():
+        with st.sidebar:
+            st.caption("🧪 Modo dev — autenticação desativada (SKIP_AUTH)")
+        return
+
     if st.session_state.get("user"):
         email = st.session_state.user.email
         inicial = email[0].upper() if email else "?"
@@ -303,6 +319,9 @@ def renderizar_usuario_sidebar():
 
 def renderizar_botao_sair():
     """Exibe o botão de logout — chame no final do conteúdo da barra lateral."""
+    if _skip_auth():
+        return
+
     if st.session_state.get("user"):
         with st.sidebar:
             st.divider()

@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <script src="https://cdn.jsdelivr.net/npm/streamlit-component-lib@2.0.0/dist/index.js"></script>
+  <style>
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; background: transparent; }
+    body {
+      color: #FAFAFA;
+      font-family: "Source Sans Pro", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 14px;
+      overflow: visible;
+    }
+    .wrap { width: 100%; position: relative; }
+    .label {
+      display: block;
+      margin: 0 0 6px 0;
+      color: #FAFAFA;
+      font-size: 14px;
+      font-weight: 600;
+      line-height: 1.4;
+    }
+    .mode-toggle-row {
+      /* Mesmo espaçamento vertical que o Streamlit usa entre um widget e o
+         próximo (ex.: entre o selectbox "Categoria" e o toggle "Apenas sem
+         categoria" logo abaixo dele) — para os dois toggles ficarem
+         alinhados na mesma altura. */
+      margin-top: 12px;
+    }
+    .mode-toggle {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      background: transparent;
+      border: none;
+      padding: 0;
+      cursor: pointer;
+      color: #FAFAFA;
+      font-size: 14px;
+      line-height: 1.4;
+      white-space: nowrap;
+    }
+    .mode-slider {
+      position: relative;
+      width: 32px;
+      height: 18px;
+      border-radius: 999px;
+      background: #464B53;
+      transition: background .15s ease;
+      flex: 0 0 auto;
+    }
+    .mode-slider::after {
+      content: "";
+      position: absolute;
+      top: 2px;
+      left: 2px;
+      width: 14px;
+      height: 14px;
+      border-radius: 50%;
+      background: #FAFAFA;
+      transition: transform .15s ease;
+    }
+    .mode-toggle[aria-pressed="true"] .mode-slider {
+      background: #FF4B4B;
+    }
+    .mode-toggle[aria-pressed="true"] .mode-slider::after {
+      transform: translateX(14px);
+    }
+    .selectbox {
+      position: relative;
+      width: 100%;
+    }
+    .control {
+      width: 100%;
+      min-height: 40px;
+      padding: 0 64px 0 12px;
+      border: 1px solid #464B53;
+      border-radius: 6px;
+      background: #262730;
+      color: #FAFAFA;
+      display: flex;
+      align-items: center;
+      cursor: text;
+      position: relative;
+    }
+    .control:focus-within {
+      border-color: #FF4B4B;
+      box-shadow: 0 0 0 1px #FF4B4B;
+    }
+    input {
+      width: 100%;
+      height: 38px;
+      padding: 0;
+      border: 0;
+      outline: 0;
+      background: transparent;
+      color: #FAFAFA;
+      font: inherit;
+      min-width: 0;
+    }
+    input::placeholder { color: #8B8D98; opacity: 1; }
+    .clear-btn {
+      position: absolute;
+      right: 34px;
+      top: 50%;
+      transform: translateY(-50%);
+      width: 22px;
+      height: 22px;
+      border: none;
+      border-radius: 4px;
+      background: transparent;
+      color: #8B8D98;
+      font-size: 15px;
+      line-height: 1;
+      cursor: pointer;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 0;
+    }
+    .clear-btn.visible { display: flex; }
+    .clear-btn:hover {
+      color: #FAFAFA;
+      background: rgba(255, 255, 255, 0.08);
+    }
+    .arrow {
+      position: absolute;
+      right: 12px;
+      top: 50%;
+      width: 8px;
+      height: 8px;
+      border-right: 2px solid #FAFAFA;
+      border-bottom: 2px solid #FAFAFA;
+      transform: translateY(-65%) rotate(45deg);
+      pointer-events: none;
+    }
+    .menu {
+      position: absolute;
+      left: 0;
+      right: 0;
+      top: calc(100% + 4px);
+      max-height: 300px;
+      overflow-y: auto;
+      z-index: 99999;
+      background: #262730;
+      border: 1px solid #464B53;
+      border-radius: 6px;
+      box-shadow: 0 4px 12px rgba(0,0,0,.35);
+      padding: 4px 0;
+      display: none;
+    }
+    .menu.open { display: block; }
+    .option {
+      padding: 9px 12px;
+      color: #FAFAFA;
+      cursor: pointer;
+      line-height: 1.35;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .option:hover, .option.active { background: #3A3B46; }
+    .empty { padding: 10px 12px; color: #8B8D98; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="label" id="label"></div>
+    <div class="selectbox">
+      <div class="control" id="control">
+        <input id="input" autocomplete="off" spellcheck="false" />
+        <button type="button" class="clear-btn" id="clearBtn" aria-label="Limpar" tabindex="-1">✕</button>
+        <span class="arrow"></span>
+      </div>
+      <div class="menu" id="menu"></div>
+    </div>
+    <div class="mode-toggle-row">
+      <button
+        type="button"
+        class="mode-toggle"
+        id="modeToggle"
+        aria-pressed="false"
+        title="Alternar entre buscar por código ou por descrição"
+      >
+        <span class="mode-slider"></span>
+        <span class="mode-text" id="modeText">Buscar descrição</span>
+      </button>
+    </div>
+  </div>
+
+<script>
+  const labelEl = document.getElementById("label");
+  const input = document.getElementById("input");
+  const menu = document.getElementById("menu");
+  const control = document.getElementById("control");
+  const clearBtn = document.getElementById("clearBtn");
+  const modeToggle = document.getElementById("modeToggle");
+
+  let args = { opcoes: [], rotulo_selecionado: null, buscar_descricao: false, valor_selecionado: null, termo: "", placeholder: "" };
+  let selectedId = null;
+  let lastQuery = "";
+  let activeIndex = -1;
+  let suppressNextInput = false;
+  // Evita que o .focus() programático (usado ao limpar a seleção) reabra o
+  // menu — só queremos manter o cursor no campo, não reabrir a lista.
+  let suppressNextFocusOpen = false;
+  // Estado do modo de busca (código vs. descrição). Vive aqui no componente
+  // e é sincronizado com args.buscar_descricao a cada render() vindo do
+  // Python — mas atualizado localmente na hora do clique, pra feedback
+  // visual instantâneo antes da resposta do servidor chegar.
+  let buscarDescricao = false;
+
+  // A filtragem por código/descrição passou a acontecer no servidor (Python),
+  // usando exatamente o mesmo critério de antes. Isso evita reenviar o
+  // catálogo inteiro ao iframe a cada tecla digitada — args.opcoes já chega
+  // pronto (filtrado e limitado) a cada re-render.
+  function opcoesAtuais() {
+    return args.opcoes || [];
+  }
+
+  function atualizarBotaoLimpar() {
+    const temConteudo = input.value.trim().length > 0 || selectedId !== null;
+    clearBtn.classList.toggle("visible", temConteudo);
+  }
+
+  function limparSelecao() {
+    selectedId = null;
+    lastQuery = "";
+    suppressNextInput = true;
+    input.value = "";
+    atualizarBotaoLimpar();
+    suppressNextFocusOpen = true;
+    input.focus();
+    closeMenu();
+  }
+
+  function send(value) {
+    window.parent.postMessage({
+      isStreamlitMessage: true,
+      type: "streamlit:setComponentValue",
+      value: value
+    }, "*");
+  }
+
+  // Toda mensagem enviada ao Python carrega o modo de busca atual — assim o
+  // servidor sempre sabe se deve filtrar por código ou por descrição,
+  // independentemente de qual interação disparou o envio.
+  function enviarEstado(extra) {
+    send(Object.assign({ buscar_descricao: buscarDescricao }, extra));
+  }
+
+  function renderMenu() {
+    const options = opcoesAtuais();
+    menu.innerHTML = "";
+    activeIndex = -1;
+
+    if (!options.length) {
+      if (lastQuery.trim()) {
+        const empty = document.createElement("div");
+        empty.className = "empty";
+        empty.textContent = "Nenhum produto encontrado.";
+        menu.appendChild(empty);
+      }
+      return;
+    }
+
+    options.slice(0, 100).forEach((option, index) => {
+      const el = document.createElement("div");
+      el.className = "option";
+      el.textContent = option.rotulo;
+      el.title = option.rotulo;
+      el.addEventListener("mousedown", (event) => {
+        event.preventDefault();
+        selectOption(option);
+      });
+      menu.appendChild(el);
+    });
+  }
+
+  function setFrameHeight(height) {
+    window.parent.postMessage({
+      isStreamlitMessage: true,
+      type: "streamlit:setFrameHeight",
+      height: height
+    }, "*");
+  }
+
+  function openMenu() {
+    renderMenu();
+    menu.classList.add("open");
+    // O frame cresce apenas enquanto a lista está aberta. A tela principal
+    // compensa esse espaço para que a tabela permaneça na mesma posição.
+    setFrameHeight(388);
+    enviarEstado({ id: selectedId, termo: lastQuery, aberto: true });
+  }
+
+  function closeMenu(resetUnselected = false) {
+    menu.classList.remove("open");
+    activeIndex = -1;
+
+    // Se o usuário apenas iniciou uma busca e saiu do componente sem
+    // selecionar um produto, descarta o termo digitado e volta ao estado
+    // inicial ("Todos os produtos").
+    if (resetUnselected && selectedId === null) {
+      lastQuery = "";
+      suppressNextInput = true;
+      input.value = "";
+      atualizarBotaoLimpar();
+    }
+
+    setFrameHeight(100);
+    enviarEstado({
+      id: selectedId,
+      termo: selectedId === null ? "" : lastQuery,
+      aberto: false
+    });
+  }
+
+  function selectOption(option) {
+    selectedId = option.id;
+    lastQuery = option.rotulo;
+    suppressNextInput = true;
+    input.value = option.rotulo;
+    atualizarBotaoLimpar();
+    closeMenu();
+    enviarEstado({ id: option.id, termo: option.rotulo });
+  }
+
+  function clearSelectionForTyping() {
+    if (selectedId !== null) {
+      selectedId = null;
+      enviarEstado({ id: null, termo: input.value });
+    }
+  }
+
+  function placeholderPadrao() {
+    // Usado quando args.placeholder não é enviado pelo Python: o próprio
+    // componente decide o texto de acordo com o modo de busca atual.
+    return buscarDescricao ? "Buscar por descrição..." : "Todos os produtos";
+  }
+
+  function aplicarModoNoBotao() {
+    modeToggle.setAttribute("aria-pressed", buscarDescricao ? "true" : "false");
+  }
+
+  function alternarModoBusca() {
+    buscarDescricao = !buscarDescricao;
+    aplicarModoNoBotao();
+
+    // Trocar o modo invalida a busca atual: um termo de código não faz
+    // sentido filtrando por descrição, e vice-versa — mesmo comportamento
+    // que produtos.py tinha antes ao limpar a seleção no on_change do
+    // st.toggle separado.
+    selectedId = null;
+    lastQuery = "";
+    suppressNextInput = true;
+    input.value = "";
+    input.placeholder = placeholderPadrao();
+    atualizarBotaoLimpar();
+    input.focus();
+    openMenu();
+  }
+
+  function render(newArgs) {
+    args = newArgs || {};
+    labelEl.textContent = args.label || "Produto";
+
+    buscarDescricao = !!args.buscar_descricao;
+    aplicarModoNoBotao();
+    input.placeholder = args.placeholder || placeholderPadrao();
+
+    const externalId = args.valor_selecionado;
+
+    // O rótulo do item selecionado já vem pronto do Python (calculado a
+    // partir da lista completa, não da lista filtrada pela busca), então não
+    // precisamos mais procurar o id dentro de args.opcoes aqui.
+    // Só sincroniza valor externo quando o usuário não está digitando.
+    if (document.activeElement !== input) {
+      if (externalId != null && args.rotulo_selecionado) {
+        selectedId = externalId;
+        lastQuery = args.rotulo_selecionado;
+        input.value = args.rotulo_selecionado;
+      } else if (externalId == null) {
+        selectedId = null;
+        lastQuery = String(args.termo || "");
+        input.value = lastQuery;
+      }
+    }
+
+    if (menu.classList.contains("open")) renderMenu();
+    atualizarBotaoLimpar();
+  }
+
+  modeToggle.addEventListener("click", () => {
+    alternarModoBusca();
+  });
+
+  input.addEventListener("focus", () => {
+    if (suppressNextFocusOpen) {
+      suppressNextFocusOpen = false;
+      return;
+    }
+    openMenu();
+  });
+
+  input.addEventListener("input", () => {
+    if (suppressNextInput) {
+      suppressNextInput = false;
+      return;
+    }
+    if (selectedId !== null) selectedId = null;
+    lastQuery = input.value;
+    atualizarBotaoLimpar();
+    openMenu();
+    enviarEstado({ id: null, termo: lastQuery });
+  });
+
+  // mousedown com preventDefault evita que o input perca o foco ao clicar no "x".
+  clearBtn.addEventListener("mousedown", (event) => {
+    event.preventDefault();
+  });
+
+  clearBtn.addEventListener("click", () => {
+    limparSelecao();
+  });
+
+  // A seta (e o espaço reservado a ela) fica visualmente dentro de
+  // ".control", mas fora da caixa real do <input> (que não ocupa a área de
+  // padding reservada à seta/botão de limpar). Sem isso, clicar bem em cima
+  // da seta não focava o input e a busca não abria.
+  control.addEventListener("mousedown", (event) => {
+    if (event.target === clearBtn || event.target === input) return;
+    event.preventDefault();
+    if (document.activeElement === input) {
+      // Já focado (ex.: usuário fechou com Escape e clicou de novo): reabre.
+      openMenu();
+    } else {
+      input.focus();
+    }
+  });
+
+  input.addEventListener("keydown", (event) => {
+    const options = opcoesAtuais();
+    if (event.key === "Escape") {
+      closeMenu(true);
+      return;
+    }
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      if (!menu.classList.contains("open")) openMenu();
+      activeIndex = Math.min(activeIndex + 1, options.length - 1);
+      [...menu.querySelectorAll(".option")].forEach((el, i) => el.classList.toggle("active", i === activeIndex));
+      return;
+    }
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      activeIndex = Math.max(activeIndex - 1, 0);
+      [...menu.querySelectorAll(".option")].forEach((el, i) => el.classList.toggle("active", i === activeIndex));
+      return;
+    }
+    if (event.key === "Enter" && activeIndex >= 0 && options[activeIndex]) {
+      event.preventDefault();
+      selectOption(options[activeIndex]);
+    }
+  });
+
+  document.addEventListener("mousedown", (event) => {
+    if (!event.target.closest(".selectbox")) closeMenu(true);
+  });
+
+  // O listener acima só enxerga cliques dentro do próprio iframe.
+  // Quando o clique acontece fora do componente (no restante da página
+  // Streamlit), esse "mousedown" nunca dispara, porque é um documento
+  // diferente. Para cobrir esse caso, usamos o evento "blur" da window:
+  // ele dispara sempre que o foco sai do iframe, independente de origem.
+  window.addEventListener("blur", () => {
+    // Pequeno delay para não fechar o menu quando o próprio clique numa
+    // opção (mousedown + preventDefault) mantém o foco no input.
+    setTimeout(() => {
+      if (document.activeElement !== input && menu.classList.contains("open")) {
+        closeMenu(true);
+      }
+    }, 0);
+  });
+
+  window.addEventListener("message", (event) => {
+    const data = event.data;
+    if (data && data.type === "streamlit:render") render(data.args || {});
+  });
+
+  window.parent.postMessage({
+    isStreamlitMessage: true,
+    type: "streamlit:componentReady",
+    apiVersion: 1
+  }, "*");
+  setFrameHeight(100);
+</script>
+</body>
+</html>
