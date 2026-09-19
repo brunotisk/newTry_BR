@@ -14,7 +14,7 @@ from telas.report import tela_report
 from telas.compras import tela_compras
 from telas.vendas import tela_vendas
 from telas.clientes import tela_clientes
-from telas.estoque import tela_estoque
+from telas.estoque_saldo import tela_estoque_saldo
 from auth import autenticar_usuario, renderizar_usuario_sidebar, renderizar_botao_sair
 
 # 2. Trava de Autenticação
@@ -91,7 +91,7 @@ PAGINAS = {
     "📦 Produtos": tela_produtos,
     "🛍️ Compras": tela_compras,
     "💰 Vendas": tela_vendas,
-    "📊 Estoque": tela_estoque,
+    "📊 Estoque": tela_estoque_saldo,
     "👤 Clientes": tela_clientes,
     "📈 Relatórios": tela_report,
 }

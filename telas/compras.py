@@ -24,7 +24,7 @@ def _fmt_qtd(valor) -> str:
 
 
 @_dialog("📦 Itens da compra", width="large")
-def _dialog_itens_compra(compra: dict):
+def _dialog_itens_compra(compra: dict, produto_id: int | None = None):
     # Alarga ainda mais o popup (o width="large" do Streamlit já ajuda,
     # mas aqui forçamos um valor maior e fixo em pixels/vw).
     st.markdown(
@@ -48,8 +48,8 @@ def _dialog_itens_compra(compra: dict):
         response = (
             supabase.table("compras_itens")
             .select(
-                "numero_item, quantidade, valor_unitario, valor_desconto, valor_total,"
-                " produtos(codigo_interno, descricao)"
+                "numero_item, produto_id, quantidade, valor_unitario, valor_desconto, valor_total,"
+                " produtos(id, codigo_interno, descricao)"
             )
             .eq("compra_id", compra["id"])
             .order("numero_item")
@@ -63,6 +63,17 @@ def _dialog_itens_compra(compra: dict):
     if not itens:
         st.info("Nenhum item encontrado para essa compra.")
         return
+
+    if produto_id is not None:
+        itens_relacionados = [
+            item for item in itens
+            if (item.get("produtos") or {}).get("id") == produto_id
+        ]
+        # O embed acima não traz o id do produto em todas as versões do schema;
+        # se não for possível identificar, mantemos o detalhe completo da compra.
+        if itens_relacionados:
+            itens = itens_relacionados
+            st.caption("Item relacionado à movimentação de estoque")
 
     with st.container(border=True):
         c_cod, c_desc, c_qtd, c_unit, c_desc_v, c_tot = st.columns(
@@ -91,6 +102,24 @@ def _dialog_itens_compra(compra: dict):
 
 
 def _secao_listagem():
+    # Abre automaticamente o detalhe solicitado pela tela de movimentações.
+    compra_abrir_id = st.session_state.pop("compras_abrir_id", None)
+    if compra_abrir_id:
+        try:
+            compra_resp = (
+                supabase.table("compras")
+                .select("id, numero_nf, data_emissao, valor_produtos, valor_desconto, valor_total, chave_acesso")
+                .eq("id", int(compra_abrir_id))
+                .single()
+                .execute()
+            )
+            compra = compra_resp.data
+            if compra:
+                produto_id = st.session_state.pop("compras_abrir_produto_id", None)
+                _dialog_itens_compra(compra, produto_id=produto_id)
+        except Exception as e:
+            st.error(f"Erro ao abrir a compra #{compra_abrir_id}: {e}")
+
     try:
         # 1. Consulta dos dados na tabela 'compras' (agora incluindo o id,
         #    necessário para buscar os itens e a contagem por compra)

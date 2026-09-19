@@ -569,7 +569,12 @@ def obter_ou_criar_lista_id(sb: Client, tabela: str, nome: str) -> int:
     return criado.data[0]["id"]
 
 
-def inserir_venda_e_baixar_estoque(sb: Client, linha: dict, produto_id: int) -> int:
+def inserir_venda_e_baixar_estoque(
+    sb: Client,
+    linha: dict,
+    produto_id: int,
+    motivo_saida: str = "Venda Manual",
+) -> int:
     """Insere uma venda e registra sua saída no estoque/ledger.
 
     Esta é a rotina única usada tanto pela importação de Excel quanto pelo
@@ -625,6 +630,7 @@ def inserir_venda_e_baixar_estoque(sb: Client, linha: dict, produto_id: int) -> 
         "quantidade": quantidade,
         "saldo_apos": novo_saldo,
         "data_movimento": linha["data_venda"],
+        "motivo": motivo_saida,
     }).execute()
 
     return venda_id
@@ -971,7 +977,9 @@ def importar_linhas_validadas(linhas: list[dict], sb: Client | None = None) -> d
                 "cliente": cliente,
                 "observacao": item.get("observacao") or "",
             }
-            inserir_venda_e_baixar_estoque(sb, linha, item["produto_id"])
+            inserir_venda_e_baixar_estoque(
+                sb, linha, item["produto_id"], motivo_saida="Importação XLSX"
+            )
             importadas += 1
         except Exception as exc:
             erros.append(f"Linha {item.get('linha')}: {exc}")
@@ -1047,7 +1055,9 @@ def importar_vendas_excel(caminho_arquivo) -> dict:
                 duplicadas += 1
                 continue
 
-            inserir_venda_e_baixar_estoque(sb, linha, produto_id)
+            inserir_venda_e_baixar_estoque(
+                sb, linha, produto_id, motivo_saida="Importação XLSX"
+            )
             importadas += 1
 
         except Exception as e:

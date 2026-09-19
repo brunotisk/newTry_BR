@@ -853,6 +853,7 @@ def _dialog_editar_venda(
                 sb,
                 dados_novos,
                 produto_selecionado["id"],
+                motivo_saida="Venda Manual",
             )
             st.success("Venda registrada com sucesso e estoque atualizado!")
         else:
@@ -982,7 +983,36 @@ def _carregar_cadastros_popup():
 
 
 
+def _abrir_venda_pendente():
+    venda_id = st.session_state.pop("vendas_abrir_id", None)
+    if not venda_id:
+        return
+    try:
+        venda_resp = (
+            supabase.table("vendas")
+            .select(
+                "id, produto_id, quantidade, valor_lista, valor_desconto, valor_final, "
+                "data_venda, cliente, detalhe_feira_id, "
+                "produtos(descricao, codigo_interno), canais_venda(nome), "
+                "status_venda(nome), formas_pagamento(descricao), detalhes_feira(nome_feira)"
+            )
+            .eq("id", int(venda_id))
+            .single()
+            .execute()
+        )
+        venda = venda_resp.data
+        if not venda:
+            st.warning(f"Venda #{venda_id} não encontrada.")
+            return
+
+        canais, status, formas, feiras, clientes = _carregar_cadastros_popup()
+        _dialog_editar_venda(venda, canais, status, formas, feiras, clientes)
+    except Exception as e:
+        st.error(f"Erro ao abrir a venda #{venda_id}: {e}")
+
+
 def _secao_listagem():
+    _abrir_venda_pendente()
     # ------------------------------------------------------------------
     # 1) Dataset leve com TODAS as vendas (valor_final, data_venda e o nome
     #    do canal), usado para os KPIs fixos (Total/Ano/Mês atual), para o
@@ -1164,7 +1194,7 @@ def _secao_listagem():
             .table("vendas")
             .select(
                 "id, produto_id, quantidade, valor_lista, valor_desconto,"
-                " valor_final, data_venda, cliente,"
+                " valor_final, data_venda, cliente, detalhe_feira_id,"
                 f" produtos(descricao, codigo_interno), {canal_embed}, "
                 "status_venda(nome), formas_pagamento(descricao), "
                 "detalhes_feira(nome_feira)",
