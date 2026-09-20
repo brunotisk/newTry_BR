@@ -181,10 +181,27 @@ def _secao_movimentacoes():
         query = (
             supabase.table("estoque_movimentos")
             .select(
-                "id, tipo, quantidade, saldo_apos, data_movimento, compra_id, venda_id, motivo,"
+                "id, produto_id, tipo, quantidade, saldo_apos, data_movimento, compra_id, venda_id, motivo,"
                 " produtos(id, codigo_interno, descricao)"
             )
         )
+
+        # IMPORTANTE: o filtro por código precisa ser aplicado NO BANCO, antes
+        # do limite/paginação do histórico. Se filtrarmos depois de buscar os
+        # primeiros 500/5000 movimentos gerais, uma entrada antiga do produto
+        # pode ficar escondida por outros movimentos mais recentes.
+        produto_ids = None
+        if busca_codigo.strip():
+            codigo_busca = busca_codigo.strip()
+            resp_produto = (
+                supabase.table("produtos")
+                .select("id, codigo_interno")
+                .eq("codigo_interno", codigo_busca)
+                .execute()
+            )
+            produto_ids = [p["id"] for p in (resp_produto.data or [])]
+            if produto_ids:
+                query = query.in_("produto_id", produto_ids)
 
         # Sem filtro de data: traz todo o histórico.
         # Quando houver filtro, usamos limite superior exclusivo para não perder
@@ -199,24 +216,20 @@ def _secao_movimentacoes():
         if tipo_filtro != "Todos":
             query = query.eq("tipo", tipo_map[tipo_filtro])
 
-        response = (
-            query
-            .order("data_movimento", desc=True)
-            .order("id", desc=True)
-            .limit(500)
-            .execute()
-        )
-        movimentos = response.data or []
+        if busca_codigo.strip() and not produto_ids:
+            movimentos = []
+        else:
+            response = (
+                query
+                .order("data_movimento", desc=True)
+                .order("id", desc=True)
+                .limit(5000)
+                .execute()
+            )
+            movimentos = response.data or []
     except Exception as e:
         st.error(f"Erro ao carregar movimentações: {e}")
         return
-
-    if busca_codigo:
-        termo = busca_codigo.strip().lower()
-        movimentos = [
-            m for m in movimentos
-            if termo in ((m.get("produtos") or {}).get("codigo_interno") or "").lower()
-        ]
 
     filtro_atual = (
         modo_data,

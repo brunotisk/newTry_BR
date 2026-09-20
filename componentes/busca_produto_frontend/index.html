@@ -14,59 +14,60 @@
       overflow: visible;
     }
     .wrap { width: 100%; position: relative; }
+    .label-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin: 0 0 6px 0;
+    }
     .label {
       display: block;
-      margin: 0 0 6px 0;
+      margin: 0;
       color: #FAFAFA;
       font-size: 14px;
       font-weight: 600;
       line-height: 1.4;
     }
-    .mode-toggle-row {
-      /* Mesmo espaçamento vertical que o Streamlit usa entre um widget e o
-         próximo (ex.: entre o selectbox "Categoria" e o toggle "Apenas sem
-         categoria" logo abaixo dele) — para os dois toggles ficarem
-         alinhados na mesma altura. */
-      margin-top: 12px;
+    /* Grupo de opções (radio) para escolher o modo de busca: substitui o
+       switch anterior (que tinha uma sensação de atraso visual) por uma
+       seleção direta entre "Cod. Produto" (padrão) e "Descrição". */
+    .mode-radio {
+      display: inline-flex;
+      align-items: center;
+      flex: 0 0 auto;
+      border: 1px solid #464B53;
+      border-radius: 6px;
+      padding: 2px;
+      gap: 2px;
     }
-    .mode-toggle {
+    .mode-option {
       display: flex;
       align-items: center;
-      gap: 8px;
-      background: transparent;
-      border: none;
-      padding: 0;
+      padding: 3px 8px;
+      border-radius: 4px;
       cursor: pointer;
-      color: #FAFAFA;
-      font-size: 14px;
-      line-height: 1.4;
+      font-size: 11.5px;
+      font-weight: 400;
+      line-height: 1.3;
+      color: rgb(163, 168, 184);
       white-space: nowrap;
+      user-select: none;
+      transition: background .12s ease, color .12s ease;
     }
-    .mode-slider {
-      position: relative;
-      width: 32px;
-      height: 18px;
-      border-radius: 999px;
-      background: #464B53;
-      transition: background .15s ease;
-      flex: 0 0 auto;
-    }
-    .mode-slider::after {
-      content: "";
+    .mode-option input {
       position: absolute;
-      top: 2px;
-      left: 2px;
-      width: 14px;
-      height: 14px;
-      border-radius: 50%;
-      background: #FAFAFA;
-      transition: transform .15s ease;
+      opacity: 0;
+      width: 0;
+      height: 0;
+      pointer-events: none;
     }
-    .mode-toggle[aria-pressed="true"] .mode-slider {
+    .mode-option:hover {
+      color: #FAFAFA;
+    }
+    .mode-option.active {
       background: #FF4B4B;
-    }
-    .mode-toggle[aria-pressed="true"] .mode-slider::after {
-      transform: translateX(14px);
+      color: #FAFAFA;
     }
     .selectbox {
       position: relative;
@@ -167,7 +168,19 @@
 </head>
 <body>
   <div class="wrap">
-    <div class="label" id="label"></div>
+    <div class="label-row">
+      <div class="label" id="label"></div>
+      <div class="mode-radio" id="modeRadio" role="radiogroup" aria-label="Modo de busca">
+        <label class="mode-option" data-mode="codigo">
+          <input type="radio" name="modo_busca" value="codigo" checked />
+          <span>Cod. Produto</span>
+        </label>
+        <label class="mode-option" data-mode="descricao">
+          <input type="radio" name="modo_busca" value="descricao" />
+          <span>Descrição</span>
+        </label>
+      </div>
+    </div>
     <div class="selectbox">
       <div class="control" id="control">
         <input id="input" autocomplete="off" spellcheck="false" />
@@ -175,18 +188,6 @@
         <span class="arrow"></span>
       </div>
       <div class="menu" id="menu"></div>
-    </div>
-    <div class="mode-toggle-row">
-      <button
-        type="button"
-        class="mode-toggle"
-        id="modeToggle"
-        aria-pressed="false"
-        title="Alternar entre buscar por código ou por descrição"
-      >
-        <span class="mode-slider"></span>
-        <span class="mode-text" id="modeText">Buscar descrição</span>
-      </button>
     </div>
   </div>
 
@@ -196,7 +197,9 @@
   const menu = document.getElementById("menu");
   const control = document.getElementById("control");
   const clearBtn = document.getElementById("clearBtn");
-  const modeToggle = document.getElementById("modeToggle");
+  const modeRadio = document.getElementById("modeRadio");
+  const modeOptions = modeRadio.querySelectorAll(".mode-option");
+  const modeInputs = modeRadio.querySelectorAll('input[name="modo_busca"]');
 
   let args = { opcoes: [], rotulo_selecionado: null, buscar_descricao: false, valor_selecionado: null, termo: "", placeholder: "" };
   let selectedId = null;
@@ -211,6 +214,13 @@
   // Python — mas atualizado localmente na hora do clique, pra feedback
   // visual instantâneo antes da resposta do servidor chegar.
   let buscarDescricao = false;
+  // Guarda contra "render" com argumentos desatualizados: quando o Python
+  // ainda não processou a troca de modo (ver selecionarModoBusca), o valor
+  // selecionado que chega em args pode ser o ANTIGO por mais um ciclo. Esses
+  // dois valores permitem ignorar esse render específico e manter o campo
+  // limpo que já aplicamos localmente, até o Python realmente confirmar.
+  let modoTrocandoAguardandoSync = false;
+  let idAntesDaTroca = null;
 
   // A filtragem por código/descrição passou a acontecer no servidor (Python),
   // usando exatamente o mesmo critério de antes. Isso evita reenviar o
@@ -226,6 +236,7 @@
   }
 
   function limparSelecao() {
+    modoTrocandoAguardandoSync = false;
     selectedId = null;
     lastQuery = "";
     suppressNextInput = true;
@@ -292,7 +303,7 @@
     menu.classList.add("open");
     // O frame cresce apenas enquanto a lista está aberta. A tela principal
     // compensa esse espaço para que a tabela permaneça na mesma posição.
-    setFrameHeight(388);
+    setFrameHeight(368);
     enviarEstado({ id: selectedId, termo: lastQuery, aberto: true });
   }
 
@@ -310,7 +321,7 @@
       atualizarBotaoLimpar();
     }
 
-    setFrameHeight(100);
+    setFrameHeight(76);
     enviarEstado({
       id: selectedId,
       termo: selectedId === null ? "" : lastQuery,
@@ -319,6 +330,7 @@
   }
 
   function selectOption(option) {
+    modoTrocandoAguardandoSync = false;
     selectedId = option.id;
     lastQuery = option.rotulo;
     suppressNextInput = true;
@@ -330,6 +342,7 @@
 
   function clearSelectionForTyping() {
     if (selectedId !== null) {
+      modoTrocandoAguardandoSync = false;
       selectedId = null;
       enviarEstado({ id: null, termo: input.value });
     }
@@ -338,29 +351,53 @@
   function placeholderPadrao() {
     // Usado quando args.placeholder não é enviado pelo Python: o próprio
     // componente decide o texto de acordo com o modo de busca atual.
-    return buscarDescricao ? "Buscar por descrição..." : "Todos os produtos";
+    return buscarDescricao
+      ? "Todos os produtos - busca por Descrição"
+      : "Todos os produtos - busca por Cod. Produto";
   }
 
   function aplicarModoNoBotao() {
-    modeToggle.setAttribute("aria-pressed", buscarDescricao ? "true" : "false");
+    modeInputs.forEach((el) => {
+      el.checked = (el.value === "descricao") === buscarDescricao;
+    });
+    modeOptions.forEach((el) => {
+      const ativo = (el.dataset.mode === "descricao") === buscarDescricao;
+      el.classList.toggle("active", ativo);
+    });
   }
 
-  function alternarModoBusca() {
-    buscarDescricao = !buscarDescricao;
+  function selecionarModoBusca(novoBuscarDescricao) {
+    if (novoBuscarDescricao === buscarDescricao) return;
+    buscarDescricao = novoBuscarDescricao;
     aplicarModoNoBotao();
 
     // Trocar o modo invalida a busca atual: um termo de código não faz
     // sentido filtrando por descrição, e vice-versa — mesmo comportamento
     // que produtos.py tinha antes ao limpar a seleção no on_change do
     // st.toggle separado.
+    // Guarda o id que estava selecionado ANTES da troca: enquanto o Python
+    // não confirmar a limpeza (id: null) de volta, ignoramos qualquer
+    // render() que ainda venha com esse id antigo, para o rótulo do
+    // produto não "voltar" por cima do campo já limpo.
+    idAntesDaTroca = selectedId;
+    modoTrocandoAguardandoSync = idAntesDaTroca !== null;
+
     selectedId = null;
     lastQuery = "";
     suppressNextInput = true;
     input.value = "";
     input.placeholder = placeholderPadrao();
     atualizarBotaoLimpar();
+    // Fecha a lista caso já estivesse aberta — trocar o modo não deve
+    // abrir (nem manter aberto) o dropdown de opções.
+    menu.classList.remove("open");
+    activeIndex = -1;
+    setFrameHeight(76);
+    // Só reposiciona o cursor no campo — não deve abrir a lista de opções
+    // ao clicar no radio (o "focus" abriria o menu, então suprimimos isso).
+    suppressNextFocusOpen = true;
     input.focus();
-    openMenu();
+    enviarEstado({ id: null, termo: "" });
   }
 
   function render(newArgs) {
@@ -372,6 +409,19 @@
     input.placeholder = args.placeholder || placeholderPadrao();
 
     const externalId = args.valor_selecionado;
+
+    if (modoTrocandoAguardandoSync) {
+      if (externalId === idAntesDaTroca) {
+        // O Python ainda não processou a troca de modo — estes args estão
+        // um ciclo atrasados. Ignora a sincronização de seleção deste
+        // render (o campo já está limpo localmente) até o valor real
+        // (null) chegar.
+        if (menu.classList.contains("open")) renderMenu();
+        atualizarBotaoLimpar();
+        return;
+      }
+      modoTrocandoAguardandoSync = false;
+    }
 
     // O rótulo do item selecionado já vem pronto do Python (calculado a
     // partir da lista completa, não da lista filtrada pela busca), então não
@@ -393,8 +443,15 @@
     atualizarBotaoLimpar();
   }
 
-  modeToggle.addEventListener("click", () => {
-    alternarModoBusca();
+  modeOptions.forEach((el) => {
+    el.addEventListener("mousedown", (event) => {
+      // Evita que o clique tire o foco do input antes da hora (mesmo
+      // padrão usado nas opções da lista de produtos).
+      event.preventDefault();
+    });
+    el.addEventListener("click", () => {
+      selecionarModoBusca(el.dataset.mode === "descricao");
+    });
   });
 
   input.addEventListener("focus", () => {
@@ -410,6 +467,7 @@
       suppressNextInput = false;
       return;
     }
+    modoTrocandoAguardandoSync = false;
     if (selectedId !== null) selectedId = null;
     lastQuery = input.value;
     atualizarBotaoLimpar();
@@ -495,7 +553,7 @@
     type: "streamlit:componentReady",
     apiVersion: 1
   }, "*");
-  setFrameHeight(100);
+  setFrameHeight(76);
 </script>
 </body>
 </html>

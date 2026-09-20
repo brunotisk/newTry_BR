@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <script src="https://cdn.jsdelivr.net/npm/streamlit-component-lib@2.0.0/dist/index.js"></script>
+  <style>
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: transparent;
+      overflow: hidden;
+    }
+    body {
+      color: #FAFAFA;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 14px;
+    }
+
+    .wrap {
+      width: 100%;
+      height: 66px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .field-label {
+      height: 20px;
+      line-height: 20px;
+      color: #FAFAFA;
+      font-size: 14px;
+      font-weight: 600;
+      margin: 0;
+      padding: 0;
+    }
+
+    .control-row {
+      width: 100%;
+      height: 40px;
+      display: flex;
+      align-items: stretch;
+      gap: 0;
+    }
+
+    /* Aparência alinhada aos botões/widgets padrão do Streamlit */
+    .step,
+    .value,
+    .lock {
+      height: 40px;
+      margin: 0;
+      font-family: inherit;
+      color: #FAFAFA;
+      border: 1px solid #464B53;
+      background: #262730;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .step {
+      flex: 1 1 0;
+      min-width: 0;
+      padding: 0;
+      font-size: 18px;
+      font-weight: 500;
+      cursor: pointer;
+    }
+
+    .step:first-child {
+      border-radius: 6px 0 0 6px;
+    }
+
+    .step:nth-child(3) {
+      border-radius: 0 6px 6px 0;
+    }
+
+    .step:hover:not(:disabled) {
+      background: #31323D;
+      border-color: #5A5D68;
+    }
+
+    .step:active:not(:disabled) {
+      background: #3A3B46;
+    }
+
+    .step:disabled {
+      color: #8B8D98;
+      cursor: default;
+      opacity: .65;
+    }
+
+    .value-wrap {
+      flex: 1 1 0;
+      min-width: 0;
+      position: relative;
+    }
+
+    .value {
+      width: 100%;
+      padding: 0 6px;
+      border-left: 0;
+      border-right: 0;
+      border-radius: 0;
+      outline: none;
+      text-align: center;
+      font-size: 14px;
+      font-weight: 400;
+      cursor: default;
+    }
+
+    .value.unlocked {
+      cursor: text;
+      background: #555862;
+      color: #FAFAFA;
+      border-color: #777B86;
+      box-shadow: inset 0 0 0 1px rgba(255,255,255,.22);
+    }
+
+    .value.unlocked::selection {
+      background: #707580;
+      color: #FFFFFF;
+    }
+
+    .value:focus {
+      border-color: #FF4B4B;
+      box-shadow: inset 0 0 0 1px #FF4B4B;
+    }
+
+    /* O cadeado fica depois do contador, como no layout solicitado. */
+    .lock {
+      flex: 0 0 40px;
+      width: 40px;
+      padding: 0;
+      border-radius: 6px;
+      margin-left: 6px;
+      cursor: pointer;
+      font-size: 17px;
+      line-height: 1;
+    }
+
+    .lock:hover {
+      background: #31323D;
+      border-color: #5A5D68;
+    }
+
+    .lock.unlocked {
+      border-color: #FF4B4B;
+      color: #FF4B4B;
+    }
+
+    /* Remove as setas nativas do input number para manter o visual limpo. */
+    input[type="number"]::-webkit-inner-spin-button,
+    input[type="number"]::-webkit-outer-spin-button {
+      -webkit-appearance: none;
+      margin: 0;
+    }
+    input[type="number"] {
+      -moz-appearance: textfield;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="field-label" id="label">Quantidade</div>
+    <div class="control-row">
+      <button class="step" id="minus" type="button" aria-label="Diminuir quantidade">−</button>
+      <div class="value-wrap">
+        <input class="value" id="value" type="number" min="1" step="1" aria-label="Quantidade" />
+      </div>
+      <button class="step" id="plus" type="button" aria-label="Aumentar quantidade">+</button>
+      <button class="lock" id="lock" type="button" aria-label="Desbloquear edição manual" title="Desbloquear edição manual">🔒</button>
+    </div>
+  </div>
+
+<script>
+  let args = { valor: 1, min_valor: 1, bloqueado: true };
+  let valor = 1;
+  let minValor = 1;
+  let bloqueado = true;
+  let pronto = false;
+
+  const labelEl = document.getElementById("label");
+  const valueEl = document.getElementById("value");
+  const minusEl = document.getElementById("minus");
+  const plusEl = document.getElementById("plus");
+  const lockEl = document.getElementById("lock");
+
+  function clamp(v) {
+    let n = parseInt(v, 10);
+    if (!Number.isFinite(n)) n = minValor;
+    return Math.max(minValor, n);
+  }
+
+  function enviar() {
+    window.parent.postMessage({
+      isStreamlitMessage: true,
+      type: "streamlit:setComponentValue",
+      value: { valor: valor, bloqueado: bloqueado }
+    }, "*");
+  }
+
+  function render() {
+    labelEl.textContent = args.label || "Quantidade";
+    valor = clamp(valor);
+    valueEl.value = String(valor);
+    valueEl.readOnly = bloqueado;
+    valueEl.classList.toggle("unlocked", !bloqueado);
+    minusEl.disabled = valor <= minValor;
+    lockEl.textContent = bloqueado ? "🔒" : "🔓";
+    lockEl.classList.toggle("unlocked", !bloqueado);
+    lockEl.setAttribute("aria-label", bloqueado ? "Desbloquear edição manual" : "Bloquear edição manual");
+    lockEl.title = bloqueado ? "Desbloquear edição manual" : "Bloquear edição manual";
+  }
+
+  minusEl.addEventListener("click", () => {
+    valor = clamp(valor - 1);
+    render();
+    enviar();
+  });
+
+  plusEl.addEventListener("click", () => {
+    valor = clamp(valor + 1);
+    render();
+    enviar();
+  });
+
+  lockEl.addEventListener("click", () => {
+    bloqueado = !bloqueado;
+    render();
+    enviar();
+    if (!bloqueado) {
+      valueEl.focus();
+      valueEl.select();
+    }
+  });
+
+  valueEl.addEventListener("input", () => {
+    if (bloqueado) return;
+    if (valueEl.value === "") return;
+    valor = clamp(valueEl.value);
+    enviar();
+  });
+
+  valueEl.addEventListener("blur", () => {
+    valor = clamp(valueEl.value);
+    render();
+    enviar();
+  });
+
+  valueEl.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      valueEl.blur();
+    }
+  });
+
+  window.addEventListener("message", (event) => {
+    const data = event.data;
+    if (data && data.type === "streamlit:render") {
+      args = data.args || args;
+      labelEl.textContent = args.label || "Quantidade";
+      minValor = Math.max(1, parseInt(args.min_valor ?? 1, 10) || 1);
+      if (!pronto) {
+        valor = clamp(args.valor ?? 1);
+        bloqueado = !!args.bloqueado;
+        pronto = true;
+      }
+      render();
+    }
+  });
+
+  window.parent.postMessage({
+    isStreamlitMessage: true,
+    type: "streamlit:componentReady",
+    apiVersion: 1
+  }, "*");
+  setTimeout(render, 0);
+</script>
+</body>
+</html>
