@@ -8,6 +8,8 @@ Fluxo (importar_nfe):
   4. upsert de produtos novos (atualizando ultima_compra e nr_compras)
   5. insert dos itens da compra
   6. atualiza saldo de estoque + grava movimento no ledger (via servicos.estoque)
+  7. atualiza o preço de venda sugerido em estoque (2x o valor_unitario da
+     compra mais recente do produto)
 
 O parsing de XML (antes em nfe_parser.py, separado) foi trazido pra cá porque
 só é usado por este pipeline de importação de compras.
@@ -217,6 +219,33 @@ def upsert_produto(sb: Client, item, data_emissao) -> int:
     return resp.data[0]["id"]
 
 
+def _atualizar_preco_venda_se_mais_recente(sb: Client, produto_id: int, valor_unitario: Decimal, data_movimento: str) -> None:
+    """Recalcula estoque.Estoque_Preco_venda (2x o valor_unitario da compra) somente
+    se esta compra for a mais recente já registrada para o produto (produtos.ultima_compra).
+    Isso evita que a importação de uma NF antiga sobrescreva um preço já calculado
+    a partir de uma compra mais nova."""
+
+    prod_resp = (
+        sb.table("produtos")
+        .select("ultima_compra")
+        .eq("id", produto_id)
+        .execute()
+    )
+
+    ultima_compra_produto = None
+    if prod_resp.data and prod_resp.data[0].get("ultima_compra"):
+        ultima_compra_produto = str(prod_resp.data[0]["ultima_compra"])[:10]
+
+    # Só atualiza o preço se esta compra for igual (ou, por segurança, posterior)
+    # à ultima_compra já registrada no produto.
+    if ultima_compra_produto is None or data_movimento >= ultima_compra_produto:
+        novo_preco_venda = float(valor_unitario) * 2
+        sb.table("estoque").upsert({
+            "produto_id": produto_id,
+            "Estoque_Preco_venda": novo_preco_venda,
+        }, on_conflict="produto_id").execute()
+
+
 def inserir_item_e_atualizar_estoque(sb: Client, compra_id: int, produto_id: int, item, data_emissao):
     sb.table("compras_itens").insert({
         "compra_id": compra_id,
@@ -241,6 +270,10 @@ def inserir_item_e_atualizar_estoque(sb: Client, compra_id: int, produto_id: int
         data_movimento=data_movimento,
         compra_id=compra_id,
     )
+
+    # Atualiza o preço de venda sugerido (2x o valor_unitario da compra mais
+    # recente) sempre que esta compra for a mais nova para o produto.
+    _atualizar_preco_venda_se_mais_recente(sb, produto_id, item.valor_unitario, data_movimento)
 
 
 def importar_nfe(caminho_xml: str) -> dict:
