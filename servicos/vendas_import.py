@@ -19,14 +19,13 @@ Linhas com produto não encontrado, ou já importadas antes (mesmo produto +
 data + valor + cliente), são puladas e reportadas no resumo, sem interromper
 a importação das demais.
 
-Requer as mesmas variáveis de ambiente de supabase_import.py:
+Requer as mesmas variáveis de ambiente de servicos/supabase_admin.py:
   SUPABASE_URL
   SUPABASE_SERVICE_KEY
 
 Instalar: pip install pandas openpyxl
 """
 from __future__ import annotations
-import os
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from io import BytesIO
@@ -38,12 +37,11 @@ from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.datavalidation import DataValidation
 
 import pandas as pd
-from dotenv import load_dotenv
-from supabase import create_client, Client
+from supabase import Client
 
-from estoque_ajuste import registrar_ajuste
+from .estoque import registrar_ajuste, registrar_movimento
+from .supabase_admin import get_client  # noqa: F401  (re-exportado por conveniência)
 
-load_dotenv()
 
 # Ordem das colunas quando a planilha NÃO tem cabeçalho
 COLUNAS_SEM_CABECALHO = [
@@ -456,12 +454,6 @@ def normalizar_codigo_interno(valor) -> str:
     return texto
 
 
-def get_client() -> Client:
-    url = os.environ["SUPABASE_URL"]
-    key = os.environ["SUPABASE_SERVICE_KEY"]
-    return create_client(url, key)
-
-
 def _parse_moeda(valor) -> Decimal:
     """Converte 'R$ 79,90', '79,90', 79.9, NaN etc. para Decimal."""
     if valor is None or (isinstance(valor, float) and pd.isna(valor)):
@@ -606,32 +598,20 @@ def inserir_venda_e_baixar_estoque(
     venda_resp = sb.table("vendas").insert(dados_venda).execute()
     venda_id = venda_resp.data[0]["id"]
 
-    estoque_resp = (
-        sb.table("estoque")
-        .select("quantidade_atual")
-        .eq("produto_id", produto_id)
-        .execute()
-    )
-    saldo_anterior = estoque_resp.data[0]["quantidade_atual"] if estoque_resp.data else 0
     quantidade = float(linha["quantidade"])
-    novo_saldo = float(saldo_anterior) - quantidade
 
-    sb.table("estoque").upsert({
-        "produto_id": produto_id,
-        "quantidade_atual": novo_saldo,
-    }, on_conflict="produto_id").execute()
-
-    # Toda venda, inclusive a criada manualmente pelo popup, gera uma
-    # saída vinculada à venda no ledger.
-    sb.table("estoque_movimentos").insert({
-        "produto_id": produto_id,
-        "venda_id": venda_id,
-        "tipo": "saida",
-        "quantidade": quantidade,
-        "saldo_apos": novo_saldo,
-        "data_movimento": linha["data_venda"],
-        "motivo": motivo_saida,
-    }).execute()
+    # Antes, a atualização de saldo + inserção no ledger estava duplicada
+    # aqui (era idêntica à de compras_import.py e estoque_ajuste.py). Agora
+    # é uma única implementação em servicos/estoque.py.
+    registrar_movimento(
+        sb,
+        produto_id=produto_id,
+        quantidade=-quantidade,
+        tipo="saida",
+        data_movimento=linha["data_venda"],
+        motivo=motivo_saida,
+        venda_id=venda_id,
+    )
 
     return venda_id
 

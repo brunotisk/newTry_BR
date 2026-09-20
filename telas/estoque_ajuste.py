@@ -2,7 +2,7 @@ import streamlit as st
 from datetime import date, datetime
 
 from db import supabase
-from estoque_ajuste import get_client
+from servicos.supabase_admin import get_client
 from componentes.paginacao import render_paginacao, get_itens_por_pagina, reset_paginacao
 from componentes.contador_quantidade import contador_quantidade
 

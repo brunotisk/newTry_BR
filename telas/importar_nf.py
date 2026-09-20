@@ -1,6 +1,5 @@
 import streamlit as st
-from nfe_parser import parse_nfe_string
-from supabase_import import importar_nfe
+from servicos.compras_import import parse_nfe_string, importar_nfe
 import tempfile
 
 

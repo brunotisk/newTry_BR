@@ -6,7 +6,7 @@ from datetime import date, datetime
 from typing import Optional
 
 from db import supabase
-from vendas_import import (
+from servicos.vendas_import import (
     ler_planilha,
     importar_vendas_excel,
     buscar_produto_id,

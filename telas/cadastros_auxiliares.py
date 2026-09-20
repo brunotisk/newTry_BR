@@ -1,7 +1,7 @@
 import streamlit as st
 
 from db import supabase
-from listas_venda import listar, criar, atualizar
+from servicos.listas_venda import listar, criar, atualizar
 
 
 def _secao_lista(tabela: str, titulo: str, placeholder: str):
