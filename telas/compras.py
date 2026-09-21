@@ -8,6 +8,7 @@ from servicos.arquivos_compra import (
     upload_arquivo_compra,
     listar_arquivos_compra,
     gerar_url_arquivo_compra,
+    baixar_arquivo_compra,
     excluir_arquivo_compra,
     nome_arquivo_compra,
 )
@@ -192,6 +193,23 @@ def _dialog_editar_desconto(compra: dict):
 
 @_dialog("📎 Arquivos da compra", width="large")
 def _dialog_arquivos_compra(compra: dict):
+    st.markdown(
+        """
+        <style>
+        div[data-testid="stDialog"] button[kind="primary"] {
+            background-color: #16a34a !important;
+            border-color: #16a34a !important;
+            color: white !important;
+        }
+        div[data-testid="stDialog"] button[kind="primary"]:hover {
+            background-color: #15803d !important;
+            border-color: #15803d !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
     """Gerencia XML/PDF vinculados a uma compra."""
     st.caption(
         f"NF nº {compra.get('numero_nf') or '-'} — "
@@ -309,20 +327,24 @@ def _dialog_arquivos_compra(compra: dict):
                     col_baixar, col_excluir = st.columns(2)
 
                     try:
-                        url = gerar_url_arquivo_compra(
-                            arquivo,
-                            validade_segundos=300,
+                        conteudo_arquivo, nome_download, mime_download = baixar_arquivo_compra(
+                            arquivo
                         )
                     except Exception:
-                        url = ""
+                        conteudo_arquivo = None
+                        nome_download = arquivo.get("nome_arquivo") or "arquivo"
+                        mime_download = arquivo.get("mime_type") or "application/octet-stream"
                         col_baixar.error("Erro")
 
-                    if url:
-                        col_baixar.link_button(
+                    if conteudo_arquivo is not None:
+                        col_baixar.download_button(
                             "⬇️",
-                            url,
-                            help="Baixar/abrir arquivo",
+                            data=conteudo_arquivo,
+                            file_name=nome_download,
+                            mime=mime_download,
+                            help="Baixar arquivo",
                             use_container_width=True,
+                            key=f"baixar_arquivo_compra_{arquivo['id']}",
                         )
 
                     if col_excluir.button(
@@ -340,14 +362,6 @@ def _dialog_arquivos_compra(compra: dict):
     else:
         with st.container(border=True):
             st.info("Nenhum arquivo anexado a esta compra.")
-
-    st.write("")
-    if st.button(
-        "Fechar",
-        key=f"fechar_arquivos_compra_{compra['id']}",
-        use_container_width=True,
-    ):
-        st.rerun()
 
 
 def _secao_listagem():

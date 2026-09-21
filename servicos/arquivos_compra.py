@@ -221,6 +221,40 @@ def gerar_url_arquivo_compra(
     )
 
 
+
+def baixar_arquivo_compra(arquivo: dict | int, supabase=None) -> tuple[bytes, str, str]:
+    """Baixa o conteúdo do arquivo privado do Storage.
+
+    Retorna (conteudo, nome_arquivo, mime_type), permitindo usar
+    st.download_button para forçar o download no navegador.
+    """
+    client = supabase or _obter_supabase()
+
+    if isinstance(arquivo, int):
+        resposta = (
+            client.table(TABELA_ARQUIVOS)
+            .select("id, caminho_storage, nome_arquivo, mime_type")
+            .eq("id", arquivo)
+            .single()
+            .execute()
+        )
+        registro = resposta.data or {}
+    else:
+        registro = arquivo
+
+    caminho = registro.get("caminho_storage")
+    nome = registro.get("nome_arquivo") or "arquivo"
+    mime = registro.get("mime_type") or _mime_type(nome)
+
+    if not caminho:
+        raise ValueError("O arquivo não possui caminho_storage.")
+
+    conteudo = client.storage.from_(BUCKET_COMPRAS).download(caminho)
+    if not conteudo:
+        raise ValueError("Não foi possível baixar o arquivo do Storage.")
+
+    return conteudo, nome, mime
+
 def excluir_arquivo_compra(arquivo: dict | int, supabase=None) -> bool:
     """Exclui o arquivo do Storage e o registro em compras_arquivos."""
     client = supabase or _obter_supabase()
