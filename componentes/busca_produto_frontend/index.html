@@ -154,15 +154,49 @@
     }
     .menu.open { display: block; }
     .option {
-      padding: 9px 12px;
+      padding: 0;
       color: #FAFAFA;
       cursor: pointer;
       line-height: 1.35;
       white-space: nowrap;
       overflow: hidden;
-      text-overflow: ellipsis;
+      display: flex;
+      align-items: center;
+      gap: 4px;
     }
     .option:hover, .option.active { background: #3A3B46; }
+    .option-label {
+      flex: 1 1 auto;
+      min-width: 0;
+      padding: 9px 4px 9px 12px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .copy-code-btn {
+      flex: 0 0 auto;
+      width: 30px;
+      height: 30px;
+      margin-right: 5px;
+      border: none;
+      border-radius: 4px;
+      background: transparent;
+      color: #8B8D98;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0;
+      font-size: 15px;
+      line-height: 1;
+    }
+    .copy-code-btn:hover {
+      color: #FAFAFA;
+      background: rgba(255, 255, 255, 0.10);
+    }
+    .copy-code-btn.copied {
+      color: #21C55D;
+    }
     .empty { padding: 10px 12px; color: #8B8D98; }
   </style>
 </head>
@@ -262,6 +296,31 @@
     send(Object.assign({ buscar_descricao: buscarDescricao }, extra));
   }
 
+  async function copiarParaAreaTransferencia(texto) {
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(texto);
+        return true;
+      }
+
+      // Fallback para navegadores/ambientes em que a API Clipboard não está
+      // disponível dentro do iframe do componente.
+      const auxiliar = document.createElement("textarea");
+      auxiliar.value = texto;
+      auxiliar.setAttribute("readonly", "");
+      auxiliar.style.position = "fixed";
+      auxiliar.style.opacity = "0";
+      document.body.appendChild(auxiliar);
+      auxiliar.select();
+      auxiliar.setSelectionRange(0, auxiliar.value.length);
+      const ok = document.execCommand("copy");
+      auxiliar.remove();
+      return ok;
+    } catch (error) {
+      return false;
+    }
+  }
+
   function renderMenu() {
     const options = opcoesAtuais();
     menu.innerHTML = "";
@@ -280,12 +339,52 @@
     options.slice(0, 100).forEach((option, index) => {
       const el = document.createElement("div");
       el.className = "option";
-      el.textContent = option.rotulo;
       el.title = option.rotulo;
+
+      const label = document.createElement("div");
+      label.className = "option-label";
+      label.textContent = option.rotulo;
+
+      const copyBtn = document.createElement("button");
+      copyBtn.type = "button";
+      copyBtn.className = "copy-code-btn";
+      copyBtn.textContent = "📋";
+      copyBtn.title = `Copiar código ${option.codigo || ""}`.trim();
+      copyBtn.setAttribute("aria-label", `Copiar código ${option.codigo || ""}`.trim());
+
+      // O botão de copiar não seleciona o produto nem fecha a lista.
+      copyBtn.addEventListener("mousedown", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+      });
+      copyBtn.addEventListener("click", async (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+
+        const codigo = String(option.codigo || "").trim();
+        if (!codigo) return;
+
+        const copiado = await copiarParaAreaTransferencia(codigo);
+        if (copiado) {
+          copyBtn.textContent = "✓";
+          copyBtn.classList.add("copied");
+          copyBtn.title = `Código ${codigo} copiado`;
+          setTimeout(() => {
+            copyBtn.textContent = "📋";
+            copyBtn.classList.remove("copied");
+            copyBtn.title = `Copiar código ${codigo}`;
+          }, 1200);
+        }
+      });
+
       el.addEventListener("mousedown", (event) => {
+        if (event.target === copyBtn || copyBtn.contains(event.target)) return;
         event.preventDefault();
         selectOption(option);
       });
+
+      el.appendChild(label);
+      el.appendChild(copyBtn);
       menu.appendChild(el);
     });
   }

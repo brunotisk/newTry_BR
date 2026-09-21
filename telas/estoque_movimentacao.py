@@ -49,23 +49,6 @@ def _estilo_links_origem():
             padding-bottom: 0 !important;
         }
 
-        /* Cada célula da tabela é o widget de UM componente (texto fixo em
-         * div, ou um st.button para "Origem"). Sem isto, o invólucro do
-         * botão carrega uma margem/altura padrão do Streamlit diferente da
-         * altura fixa (28px) usada nas células de texto, e as linhas da
-         * tabela ficam com espaçamento desigual entre si. Cobrimos os dois
-         * nomes de testid ("stElementContainer" e "element-container") para
-         * funcionar em diferentes versões do Streamlit.
-         */
-        div[data-testid="stVerticalBlockBorderWrapper"] div[data-testid="stHorizontalBlock"] div[data-testid="stElementContainer"],
-        div[data-testid="stVerticalBlockBorderWrapper"] div[data-testid="stHorizontalBlock"] .element-container,
-        div[data-testid="stVerticalBlockBorderWrapper"] div[data-testid="stHorizontalBlock"] div[data-testid="stButton"] {
-            margin: 0 !important;
-            min-height: 28px !important;
-            display: flex !important;
-            align-items: center !important;
-        }
-
         /* Links de origem da tabela de movimentações */
         div[data-testid="stButton"] button[kind="tertiary"] {
             color: #8ab4f8 !important;
@@ -372,7 +355,7 @@ def _secao_movimentacoes():
                     ):
                         _navegar_para_transacao("venda", venda_id)
                 else:
-                    col_origem.markdown(_texto_celula("-"), unsafe_allow_html=True)
+                    col_origem.write("-")
                 col_obs.markdown(_texto_celula(m.get("motivo") or "-"), unsafe_allow_html=True)
             elif m.get("tipo") == "entrada":
                 compra_id = m.get("compra_id")
@@ -384,7 +367,7 @@ def _secao_movimentacoes():
                     ):
                         _navegar_para_transacao("compra", compra_id, produto.get("id"))
                 else:
-                    col_origem.markdown(_texto_celula("-"), unsafe_allow_html=True)
+                    col_origem.write("-")
                 # Compras não precisam de observação nesta visão.
                 col_obs.markdown(_texto_celula("-"), unsafe_allow_html=True)
             elif m.get("tipo") == "ajuste":

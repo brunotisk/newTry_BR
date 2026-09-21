@@ -56,6 +56,38 @@ def _fmt_qtd(valor) -> str:
     return f"{float(valor or 0):g}"
 
 
+def _badge_clipe_arquivos() -> str:
+    """Indicador de 'NF possui arquivo anexado': um ícone de clipe discreto
+    (SVG, sem fundo/caixa) ao lado do número da NF — mais limpo do que o
+    emoji dentro de um selo colorido."""
+    return (
+        '<span title="Esta NF possui arquivos anexados." '
+        'style="display:inline-flex;align-items:center;margin-left:6px;'
+        'vertical-align:middle;color:#7C93C4;">'
+        '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" '
+        'stroke="currentColor" stroke-width="2.4" stroke-linecap="round" '
+        'stroke-linejoin="round">'
+        '<path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66'
+        'l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>'
+        '</svg>'
+        '</span>'
+    )
+
+
+def _badge_tipo_arquivo(tipo: str) -> str:
+    """Selo colorido para o tipo do arquivo (PDF/XML) na lista de anexados."""
+    tipo_norm = (tipo or "-").upper()
+    cor_texto, cor_fundo = {
+        "PDF": ("#f87171", "rgba(239,68,68,.14)"),
+        "XML": ("#60a5fa", "rgba(59,130,246,.14)"),
+    }.get(tipo_norm, ("#9ca3af", "rgba(156,163,175,.14)"))
+    return (
+        f'<span style="display:inline-block;padding:3px 10px;border-radius:6px;'
+        f'background:{cor_fundo};color:{cor_texto};font-size:12px;font-weight:700;'
+        f'letter-spacing:.02em;">{tipo_norm}</span>'
+    )
+
+
 @_dialog("📦 Itens da compra", width="large")
 def _dialog_itens_compra(compra: dict, produto_id: int | None = None):
     # Alarga ainda mais o popup (o width="large" do Streamlit já ajuda,
@@ -193,67 +225,80 @@ def _dialog_editar_desconto(compra: dict):
 
 @_dialog("📎 Arquivos da compra", width="large")
 def _dialog_arquivos_compra(compra: dict):
+    """Gerencia XML/PDF vinculados a uma compra."""
+    chave_wrap_upload = f"upload_arquivo_wrap_{compra['id']}"
+
+    # CSS único, escopado só ao container deste botão (mesma técnica usada
+    # no botão de preço de venda do estoque) — mais confiável do que torcer
+    # por data-testid, que foi o que deixava o botão "voltando" pro vermelho
+    # padrão do Streamlit antes.
     st.markdown(
-        """
+        f"""
         <style>
-        div[data-testid="stDialog"] button[kind="primary"] {
-            background-color: #16a34a !important;
-            border-color: #16a34a !important;
-            color: white !important;
-        }
-        div[data-testid="stDialog"] button[kind="primary"]:hover {
-            background-color: #15803d !important;
-            border-color: #15803d !important;
-        }
+        div[class*="st-key-{chave_wrap_upload}"] button[kind*="primary"] {{
+            background-color: #2563EB !important;
+            border-color: #2563EB !important;
+            color: #FFFFFF !important;
+        }}
+        div[class*="st-key-{chave_wrap_upload}"] button[kind*="primary"]:hover {{
+            background-color: #1D4ED8 !important;
+            border-color: #1D4ED8 !important;
+        }}
+        div[class*="st-key-{chave_wrap_upload}"] button[kind*="primary"]:active {{
+            background-color: #1E40AF !important;
+            border-color: #1E40AF !important;
+        }}
+        div[class*="st-key-baixar_wrap_"] button {{
+            color: #60a5fa !important;
+            border-color: rgba(96,165,250,.35) !important;
+        }}
+        div[class*="st-key-baixar_wrap_"] button:hover {{
+            background-color: rgba(59,130,246,.12) !important;
+            border-color: #3b82f6 !important;
+        }}
+        div[class*="st-key-excluir_wrap_"] button {{
+            color: #f87171 !important;
+            border-color: rgba(248,113,113,.35) !important;
+        }}
+        div[class*="st-key-excluir_wrap_"] button:hover {{
+            background-color: rgba(239,68,68,.12) !important;
+            border-color: #ef4444 !important;
+        }}
         </style>
         """,
         unsafe_allow_html=True,
     )
 
-    """Gerencia XML/PDF vinculados a uma compra."""
     st.caption(
         f"NF nº {compra.get('numero_nf') or '-'} — "
         f"Compra #{compra.get('id')}"
     )
 
-    st.markdown("### Adicionar arquivo")
+    with st.container(border=True):
+        st.markdown("**📤 Adicionar arquivo**")
 
-    # Botão de envio em verde, mantendo o restante dos botões do sistema intactos.
-    st.markdown(
-        """
-        <style>
-        div[data-testid="stDialog"] div[data-testid="stForm"] button[kind="primary"] {
-            background-color: #198754 !important;
-            border-color: #198754 !important;
-        }
-        div[data-testid="stDialog"] div[data-testid="stForm"] button[kind="primary"]:hover {
-            background-color: #157347 !important;
-            border-color: #157347 !important;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
+        with st.container(key=chave_wrap_upload):
+            with st.form(f"form_arquivo_compra_{compra['id']}", border=False):
+                arquivo = st.file_uploader(
+                    "Selecione o arquivo",
+                    type=["xml", "pdf"],
+                    key=f"upload_arquivo_compra_{compra['id']}",
+                    help="Nesta versão são aceitos somente XML e PDF.",
+                )
 
-    with st.form(f"form_arquivo_compra_{compra['id']}", border=False):
-        arquivo = st.file_uploader(
-            "Selecione o arquivo",
-            type=["xml", "pdf"],
-            key=f"upload_arquivo_compra_{compra['id']}",
-            help="Nesta versão são aceitos somente XML e PDF.",
-        )
-
-        tipo = st.selectbox(
-            "Tipo do arquivo",
-            ["PDF", "XML"],
-            key=f"tipo_arquivo_compra_{compra['id']}",
-        )
-
-        enviar = st.form_submit_button(
-            "⬆️ Enviar arquivo",
-            type="primary",
-            use_container_width=True,
-        )
+                col_tipo, col_botao = st.columns([1, 2], vertical_alignment="bottom")
+                with col_tipo:
+                    tipo = st.selectbox(
+                        "Tipo do arquivo",
+                        ["PDF", "XML"],
+                        key=f"tipo_arquivo_compra_{compra['id']}",
+                    )
+                with col_botao:
+                    enviar = st.form_submit_button(
+                        "⬆️ Enviar arquivo",
+                        type="primary",
+                        use_container_width=True,
+                    )
 
     if enviar:
         if arquivo is None:
@@ -286,7 +331,6 @@ def _dialog_arquivos_compra(compra: dict):
                     st.error(f"Erro ao enviar arquivo: {e}")
 
     st.divider()
-    st.markdown("### Arquivos na nuvem")
 
     try:
         arquivos = listar_arquivos_compra(compra["id"])
@@ -294,11 +338,11 @@ def _dialog_arquivos_compra(compra: dict):
         st.error(f"Erro ao carregar arquivos: {e}")
         return
 
+    st.markdown(f"**📁 Arquivos na nuvem ({len(arquivos)})**")
+
     if arquivos:
         # Lista dos arquivos dentro de uma área visualmente separada.
         with st.container(border=True):
-            st.markdown("**Arquivos anexados**")
-
             for arquivo in arquivos:
                 col_tipo, col_nome, col_data, col_acoes = st.columns(
                     [0.8, 3.2, 1.4, 1.8],
@@ -309,7 +353,7 @@ def _dialog_arquivos_compra(compra: dict):
                 nome = arquivo.get("nome_arquivo") or "-"
                 criado_em = arquivo.get("criado_em") or ""
 
-                col_tipo.write(f"**{tipo_arquivo}**")
+                col_tipo.markdown(_badge_tipo_arquivo(tipo_arquivo), unsafe_allow_html=True)
                 col_nome.write(nome)
 
                 if criado_em:
@@ -337,28 +381,32 @@ def _dialog_arquivos_compra(compra: dict):
                         col_baixar.error("Erro")
 
                     if conteudo_arquivo is not None:
-                        col_baixar.download_button(
-                            "⬇️",
-                            data=conteudo_arquivo,
-                            file_name=nome_download,
-                            mime=mime_download,
-                            help="Baixar arquivo",
-                            use_container_width=True,
-                            key=f"baixar_arquivo_compra_{arquivo['id']}",
-                        )
+                        with col_baixar.container(key=f"baixar_wrap_{arquivo['id']}"):
+                            st.download_button(
+                                "",
+                                data=conteudo_arquivo,
+                                file_name=nome_download,
+                                mime=mime_download,
+                                help="Baixar arquivo",
+                                use_container_width=True,
+                                key=f"baixar_arquivo_compra_{arquivo['id']}",
+                                icon=":material/download:",
+                            )
 
-                    if col_excluir.button(
-                        "🗑️",
-                        key=f"excluir_arquivo_compra_{arquivo['id']}",
-                        help="Excluir arquivo da nuvem",
-                        use_container_width=True,
-                    ):
-                        try:
-                            excluir_arquivo_compra(arquivo)
-                            st.success("Arquivo excluído.")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Erro ao excluir arquivo: {e}")
+                    with col_excluir.container(key=f"excluir_wrap_{arquivo['id']}"):
+                        if st.button(
+                            "",
+                            key=f"excluir_arquivo_compra_{arquivo['id']}",
+                            help="Excluir arquivo da nuvem",
+                            use_container_width=True,
+                            icon=":material/delete:",
+                        ):
+                            try:
+                                excluir_arquivo_compra(arquivo)
+                                st.success("Arquivo excluído.")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Erro ao excluir arquivo: {e}")
     else:
         with st.container(border=True):
             st.info("Nenhum arquivo anexado a esta compra.")
@@ -551,12 +599,7 @@ def _secao_listagem():
                 # "Desconto Adicional" (badge laranja).
                 rotulo_nf = item.get("numero_nf") or "-"
                 tem_arquivos = item["id"] in compras_com_arquivos
-                indicador_arquivos = (
-                    ' <span title="Esta NF possui arquivos anexados." '
-                    'style="font-size:0.85em;">📎</span>'
-                    if tem_arquivos
-                    else ""
-                )
+                indicador_arquivos = _badge_clipe_arquivos() if tem_arquivos else ""
                 tooltip_nf = f"Chave de acesso: {chave_acesso}"
                 if tem_desconto_adicional:
                     tooltip_nf += f" | Desconto adicional: {motivo_desconto or 'motivo não informado'}"
