@@ -1,6 +1,6 @@
 import streamlit as st
 from db import supabase
-from telas.categorias import tela_categorias
+from telas.cadastros_gerais import tela_categorias
 from componentes.paginacao import render_paginacao, get_itens_por_pagina, reset_paginacao
 from componentes.busca_produto import busca_produto
 

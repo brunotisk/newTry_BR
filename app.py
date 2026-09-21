@@ -8,7 +8,6 @@ st.set_page_config(
 )
 
 from telas.produtos import tela_produtos
-from telas.categorias import tela_categorias
 from telas.importar_nf import tela_importar_nf
 from telas.report import tela_report
 from telas.compras import tela_compras
@@ -122,6 +121,3 @@ renderizar_botao_sair()
 st.title("Sistema de Semijoias - Bruno & AC")
 
 PAGINAS[st.session_state.pagina_atual]()
-
-#    "📄 Importar NF": tela_importar_nf,
-#    "🏷️ Cadastrar Categorias": tela_categorias,

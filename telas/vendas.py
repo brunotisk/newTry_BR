@@ -19,7 +19,7 @@ from servicos.vendas_import import (
     importar_linhas_validadas,
     _normalizar_nome,
 )
-from telas.cadastros_auxiliares import tela_cadastros_auxiliares
+from telas.cadastros_gerais import tela_cadastros_gerais
 from componentes.campo_cliente import campo_cliente
 from componentes.campo_mascarado import campo_mascarado
 from componentes.contador_quantidade import contador_quantidade
@@ -1040,6 +1040,7 @@ def _carregar_cadastros_popup():
             supabase.table("canais_venda")
             .select("id, nome")
             .eq("ativo", True)
+            .order("ordem_exibicao", nullsfirst=False)
             .order("nome")
             .execute()
         ).data or []
@@ -1051,6 +1052,7 @@ def _carregar_cadastros_popup():
             supabase.table("status_venda")
             .select("id, nome")
             .eq("ativo", True)
+            .order("ordem_exibicao", nullsfirst=False)
             .order("nome")
             .execute()
         ).data or []
@@ -1062,6 +1064,7 @@ def _carregar_cadastros_popup():
             supabase.table("formas_pagamento")
             .select("id, descricao")
             .eq("ativo", True)
+            .order("ordem_exibicao", nullsfirst=False)
             .order("descricao")
             .execute()
         ).data or []
@@ -1073,6 +1076,7 @@ def _carregar_cadastros_popup():
             supabase.table("detalhes_feira")
             .select("id, nome_feira, endereco_feira, pessoa_contato_feira, tel_contato_feira")
             .eq("ativo", True)
+            .order("ordem_exibicao", nullsfirst=False)
             .order("nome_feira")
             .execute()
         ).data or []
@@ -1399,30 +1403,17 @@ def _secao_listagem():
                 help="Editar ou excluir venda",
                 use_container_width=True,
             ):
-                formas_popup = (
-                    supabase.table("formas_pagamento")
-                    .select("id, descricao")
-                    .eq("ativo", True)
-                    .order("descricao")
-                    .execute()
-                ).data or []
-                feiras_popup = (
-                    supabase.table("detalhes_feira")
-                    .select("id, nome_feira, endereco_feira, pessoa_contato_feira, tel_contato_feira")
-                    .eq("ativo", True)
-                    .order("nome_feira")
-                    .execute()
-                ).data or []
-                clientes_popup = (
-                    supabase.table("clientes")
-                    .select("id, nome")
-                    .order("nome")
-                    .execute()
-                ).data or []
+                (
+                    canais_popup,
+                    status_popup,
+                    formas_popup,
+                    feiras_popup,
+                    clientes_popup,
+                ) = _carregar_cadastros_popup()
                 _dialog_editar_venda(
                     v,
-                    canais_disponiveis,
-                    status_disponiveis,
+                    canais_popup,
+                    status_popup,
                     formas_popup,
                     feiras_popup,
                     clientes_popup,
@@ -1453,4 +1444,4 @@ def tela_vendas():
         _secao_importar()
 
     with aba_auxiliares:
-        tela_cadastros_auxiliares()
+        tela_cadastros_gerais()
