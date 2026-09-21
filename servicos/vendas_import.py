@@ -18,12 +18,6 @@ Para cada linha:
 Linhas com produto não encontrado, ou já importadas antes (mesmo produto +
 data + valor + cliente), são puladas e reportadas no resumo, sem interromper
 a importação das demais.
-
-Requer as mesmas variáveis de ambiente de servicos/supabase_admin.py:
-  SUPABASE_URL
-  SUPABASE_SERVICE_KEY
-
-Instalar: pip install pandas openpyxl
 """
 from __future__ import annotations
 from datetime import date, datetime

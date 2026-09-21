@@ -15,10 +15,6 @@ Fluxo (importar_nfe):
 O parsing de XML (antes em nfe_parser.py, separado) foi trazido pra cá porque
 só é usado por este pipeline de importação de compras.
 
-Requer as variáveis de ambiente de servicos/supabase_admin.py:
-  SUPABASE_URL
-  SUPABASE_SERVICE_KEY
-
 Instalar: pip install supabase
 """
 from __future__ import annotations
