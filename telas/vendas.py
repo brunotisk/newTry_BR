@@ -1367,37 +1367,41 @@ def _secao_listagem():
     )
 
     with st.container(border=True):
-        c_data, c_canal, c_prod, c_qtd, c_total, c_status, c_cliente, c_acoes = st.columns(
-            [1.4, 1.3, 2.8, 0.9, 1.4, 1.3, 1.7, 0.8]
+        # Data | Canal | Cod. Produto | Produto | Valor Final |
+        # Forma Pgto | Status | Cliente | Edição
+        c_data, c_canal, c_codigo, c_prod, c_total, c_forma, c_status, c_cliente, c_edicao = st.columns(
+            [1.1, 1.2, 1.2, 2.5, 1.4, 1.5, 1.2, 1.7, 0.8]
         )
         c_data.markdown("**Data**")
         c_canal.markdown("**Canal**")
+        c_codigo.markdown("**Cod. Produto**")
         c_prod.markdown("**Produto**")
-        c_qtd.markdown("**Qtd**")
         c_total.markdown("**Valor Final**")
+        c_forma.markdown("**Forma Pgto**")
         c_status.markdown("**Status**")
         c_cliente.markdown("**Cliente**")
-        c_acoes.markdown("**Ações**")
+        c_edicao.markdown("**Edição**")
 
         st.divider()
 
         for v in vendas:
-            col_data, col_canal, col_prod, col_qtd, col_total, col_status, col_cliente, col_acoes = (
-                st.columns([1.4, 1.3, 2.8, 0.9, 1.4, 1.3, 1.7, 0.8])
+            col_data, col_canal, col_codigo, col_prod, col_total, col_forma, col_status, col_cliente, col_edicao = (
+                st.columns([1.1, 1.2, 1.2, 2.5, 1.4, 1.5, 1.2, 1.7, 0.8])
             )
 
             col_data.write(str(v.get("data_venda") or "-")[:10])
             col_canal.write((v.get("canais_venda") or {}).get("nome") or "-")
 
             produto = v.get("produtos") or {}
+            col_codigo.write(produto.get("codigo_interno") or "-")
             col_prod.write(produto.get("descricao") or "-")
 
-            col_qtd.write(v.get("quantidade"))
             col_total.write(_fmt_moeda(v.get("valor_final")))
+            col_forma.write((v.get("formas_pagamento") or {}).get("descricao") or "-")
             col_status.write((v.get("status_venda") or {}).get("nome") or "-")
             col_cliente.write(v.get("cliente") or "-")
 
-            if col_acoes.button(
+            if col_edicao.button(
                 "✏️",
                 key=f"editar_venda_{v['id']}",
                 help="Editar ou excluir venda",

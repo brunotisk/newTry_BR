@@ -104,6 +104,11 @@ Depois de confirmar que a execução foi concluída corretamente, registre:
 INSERT INTO public.schema_migrations (version, nome)
 VALUES ('002', 'adiciona_campo_marca_produto');
 ```
+INSERT INTO public.schema_migrations (version, nome)
+VALUES
+    ('001', 'criar_banco_dados_PRD'),
+    ('002', 'Create_migrations_table'),
+    ('003', 'Timezone_BD');
 
 ### 3. Testar a aplicação
 
