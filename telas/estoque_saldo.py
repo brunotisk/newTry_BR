@@ -1,3 +1,4 @@
+import html
 import streamlit as st
 from db import supabase
 from componentes.paginacao import render_paginacao, reset_paginacao, get_itens_por_pagina
@@ -16,6 +17,45 @@ def _fmt_qtd(valor) -> str:
     """Mostra quantidade sem casas decimais desnecessárias (ex.: 3 em vez de 3.0)."""
     valor = float(valor or 0)
     return f"{valor:g}"
+
+
+def _injetar_estilo_tabela_estoque():
+    """CSS da tabela de estoque: descrição sem quebra de linha (com ...
+    e tooltip no hover) e o botão de preço de venda centralizado, com
+    largura fixa (não varia conforme o tamanho do valor), o que também
+    mantém um respiro constante antes da coluna 'Data Ult. Compra'."""
+    st.markdown(
+        """
+        <style>
+        .cel-truncada {
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            max-width: 100%;
+        }
+        div[class*="st-key-venda_btn_wrap_"] div[data-testid="stButton"] {
+            display: flex;
+            justify-content: center;
+        }
+        div[class*="st-key-venda_btn_wrap_"] div[data-testid="stButton"] button {
+            width: 140px;
+            min-width: 140px;
+            max-width: 140px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _celula_truncada(texto: str) -> str:
+    """HTML de uma célula que não quebra linha: corta com "..." quando não
+    cabe e mostra o texto completo no title (tooltip ao passar o mouse)."""
+    texto_seguro = html.escape(str(texto or "-"))
+    return f'<div class="cel-truncada" title="{texto_seguro}">{texto_seguro}</div>'
 
 # Compatibilidade com versões do Streamlit que usam experimental_dialog.
 _dialog = getattr(st, "dialog", None) or st.experimental_dialog
@@ -179,7 +219,7 @@ def _secao_estoque_atual():
     st.markdown("---")
 
     # Filtros e ordenação
-    col_busca, col_ordenar, col_toggle = st.columns([2.6, 2.4, 1.3])
+    col_busca, col_ordenar, col_toggles = st.columns([50, 35, 15])
 
     with col_busca:
         # Mesmo componente pesquisável usado em produtos.py: dropdown com
@@ -210,8 +250,11 @@ def _secao_estoque_atual():
             key="estoque_ordenacao",
         )
 
-    with col_toggle:
-        mostrar_negativo = st.toggle("Mostrar zerado/negativo", value=False)
+    with col_toggles:
+        # Os dois toggles ficam empilhados (um embaixo do outro) na mesma
+        # coluna, já que juntos ocupam só 15% da largura da barra.
+        mostrar_negativo = st.toggle("🔴 Mostrar zerado/negativo", value=False)
+        mostrar_somente_editados = st.toggle("✏️ Somente editados", value=False)
 
     # Termo digitado e modo de busca (código/descrição) ficam disponíveis em
     # session_state depois da chamada acima, mesmo quando o usuário ainda não
@@ -231,6 +274,9 @@ def _secao_estoque_atual():
         itens = [i for i in itens if i["status"] != "🟢 OK"]
     else:
         itens = [i for i in itens if i["status"] == "🟢 OK"]
+
+    if mostrar_somente_editados:
+        itens = [i for i in itens if i.get("flag_ajuste_preco_venda")]
 
     # Ordenação escolhida pelo usuário (crescente/decrescente pelo campo selecionado)
     if campo_ordenacao == "data_ultima_compra":
@@ -253,6 +299,7 @@ def _secao_estoque_atual():
         termo_busca_produto.strip().lower(),
         bool(buscar_descricao_produto),
         bool(mostrar_negativo),
+        bool(mostrar_somente_editados),
         campo_ordenacao,
         bool(ordem_decrescente),
     )
@@ -278,9 +325,11 @@ def _secao_estoque_atual():
         st.info("Nenhum produto encontrado para o filtro selecionado.")
         return
 
+    _injetar_estilo_tabela_estoque()
+
     with st.container(border=True):
-        c_cod, c_desc, c_saldo, c_compra, c_venda, c_data = st.columns(
-            [1.4, 3.4, 1.3, 1.5, 1.5, 1.6]
+        c_cod, c_desc, c_saldo, c_compra, c_venda, c_espaco, c_data = st.columns(
+            [1.4, 2.3, 1.3, 1.5, 1.5, 0.3, 1.6]
         )
         c_cod.markdown("**Cod. Produto**")
         c_desc.markdown("**Desc. Produto**")
@@ -292,12 +341,13 @@ def _secao_estoque_atual():
         st.divider()
 
         for item in itens_pagina:
-            col_cod, col_desc, col_saldo, col_compra, col_venda, col_data = st.columns(
-                [1.4, 3.4, 1.3, 1.5, 1.5, 1.6]
+            col_cod, col_desc, col_saldo, col_compra, col_venda, col_espaco, col_data = st.columns(
+                [1.4, 2.3, 1.3, 1.5, 1.5, 0.3, 1.6],
+                vertical_alignment="center",
             )
             col_cod.write(item["codigo_interno"])
 
-            col_desc.write(item["descricao"])
+            col_desc.markdown(_celula_truncada(item["descricao"]), unsafe_allow_html=True)
 
             col_saldo.write(_fmt_qtd(item["saldo"]))
             col_compra.write(_fmt_moeda(item["preco_compra"]))
@@ -318,12 +368,13 @@ def _secao_estoque_atual():
             else:
                 help_edicao = "Clique para editar o preço de venda."
 
-            if col_venda.button(
-                rotulo_preco,
-                key=f"editar_preco_venda_{item['id']}",
-                use_container_width=True,
-                help=help_edicao,
-            ):
+            with col_venda.container(key=f"venda_btn_wrap_{item['id']}"):
+                clicou_preco_venda = st.button(
+                    rotulo_preco,
+                    key=f"editar_preco_venda_{item['id']}",
+                    help=help_edicao,
+                )
+            if clicou_preco_venda:
                 _dialog_editar_preco_venda(
                     item["id"],
                     item["codigo_interno"],
