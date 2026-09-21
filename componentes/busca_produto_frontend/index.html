@@ -76,7 +76,8 @@
     .control {
       width: 100%;
       min-height: 40px;
-      padding: 0 64px 0 12px;
+      /* Espaço para copiar, limpar e a seta à direita. */
+      padding: 0 92px 0 12px;
       border: 1px solid #464B53;
       border-radius: 6px;
       background: #262730;
@@ -102,6 +103,31 @@
       min-width: 0;
     }
     input::placeholder { color: #8B8D98; opacity: 1; }
+    .copy-selected-btn {
+      position: absolute;
+      right: 58px;
+      top: 50%;
+      transform: translateY(-50%);
+      width: 22px;
+      height: 22px;
+      border: none;
+      border-radius: 4px;
+      background: transparent;
+      color: #8B8D98;
+      font-size: 15px;
+      line-height: 1;
+      cursor: pointer;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 0;
+    }
+    .copy-selected-btn.visible { display: flex; }
+    .copy-selected-btn:hover {
+      color: #FAFAFA;
+      background: rgba(255, 255, 255, 0.08);
+    }
+    .copy-selected-btn.copied { color: #21C55D; }
     .clear-btn {
       position: absolute;
       right: 34px;
@@ -218,6 +244,7 @@
     <div class="selectbox">
       <div class="control" id="control">
         <input id="input" autocomplete="off" spellcheck="false" />
+        <button type="button" class="copy-selected-btn" id="copySelectedBtn" aria-label="Copiar código do produto" tabindex="-1">📋</button>
         <button type="button" class="clear-btn" id="clearBtn" aria-label="Limpar" tabindex="-1">✕</button>
         <span class="arrow"></span>
       </div>
@@ -230,13 +257,15 @@
   const input = document.getElementById("input");
   const menu = document.getElementById("menu");
   const control = document.getElementById("control");
+  const copySelectedBtn = document.getElementById("copySelectedBtn");
   const clearBtn = document.getElementById("clearBtn");
   const modeRadio = document.getElementById("modeRadio");
   const modeOptions = modeRadio.querySelectorAll(".mode-option");
   const modeInputs = modeRadio.querySelectorAll('input[name="modo_busca"]');
 
-  let args = { opcoes: [], rotulo_selecionado: null, buscar_descricao: false, valor_selecionado: null, termo: "", placeholder: "" };
+  let args = { opcoes: [], rotulo_selecionado: null, codigo_selecionado: null, buscar_descricao: false, valor_selecionado: null, termo: "", placeholder: "" };
   let selectedId = null;
+  let codigoSelecionado = "";
   let lastQuery = "";
   let activeIndex = -1;
   let suppressNextInput = false;
@@ -269,13 +298,23 @@
     clearBtn.classList.toggle("visible", temConteudo);
   }
 
+  function atualizarBotaoCopiarSelecionado() {
+    const codigo = codigoSelecionado;
+    const visivel = selectedId !== null && !!codigo;
+    copySelectedBtn.classList.toggle("visible", visivel);
+    copySelectedBtn.title = visivel ? `Copiar código ${codigo}` : "Copiar código do produto";
+    copySelectedBtn.setAttribute("aria-label", copySelectedBtn.title);
+  }
+
   function limparSelecao() {
     modoTrocandoAguardandoSync = false;
     selectedId = null;
+    codigoSelecionado = "";
     lastQuery = "";
     suppressNextInput = true;
     input.value = "";
     atualizarBotaoLimpar();
+    atualizarBotaoCopiarSelecionado();
     suppressNextFocusOpen = true;
     input.focus();
     closeMenu();
@@ -431,10 +470,12 @@
   function selectOption(option) {
     modoTrocandoAguardandoSync = false;
     selectedId = option.id;
+    codigoSelecionado = String(option.codigo || "").trim();
     lastQuery = option.rotulo;
     suppressNextInput = true;
     input.value = option.rotulo;
     atualizarBotaoLimpar();
+    atualizarBotaoCopiarSelecionado();
     closeMenu();
     enviarEstado({ id: option.id, termo: option.rotulo });
   }
@@ -443,6 +484,7 @@
     if (selectedId !== null) {
       modoTrocandoAguardandoSync = false;
       selectedId = null;
+      codigoSelecionado = "";
       enviarEstado({ id: null, termo: input.value });
     }
   }
@@ -482,11 +524,13 @@
     modoTrocandoAguardandoSync = idAntesDaTroca !== null;
 
     selectedId = null;
+    codigoSelecionado = "";
     lastQuery = "";
     suppressNextInput = true;
     input.value = "";
     input.placeholder = placeholderPadrao();
     atualizarBotaoLimpar();
+    atualizarBotaoCopiarSelecionado();
     // Fecha a lista caso já estivesse aberta — trocar o modo não deve
     // abrir (nem manter aberto) o dropdown de opções.
     menu.classList.remove("open");
@@ -517,6 +561,7 @@
         // (null) chegar.
         if (menu.classList.contains("open")) renderMenu();
         atualizarBotaoLimpar();
+        atualizarBotaoCopiarSelecionado();
         return;
       }
       modoTrocandoAguardandoSync = false;
@@ -529,10 +574,12 @@
     if (document.activeElement !== input) {
       if (externalId != null && args.rotulo_selecionado) {
         selectedId = externalId;
+        codigoSelecionado = String(args.codigo_selecionado || "").trim();
         lastQuery = args.rotulo_selecionado;
         input.value = args.rotulo_selecionado;
       } else if (externalId == null) {
         selectedId = null;
+        codigoSelecionado = "";
         lastQuery = String(args.termo || "");
         input.value = lastQuery;
       }
@@ -540,6 +587,7 @@
 
     if (menu.classList.contains("open")) renderMenu();
     atualizarBotaoLimpar();
+    atualizarBotaoCopiarSelecionado();
   }
 
   modeOptions.forEach((el) => {
@@ -567,9 +615,13 @@
       return;
     }
     modoTrocandoAguardandoSync = false;
-    if (selectedId !== null) selectedId = null;
+    if (selectedId !== null) {
+      selectedId = null;
+      codigoSelecionado = "";
+    }
     lastQuery = input.value;
     atualizarBotaoLimpar();
+    atualizarBotaoCopiarSelecionado();
     openMenu();
     enviarEstado({ id: null, termo: lastQuery });
   });
@@ -583,12 +635,38 @@
     limparSelecao();
   });
 
+  // Exibido somente após selecionar um produto. Mantemos a ação no iframe
+  // para que o gesto do usuário tenha permissão de gravar na área de transferência.
+  copySelectedBtn.addEventListener("mousedown", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+  });
+
+  copySelectedBtn.addEventListener("click", async (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const codigo = codigoSelecionado;
+    if (!codigo) return;
+
+    const copiado = await copiarParaAreaTransferencia(codigo);
+    if (!copiado) return;
+
+    copySelectedBtn.textContent = "✓";
+    copySelectedBtn.classList.add("copied");
+    copySelectedBtn.title = `Código ${codigo} copiado`;
+    setTimeout(() => {
+      copySelectedBtn.textContent = "📋";
+      copySelectedBtn.classList.remove("copied");
+      atualizarBotaoCopiarSelecionado();
+    }, 1200);
+  });
+
   // A seta (e o espaço reservado a ela) fica visualmente dentro de
   // ".control", mas fora da caixa real do <input> (que não ocupa a área de
   // padding reservada à seta/botão de limpar). Sem isso, clicar bem em cima
   // da seta não focava o input e a busca não abria.
   control.addEventListener("mousedown", (event) => {
-    if (event.target === clearBtn || event.target === input) return;
+    if (event.target === clearBtn || event.target === copySelectedBtn || event.target === input) return;
     event.preventDefault();
     if (document.activeElement === input) {
       // Já focado (ex.: usuário fechou com Escape e clicou de novo): reabre.

@@ -148,10 +148,12 @@ def busca_produto(
     # busca), para que o campo continue mostrando o produto selecionado
     # mesmo quando o termo atual (ex.: texto de uma busca anterior) não
     # bate mais com ele.
-    rotulo_selecionado = next(
-        (o["rotulo"] for o in opcoes if valor_selecionado is not None and o["id"] == valor_selecionado),
+    opcao_selecionada = next(
+        (o for o in opcoes if valor_selecionado is not None and o["id"] == valor_selecionado),
         None,
     )
+    rotulo_selecionado = opcao_selecionada["rotulo"] if opcao_selecionada else None
+    codigo_selecionado = opcao_selecionada["codigo"] if opcao_selecionada else None
 
     opcoes_filtradas = _filtrar_opcoes(opcoes, termo_busca, buscar_descricao_atual)[:_LIMITE_OPCOES]
 
@@ -160,6 +162,7 @@ def busca_produto(
         placeholder=placeholder,
         opcoes=opcoes_filtradas,
         rotulo_selecionado=rotulo_selecionado,
+        codigo_selecionado=codigo_selecionado,
         buscar_descricao=bool(buscar_descricao_atual),
         valor_selecionado=valor_selecionado,
         termo=termo,
