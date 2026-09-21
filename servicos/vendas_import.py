@@ -669,19 +669,42 @@ def excluir_venda(sb: Client, venda: dict) -> None:
     """Exclui uma venda e devolve a quantidade correspondente ao estoque do
     produto, registrando o estorno no ledger de movimentações.
 
+    As movimentações de saída originais são mantidas no histórico, mas têm o
+    vínculo com a venda removido antes da exclusão. Isso é necessário porque
+    ``estoque_movimentos.venda_id`` possui uma chave estrangeira para
+    ``vendas.id``. O estorno é identificado pelo motivo para que uma nova
+    tentativa após uma falha não devolva o estoque duas vezes.
+
     `venda` precisa conter `id`, `produto_id` e `quantidade`.
     """
     venda_id = venda["id"]
     produto_id = venda["produto_id"]
     quantidade = float(venda.get("quantidade") or 0)
 
-    registrar_ajuste(
-        sb,
-        produto_id=produto_id,
-        quantidade=quantidade,
-        motivo=f"Estorno da venda #{venda_id} (exclusão)",
-        data_movimento=date.today().isoformat(),
+    motivo_estorno = f"Estorno da venda #{venda_id} (exclusão)"
+    estorno_existente = (
+        sb.table("estoque_movimentos")
+        .select("id")
+        .eq("produto_id", produto_id)
+        .eq("tipo", "ajuste")
+        .eq("motivo", motivo_estorno)
+        .limit(1)
+        .execute()
     )
+    if not estorno_existente.data:
+        registrar_ajuste(
+            sb,
+            produto_id=produto_id,
+            quantidade=quantidade,
+            motivo=motivo_estorno,
+            data_movimento=date.today().isoformat(),
+        )
+
+    # Preserva o histórico de estoque, mas elimina a referência que impediria
+    # a exclusão da venda pela chave estrangeira.
+    sb.table("estoque_movimentos").update({"venda_id": None}).eq(
+        "venda_id", venda_id
+    ).execute()
     sb.table("vendas").delete().eq("id", venda_id).execute()
 
 
