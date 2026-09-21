@@ -567,9 +567,53 @@ def _secao_listagem():
         )
 
         # 7. Tabela de Compras
+        st.markdown(
+            """
+            <style>
+            div[class*="st-key-ver_itens_compra_"] div[data-testid="stButton"],
+            div[class*="st-key-editar_desconto_compra_"] div[data-testid="stButton"],
+            div[class*="st-key-arquivos_compra_"] div[data-testid="stButton"] {
+                width: 100% !important;
+            }
+
+            div[class*="st-key-ver_itens_compra_"] button,
+            div[class*="st-key-editar_desconto_compra_"] button,
+            div[class*="st-key-arquivos_compra_"] button {
+                padding: 0.2rem 0 !important;
+                min-height: 32px !important;
+                height: 32px !important;
+                min-width: 0 !important;
+                width: 100% !important;
+                display: flex !important;
+                align-items: center !important;
+                justify-content: center !important;
+                box-sizing: border-box !important;
+            }
+
+            div[class*="st-key-ver_itens_compra_"] button p,
+            div[class*="st-key-editar_desconto_compra_"] button p,
+            div[class*="st-key-arquivos_compra_"] button p,
+            div[class*="st-key-ver_itens_compra_"] button span,
+            div[class*="st-key-editar_desconto_compra_"] button span,
+            div[class*="st-key-arquivos_compra_"] button span {
+                font-size: 0.95rem !important;
+                line-height: 1 !important;
+                margin: 0 !important;
+                padding: 0 !important;
+                overflow: visible !important;
+                text-overflow: clip !important;
+                white-space: nowrap !important;
+                text-align: center !important;
+            }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        col_pesos = [1.3, 1.1, 1.3, 1.2, 1.3, 1.4, 0.6, 1.8]
         with st.container(border=True):
             c_nf, c_dt, c_prod, c_desc, c_tot, c_desc_adic, c_itens, c_acao = st.columns(
-                [1.6, 1.6, 1.6, 1.6, 1.6, 1.5, 0.8, 1.6]
+                col_pesos
             )
 
             c_nf.markdown("**Número NF**")
@@ -585,7 +629,7 @@ def _secao_listagem():
 
             for item in compras_pagina:
                 col_nf, col_dt, col_prod, col_desc, col_tot, col_desc_adic, col_itens, col_acao = (
-                    st.columns([1.6, 1.6, 1.6, 1.6, 1.6, 1.5, 0.8, 1.6])
+                    st.columns(col_pesos)
                 )
 
                 desconto_adicional = float(item.get("compras_desconto_adicional") or 0)
@@ -644,7 +688,7 @@ def _secao_listagem():
 
                 with col_acao:
                     col_ver, col_editar, col_arquivos = st.columns(
-                        3, vertical_alignment="center"
+                        3, gap="small", vertical_alignment="center"
                     )
                     if col_ver.button(
                         "🔎",

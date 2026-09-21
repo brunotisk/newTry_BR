@@ -67,8 +67,11 @@ def _dialog_editar_preco_venda(produto_id, codigo_interno, descricao, preco_atua
     st.markdown(f"**{codigo_interno} — {descricao}**")
     st.caption(f"Preço de venda atual: {_fmt_moeda(preco_atual)}")
 
-    if flag_ajuste and preco_original is not None:
-        st.info(f"Preço original antes do primeiro ajuste: {_fmt_moeda(preco_original)}")
+    if preco_original is not None:
+        if flag_ajuste:
+            st.info(f"Preço original antes do primeiro ajuste: {_fmt_moeda(preco_original)}")
+        else:
+            st.caption(f"Preço original de referência: {_fmt_moeda(preco_original)} (atualmente igual ao original)")
 
     preco_novo = st.number_input(
         "Novo preço de venda",
@@ -96,36 +99,37 @@ def _dialog_editar_preco_venda(produto_id, codigo_interno, descricao, preco_atua
             key=f"salvar_preco_venda_{produto_id}",
             use_container_width=True,
         ):
-            novo_valor = float(preco_novo)
-            valor_atual = float(preco_atual or 0)
+            novo_valor = round(float(preco_novo), 2)
+            valor_atual = round(float(preco_atual or 0), 2)
+            valor_original = (
+                round(float(preco_original), 2)
+                if preco_original is not None
+                else None
+            )
 
             try:
-                # Primeira edição: grava o preço atual como original.
-                # O filtro pela flag impede que uma segunda edição sobrescreva
-                # o valor original mesmo em caso de concorrência.
-                primeira_edicao = (
-                    supabase.table("estoque")
-                    .update({
+                if valor_original is not None:
+                    # O item já teve um preço original gravado no passado.
+                    # Se o novo valor for igual ao original, desmarca a flag de ajuste.
+                    # Caso contrário, mantém a flag ativa.
+                    flag_ajustado = (novo_valor != valor_original)
+                    supabase.table("estoque").update({
+                        "estoque_preco_venda_sugerida": novo_valor,
+                        "estoque_flag_ajuste_preco_venda": flag_ajustado,
+                    }).eq("produto_id", produto_id).execute()
+
+                else:
+                    # Primeiro ajuste do produto:
+                    if novo_valor == valor_atual:
+                        st.info("Nenhuma alteração de valor realizada.")
+                        st.rerun()
+                        return
+
+                    supabase.table("estoque").update({
                         "estoque_preco_venda_sugerida": novo_valor,
                         "estoque_flag_ajuste_preco_venda": True,
                         "estoque_preco_venda_original": valor_atual,
-                    })
-                    .eq("produto_id", produto_id)
-                    .eq("estoque_flag_ajuste_preco_venda", False)
-                    .execute()
-                )
-
-                if not primeira_edicao.data:
-                    # Produto já ajustado: altera somente o preço atual.
-                    (
-                        supabase.table("estoque")
-                        .update({
-                            "estoque_preco_venda_sugerida": novo_valor,
-                            "estoque_flag_ajuste_preco_venda": True,
-                        })
-                        .eq("produto_id", produto_id)
-                        .execute()
-                    )
+                    }).eq("produto_id", produto_id).execute()
 
             except Exception as e:
                 st.error(f"Erro ao salvar o novo preço de venda: {e}")
@@ -134,9 +138,14 @@ def _dialog_editar_preco_venda(produto_id, codigo_interno, descricao, preco_atua
             st.success("Preço de venda atualizado.")
             st.rerun()
 
-def _secao_estoque_atual():
-    try:
-        # Estoque + produto embutido (join via FK estoque.produto_id -> produtos.id)
+def _carregar_estoque_completo():
+    """Carrega todo o estoque em lotes para não ficar limitado ao máximo
+    de linhas retornado pelo PostgREST/Supabase em uma única consulta."""
+    tamanho_lote = 1000
+    offset = 0
+    linhas = []
+
+    while True:
         response = (
             supabase.table("estoque")
             .select(
@@ -145,9 +154,29 @@ def _secao_estoque_atual():
                 "estoque_flag_ajuste_preco_venda, estoque_ultima_compra, "
                 "produtos(id, codigo_interno, descricao)"
             )
+            .order("produto_id")
+            .range(offset, offset + tamanho_lote - 1)
             .execute()
         )
-        linhas_brutas = response.data or []
+
+        lote = response.data or []
+        linhas.extend(lote)
+
+        if len(lote) < tamanho_lote:
+            break
+
+        offset += tamanho_lote
+
+    return linhas
+
+
+def _secao_estoque_atual():
+    try:
+        # Não usar .execute() sem paginação aqui: o Supabase/PostgREST pode
+        # limitar uma resposta a 1000 registros. Isso fazia produtos com IDs
+        # mais altos, como o produto 1173, desaparecerem da busca e dos
+        # filtros mesmo existindo normalmente na tabela estoque.
+        linhas_brutas = _carregar_estoque_completo()
     except Exception as e:
         st.error(f"Erro ao carregar estoque: {e}")
         return
@@ -270,9 +299,13 @@ def _secao_estoque_atual():
         # componente, aplicada à listagem completa da tela.
         itens = filtrar_por_termo(itens, termo_busca_produto, buscar_descricao_produto)
 
+    # Filtros de estoque e ajuste de preço:
+    # - "Mostrar zerado/negativo": exibe SOMENTE itens com saldo <= 0 (zerados ou negativos).
+    # - Padrão (ambos desligados): exibe somente itens com estoque positivo (🟢 OK).
+    # - "Somente editados": restringe aos itens que tiveram preço ajustado manualmente.
     if mostrar_negativo:
-        itens = [i for i in itens if i["status"] != "🟢 OK"]
-    else:
+        itens = [i for i in itens if i["saldo"] <= 0]
+    elif not mostrar_somente_editados:
         itens = [i for i in itens if i["status"] == "🟢 OK"]
 
     if mostrar_somente_editados:
@@ -292,6 +325,13 @@ def _secao_estoque_atual():
             return item[campo_ordenacao]
 
     itens.sort(key=_chave_ordenacao, reverse=ordem_decrescente)
+
+    if not itens:
+        if mostrar_negativo:
+            st.info("Não há produtos com estoque zerado ou negativo.")
+        else:
+            st.info("Nenhum produto encontrado para o filtro selecionado.")
+        return
 
     # Detecta mudança nos filtros/ordenação e volta para a primeira página.
     filtro_atual = (
