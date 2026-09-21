@@ -1,6 +1,8 @@
 import streamlit as st
 from db import supabase
 from componentes.paginacao import render_paginacao, reset_paginacao, get_itens_por_pagina
+from componentes.busca_produto import busca_produto, filtrar_por_termo
+from componentes.ordenacao import ordenacao
 
 def _fmt_moeda(valor) -> str:
     return (
@@ -15,20 +17,94 @@ def _fmt_qtd(valor) -> str:
     valor = float(valor or 0)
     return f"{valor:g}"
 
+# Compatibilidade com versões do Streamlit que usam experimental_dialog.
+_dialog = getattr(st, "dialog", None) or st.experimental_dialog
+
+
+@_dialog("Ajustar preço de venda")
+def _dialog_editar_preco_venda(produto_id, codigo_interno, descricao, preco_atual, preco_original=None, flag_ajuste=False):
+    """Permite editar o preço de venda sugerido e registra o ajuste no estoque."""
+    st.markdown(f"**{codigo_interno} — {descricao}**")
+    st.caption(f"Preço de venda atual: {_fmt_moeda(preco_atual)}")
+
+    if flag_ajuste and preco_original is not None:
+        st.info(f"Preço original antes do primeiro ajuste: {_fmt_moeda(preco_original)}")
+
+    preco_novo = st.number_input(
+        "Novo preço de venda",
+        min_value=0.0,
+        value=float(preco_atual or 0),
+        step=0.01,
+        format="%.2f",
+        key=f"estoque_preco_venda_edit_{produto_id}",
+    )
+
+    col_cancelar, col_salvar = st.columns(2)
+
+    with col_cancelar:
+        if st.button(
+            "Cancelar",
+            key=f"cancelar_preco_venda_{produto_id}",
+            use_container_width=True,
+        ):
+            st.rerun()
+
+    with col_salvar:
+        if st.button(
+            "💾 Salvar alteração",
+            type="primary",
+            key=f"salvar_preco_venda_{produto_id}",
+            use_container_width=True,
+        ):
+            novo_valor = float(preco_novo)
+            valor_atual = float(preco_atual or 0)
+
+            try:
+                # Primeira edição: grava o preço atual como original.
+                # O filtro pela flag impede que uma segunda edição sobrescreva
+                # o valor original mesmo em caso de concorrência.
+                primeira_edicao = (
+                    supabase.table("estoque")
+                    .update({
+                        "estoque_preco_venda_sugerida": novo_valor,
+                        "estoque_flag_ajuste_preco_venda": True,
+                        "estoque_preco_venda_original": valor_atual,
+                    })
+                    .eq("produto_id", produto_id)
+                    .eq("estoque_flag_ajuste_preco_venda", False)
+                    .execute()
+                )
+
+                if not primeira_edicao.data:
+                    # Produto já ajustado: altera somente o preço atual.
+                    (
+                        supabase.table("estoque")
+                        .update({
+                            "estoque_preco_venda_sugerida": novo_valor,
+                            "estoque_flag_ajuste_preco_venda": True,
+                        })
+                        .eq("produto_id", produto_id)
+                        .execute()
+                    )
+
+            except Exception as e:
+                st.error(f"Erro ao salvar o novo preço de venda: {e}")
+                return
+
+            st.success("Preço de venda atualizado.")
+            st.rerun()
+
 def _secao_estoque_atual():
     try:
-        # Categorias, para exibir o nome em vez do id (mesmo padrão de telas/produtos.py)
-        response_cat = (
-            supabase.table("categorias_produtos")
-            .select("id, categoria")
-            .execute()
-        )
-        cat_dict = {c["id"]: c["categoria"] for c in (response_cat.data or [])}
-
         # Estoque + produto embutido (join via FK estoque.produto_id -> produtos.id)
         response = (
             supabase.table("estoque")
-            .select("quantidade_atual, produtos(id, codigo_interno, descricao, categoria_id)")
+            .select(
+                "produto_id, quantidade_atual, estoque_preco_ultima_compra, "
+                "estoque_preco_venda_sugerida, estoque_preco_venda_original, "
+                "estoque_flag_ajuste_preco_venda, estoque_ultima_compra, "
+                "produtos(id, codigo_interno, descricao)"
+            )
             .execute()
         )
         linhas_brutas = response.data or []
@@ -46,28 +122,19 @@ def _secao_estoque_atual():
             "id": prod["id"],
             "codigo_interno": prod.get("codigo_interno") or "-",
             "descricao": prod.get("descricao") or "-",
-            "categoria": cat_dict.get(prod.get("categoria_id"), "Sem Categoria"),
             "saldo": float(linha.get("quantidade_atual") or 0),
+            "preco_compra": float(linha.get("estoque_preco_ultima_compra") or 0),
+            "preco_venda": float(linha.get("estoque_preco_venda_sugerida") or 0),
+            "preco_venda_original": linha.get("estoque_preco_venda_original"),
+            "flag_ajuste_preco_venda": bool(linha.get("estoque_flag_ajuste_preco_venda", False)),
+            "data_ultima_compra": linha.get("estoque_ultima_compra"),
         })
 
-    # Custo unitário estimado = valor_unitario da compra mais recente daquele produto
-    produto_ids = [item["id"] for item in itens]
-    custo_unitario = {}
-    if produto_ids:
-        try:
-            custos_resp = (
-                supabase.table("compras_itens")
-                .select("produto_id, valor_unitario")
-                .in_("produto_id", produto_ids)
-                .order("id", desc=True)
-                .execute()
-            )
-            for row in custos_resp.data or []:
-                pid = row["produto_id"]
-                if pid not in custo_unitario:
-                    custo_unitario[pid] = float(row["valor_unitario"] or 0)
-        except Exception:
-            pass  # KPI de valor fica sem essa parcela se a consulta falhar
+    # Custo unitário estimado: preço da última compra armazenado em estoque.
+    custo_unitario = {
+        item["id"]: item["preco_compra"]
+        for item in itens
+    }
 
     # Classificação de status: sem estoque mínimo configurável, só zerado/negativo vs. OK
     for item in itens:
@@ -77,58 +144,118 @@ def _secao_estoque_atual():
             item["status"] = "🟢 OK"
 
     # KPIs
-    total_produtos = len(itens)
-    qtd_zerado_ou_negativo = sum(1 for i in itens if i["status"] != "🟢 OK")
-    valor_total_estoque = sum(i["saldo"] * custo_unitario.get(i["id"], 0) for i in itens)
+    # Consideram todos os itens carregados, antes dos filtros da tabela.
+    qtde_pecas_estoque = sum(i["saldo"] for i in itens)
+    qtde_distinta_pecas = len({i["id"] for i in itens})
+    valor_estoque_compra = sum(
+        i["saldo"] * i["preco_compra"] for i in itens
+    )
+    valor_estoque_venda = sum(
+        i["saldo"] * i["preco_venda"] for i in itens
+    )
 
-    col_kpi1, col_kpi2, col_kpi3 = st.columns(3)
+    col_kpi1, col_kpi2, col_kpi3, col_kpi4 = st.columns(4)
     with col_kpi1:
         with st.container(border=True):
-            st.caption("Produtos com Estoque")
-            st.title(f"{total_produtos}")
+            st.caption("Qtde. Peças Estoque")
+            st.title(_fmt_qtd(qtde_pecas_estoque))
     with col_kpi2:
         with st.container(border=True):
-            st.caption("Zerados ou Negativos")
-            st.title(f"{qtd_zerado_ou_negativo}")
+            st.caption("Qtde. Distinta Peças")
+            st.title(f"{qtde_distinta_pecas}")
     with col_kpi3:
         with st.container(border=True):
-            st.caption("Valor em Estoque (estimado)")
-            st.title(_fmt_moeda(valor_total_estoque))
+            st.caption("Valor Estoque Compra")
+            st.title(_fmt_moeda(valor_estoque_compra))
+    with col_kpi4:
+        with st.container(border=True):
+            st.caption("Valor Estoque Venda")
+            st.title(_fmt_moeda(valor_estoque_venda))
 
     st.caption(
-        "Valor estimado com base no valor unitário da última compra registrada de cada produto."
+        "Valores calculados pela quantidade em estoque multiplicada pelo preço de compra "
+        "da última compra e pelo preço de venda sugerido."
     )
     st.markdown("---")
 
-    # Filtros
-    col_busca, col_toggle = st.columns([3, 1])
+    # Filtros e ordenação
+    col_busca, col_ordenar, col_toggle = st.columns([2.6, 2.4, 1.3])
+
     with col_busca:
-        busca = st.text_input(
-            "Filtrar por código ou descrição",
-            placeholder="Digite para buscar...",
-            label_visibility="collapsed",
+        # Mesmo componente pesquisável usado em produtos.py: dropdown com
+        # busca por código (prefixo) ou descrição, alternável dentro do
+        # próprio componente. Reaproveita a lista "itens" desta tela, já que
+        # as chaves batem (id, codigo_interno, descricao, saldo).
+        produto_id_selecionado = busca_produto(
+            produtos=itens,
+            label="Buscar produto",
+            placeholder="Digite o código ou a descrição...",
+            key="estoque_busca_produto",
+            mostrar_saldo=True,
         )
+
+    with col_ordenar:
+        # Colunas oferecidas para ordenar NESTA tela — é este parâmetro que
+        # torna o componente `ordenacao` reutilizável em outras telas/tabelas,
+        # cada uma passando seu próprio conjunto de campos.
+        colunas_ordenacao = [
+            {"chave": "codigo_interno", "rotulo": "Cod. Produto"},
+            {"chave": "saldo", "rotulo": "Qtde. Estoque"},
+            {"chave": "preco_venda", "rotulo": "Preço Venda"},
+            {"chave": "data_ultima_compra", "rotulo": "Data Ult. Compra"},
+        ]
+        campo_ordenacao, ordem_decrescente = ordenacao(
+            colunas=colunas_ordenacao,
+            campo_padrao="codigo_interno",
+            key="estoque_ordenacao",
+        )
+
     with col_toggle:
         mostrar_negativo = st.toggle("Mostrar zerado/negativo", value=False)
 
-    if busca:
-        termo = busca.strip().lower()
-        itens = [
-            i for i in itens
-            if termo in i["codigo_interno"].lower() or termo in i["descricao"].lower()
-        ]
+    # Termo digitado e modo de busca (código/descrição) ficam disponíveis em
+    # session_state depois da chamada acima, mesmo quando o usuário ainda não
+    # selecionou um produto específico na lista.
+    termo_busca_produto = st.session_state.get("estoque_busca_produto_termo", "")
+    buscar_descricao_produto = st.session_state.get("estoque_busca_produto_buscar_descricao", False)
+
+    if produto_id_selecionado is not None:
+        # Produto específico escolhido no dropdown: mostra só ele.
+        itens = [i for i in itens if i["id"] == produto_id_selecionado]
+    elif termo_busca_produto:
+        # Ainda digitando (sem selecionar): mesma regra de busca do
+        # componente, aplicada à listagem completa da tela.
+        itens = filtrar_por_termo(itens, termo_busca_produto, buscar_descricao_produto)
 
     if mostrar_negativo:
         itens = [i for i in itens if i["status"] != "🟢 OK"]
     else:
         itens = [i for i in itens if i["status"] == "🟢 OK"]
 
-    # Ordena: problemas primeiro (negativo, depois zerado, depois ok), por saldo crescente
-    ordem_status = {"🔴 Negativo": 0, "🔴 Zerado": 1, "🟢 OK": 2}
-    itens.sort(key=lambda i: (ordem_status[i["status"]], i["saldo"]))
+    # Ordenação escolhida pelo usuário (crescente/decrescente pelo campo selecionado)
+    if campo_ordenacao == "data_ultima_compra":
+        # Itens sem data de compra sempre vão para o final, independente da direção
+        def _chave_ordenacao(item):
+            data = item["data_ultima_compra"]
+            return (data is None, data or "")
+    elif campo_ordenacao == "codigo_interno":
+        def _chave_ordenacao(item):
+            return item["codigo_interno"].lower()
+    else:
+        def _chave_ordenacao(item):
+            return item[campo_ordenacao]
 
-    # Detecta mudança nos filtros e volta para a primeira página.
-    filtro_atual = (busca.strip().lower(), bool(mostrar_negativo))
+    itens.sort(key=_chave_ordenacao, reverse=ordem_decrescente)
+
+    # Detecta mudança nos filtros/ordenação e volta para a primeira página.
+    filtro_atual = (
+        produto_id_selecionado,
+        termo_busca_produto.strip().lower(),
+        bool(buscar_descricao_produto),
+        bool(mostrar_negativo),
+        campo_ordenacao,
+        bool(ordem_decrescente),
+    )
     if st.session_state.get("estoque_filtro_atual") != filtro_atual:
         st.session_state["estoque_filtro_atual"] = filtro_atual
         reset_paginacao("estoque_atual")
@@ -152,22 +279,71 @@ def _secao_estoque_atual():
         return
 
     with st.container(border=True):
-        c_cod, c_desc, c_cat, c_saldo, c_status = st.columns([1.5, 3.5, 2, 1.5, 1.5])
-        c_cod.markdown("**Código**")
-        c_desc.markdown("**Descrição**")
-        c_cat.markdown("**Categoria**")
-        c_saldo.markdown("**Saldo**")
-        c_status.markdown("**Status**")
+        c_cod, c_desc, c_saldo, c_compra, c_venda, c_data = st.columns(
+            [1.4, 3.4, 1.3, 1.5, 1.5, 1.6]
+        )
+        c_cod.markdown("**Cod. Produto**")
+        c_desc.markdown("**Desc. Produto**")
+        c_saldo.markdown("**Qtde. Estoque**")
+        c_compra.markdown("**Preço Compra**")
+        c_venda.markdown("**Preço Venda**")
+        c_data.markdown("**Data Ult. Compra**")
 
         st.divider()
 
         for item in itens_pagina:
-            col_cod, col_desc, col_cat, col_saldo, col_status = st.columns([1.5, 3.5, 2, 1.5, 1.5])
+            col_cod, col_desc, col_saldo, col_compra, col_venda, col_data = st.columns(
+                [1.4, 3.4, 1.3, 1.5, 1.5, 1.6]
+            )
             col_cod.write(item["codigo_interno"])
+
             col_desc.write(item["descricao"])
-            col_cat.write(item["categoria"])
+
             col_saldo.write(_fmt_qtd(item["saldo"]))
-            col_status.write(item["status"])
+            col_compra.write(_fmt_moeda(item["preco_compra"]))
+
+            # Preço de venda clicável, com a mesma interface da versão Lapis.
+            # O hover do próprio botão mostra o preço original quando o produto
+            # já passou pelo primeiro ajuste.
+            rotulo_preco = _fmt_moeda(item["preco_venda"])
+            if item["flag_ajuste_preco_venda"]:
+                rotulo_preco = f"✏️ {rotulo_preco}"
+
+            if item.get("flag_ajuste_preco_venda") and item.get("preco_venda_original") is not None:
+                preco_original_fmt = _fmt_moeda(item["preco_venda_original"])
+                help_edicao = (
+                    f"Editar preço de venda. "
+                    f"Preço original antes do primeiro ajuste: {preco_original_fmt}"
+                )
+            else:
+                help_edicao = "Clique para editar o preço de venda."
+
+            if col_venda.button(
+                rotulo_preco,
+                key=f"editar_preco_venda_{item['id']}",
+                use_container_width=True,
+                help=help_edicao,
+            ):
+                _dialog_editar_preco_venda(
+                    item["id"],
+                    item["codigo_interno"],
+                    item["descricao"],
+                    item["preco_venda"],
+                    item.get("preco_venda_original"),
+                    item.get("flag_ajuste_preco_venda", False),
+                )
+
+            data_compra = item["data_ultima_compra"]
+            if data_compra:
+                try:
+                    data_compra = str(data_compra)[:10]
+                    ano, mes, dia = data_compra.split("-")
+                    data_compra = f"{dia}/{mes}/{ano}"
+                except (ValueError, AttributeError):
+                    pass
+            else:
+                data_compra = "-"
+            col_data.write(data_compra)
 
     render_paginacao(
         "estoque_atual",

@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <script src="https://cdn.jsdelivr.net/npm/streamlit-component-lib@2.0.0/dist/index.js"></script>
+  <style>
+    /* Estas regras são as MESMAS do componente busca_produto (index.html),
+       reaproveitadas ao pé da letra para garantir visual idêntico entre os
+       dois componentes: mesmo label-row, mesmas pílulas (.mode-radio /
+       .mode-option) e mesma caixa de controle (.selectbox / .control /
+       .arrow / .menu / .option). */
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; background: transparent; }
+    body {
+      color: #FAFAFA;
+      font-family: "Source Sans Pro", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 14px;
+      overflow: visible;
+    }
+    .wrap { width: 100%; position: relative; }
+    .label-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin: 0 0 6px 0;
+    }
+    .label {
+      display: block;
+      margin: 0;
+      color: #FAFAFA;
+      font-size: 14px;
+      font-weight: 600;
+      line-height: 1.4;
+    }
+    /* Pílulas de direção (Crescente / Decrescente) — mesma estrutura visual
+       do seletor "Cod. Produto / Descrição" do busca_produto. */
+    .mode-radio {
+      display: inline-flex;
+      align-items: center;
+      flex: 0 0 auto;
+      border: 1px solid #464B53;
+      border-radius: 6px;
+      padding: 2px;
+      gap: 2px;
+    }
+    .mode-option {
+      display: flex;
+      align-items: center;
+      padding: 3px 8px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 11.5px;
+      font-weight: 400;
+      line-height: 1.3;
+      color: rgb(163, 168, 184);
+      white-space: nowrap;
+      user-select: none;
+      transition: background .12s ease, color .12s ease;
+    }
+    .mode-option input {
+      position: absolute;
+      opacity: 0;
+      width: 0;
+      height: 0;
+      pointer-events: none;
+    }
+    .mode-option:hover {
+      color: #FAFAFA;
+    }
+    .mode-option.active {
+      background: #FF4B4B;
+      color: #FAFAFA;
+    }
+    .selectbox {
+      position: relative;
+      width: 100%;
+    }
+    .control {
+      width: 100%;
+      min-height: 40px;
+      padding: 0 34px 0 12px;
+      border: 1px solid #464B53;
+      border-radius: 6px;
+      background: #262730;
+      color: #FAFAFA;
+      display: flex;
+      align-items: center;
+      cursor: pointer;
+      position: relative;
+      user-select: none;
+    }
+    .control:focus,
+    .control:focus-within {
+      outline: none;
+      border-color: #FF4B4B;
+      box-shadow: 0 0 0 1px #FF4B4B;
+    }
+    .control-text {
+      width: 100%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .arrow {
+      position: absolute;
+      right: 12px;
+      top: 50%;
+      width: 8px;
+      height: 8px;
+      border-right: 2px solid #FAFAFA;
+      border-bottom: 2px solid #FAFAFA;
+      transform: translateY(-65%) rotate(45deg);
+      pointer-events: none;
+    }
+    .menu {
+      position: absolute;
+      left: 0;
+      right: 0;
+      top: calc(100% + 4px);
+      max-height: 300px;
+      overflow-y: auto;
+      z-index: 99999;
+      background: #262730;
+      border: 1px solid #464B53;
+      border-radius: 6px;
+      box-shadow: 0 4px 12px rgba(0,0,0,.35);
+      padding: 4px 0;
+      display: none;
+    }
+    .menu.open { display: block; }
+    .option {
+      padding: 9px 12px;
+      color: #FAFAFA;
+      cursor: pointer;
+      line-height: 1.35;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .option:hover, .option.active { background: #3A3B46; }
+    .empty { padding: 10px 12px; color: #8B8D98; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="label-row">
+      <div class="label" id="label">Ordenação:</div>
+      <div class="mode-radio" id="direcaoRadio" role="radiogroup" aria-label="Direção da ordenação">
+        <label class="mode-option" data-dir="asc">
+          <input type="radio" name="direcao" value="asc" checked />
+          <span>⬆️ Crescente</span>
+        </label>
+        <label class="mode-option" data-dir="desc">
+          <input type="radio" name="direcao" value="desc" />
+          <span>⬇️ Decrescente</span>
+        </label>
+      </div>
+    </div>
+    <div class="selectbox">
+      <div class="control" id="control" tabindex="0">
+        <span class="control-text" id="controlText"></span>
+        <span class="arrow"></span>
+      </div>
+      <div class="menu" id="menu"></div>
+    </div>
+  </div>
+
+<script>
+  const labelEl = document.getElementById("label");
+  const control = document.getElementById("control");
+  const controlText = document.getElementById("controlText");
+  const menu = document.getElementById("menu");
+  const direcaoRadio = document.getElementById("direcaoRadio");
+  const direcaoOptions = direcaoRadio.querySelectorAll(".mode-option");
+  const direcaoInputs = direcaoRadio.querySelectorAll('input[name="direcao"]');
+
+  // Diferente do busca_produto (que precisa lidar com digitação assíncrona),
+  // este componente é só um seletor: o estado sempre vem de "args" (que o
+  // Python já resolve a partir do st.session_state[key] a cada rerun), então
+  // não há necessidade de guardas de sincronização — sempre confiamos no
+  // valor mais recente recebido do Python.
+  let args = { label: "Ordenação:", colunas: [], campo: null, decrescente: false };
+  let campoAtual = null;
+  let decrescenteAtual = false;
+
+  function send(value) {
+    window.parent.postMessage({
+      isStreamlitMessage: true,
+      type: "streamlit:setComponentValue",
+      value: value
+    }, "*");
+  }
+
+  function setFrameHeight(height) {
+    window.parent.postMessage({
+      isStreamlitMessage: true,
+      type: "streamlit:setFrameHeight",
+      height: height
+    }, "*");
+  }
+
+  function enviarEstado() {
+    send({ campo: campoAtual, decrescente: decrescenteAtual });
+  }
+
+  function colunasAtuais() {
+    return args.colunas || [];
+  }
+
+  function rotuloDoCampo(chave) {
+    const col = colunasAtuais().find((c) => c.chave === chave);
+    return col ? col.rotulo : "";
+  }
+
+  function aplicarDirecaoNoBotao() {
+    direcaoInputs.forEach((el) => {
+      el.checked = (el.value === "desc") === decrescenteAtual;
+    });
+    direcaoOptions.forEach((el) => {
+      const ativo = (el.dataset.dir === "desc") === decrescenteAtual;
+      el.classList.toggle("active", ativo);
+    });
+  }
+
+  function selecionarDirecao(novoDecrescente) {
+    if (novoDecrescente === decrescenteAtual) return;
+    decrescenteAtual = novoDecrescente;
+    aplicarDirecaoNoBotao();
+    enviarEstado();
+  }
+
+  function renderMenu() {
+    const colunas = colunasAtuais();
+    menu.innerHTML = "";
+
+    if (!colunas.length) {
+      const empty = document.createElement("div");
+      empty.className = "empty";
+      empty.textContent = "Nenhuma coluna disponível.";
+      menu.appendChild(empty);
+      return;
+    }
+
+    colunas.forEach((col) => {
+      const el = document.createElement("div");
+      el.className = "option";
+      if (col.chave === campoAtual) el.classList.add("active");
+      el.textContent = col.rotulo;
+      el.title = col.rotulo;
+      el.addEventListener("mousedown", (event) => {
+        event.preventDefault();
+        selecionarCampo(col.chave);
+      });
+      menu.appendChild(el);
+    });
+  }
+
+  function selecionarCampo(chave) {
+    if (chave === campoAtual) {
+      closeMenu();
+      return;
+    }
+    campoAtual = chave;
+    controlText.textContent = rotuloDoCampo(chave);
+    closeMenu();
+    enviarEstado();
+  }
+
+  function openMenu() {
+    renderMenu();
+    menu.classList.add("open");
+    // O frame cresce só enquanto a lista está aberta, igual ao busca_produto.
+    setFrameHeight(Math.min(76 + colunasAtuais().length * 38 + 12, 320));
+  }
+
+  function closeMenu() {
+    menu.classList.remove("open");
+    setFrameHeight(76);
+  }
+
+  function toggleMenu() {
+    if (menu.classList.contains("open")) closeMenu();
+    else openMenu();
+  }
+
+  control.addEventListener("mousedown", (event) => {
+    event.preventDefault();
+    toggleMenu();
+    control.focus();
+  });
+
+  control.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      toggleMenu();
+    } else if (event.key === "Escape") {
+      closeMenu();
+    }
+  });
+
+  direcaoOptions.forEach((el) => {
+    el.addEventListener("mousedown", (event) => {
+      // Evita que o clique tire o foco do controle antes da hora (mesmo
+      // padrão usado no busca_produto).
+      event.preventDefault();
+    });
+    el.addEventListener("click", () => {
+      selecionarDirecao(el.dataset.dir === "desc");
+    });
+  });
+
+  document.addEventListener("mousedown", (event) => {
+    if (!event.target.closest(".selectbox")) closeMenu();
+  });
+
+  window.addEventListener("blur", () => {
+    setTimeout(() => {
+      if (menu.classList.contains("open")) closeMenu();
+    }, 0);
+  });
+
+  function render(newArgs) {
+    args = newArgs || {};
+    labelEl.textContent = args.label || "Ordenação:";
+
+    campoAtual = args.campo != null ? args.campo : (colunasAtuais()[0] || {}).chave || null;
+    decrescenteAtual = !!args.decrescente;
+
+    controlText.textContent = rotuloDoCampo(campoAtual);
+    aplicarDirecaoNoBotao();
+
+    if (menu.classList.contains("open")) renderMenu();
+  }
+
+  window.addEventListener("message", (event) => {
+    const data = event.data;
+    if (data && data.type === "streamlit:render") render(data.args || {});
+  });
+
+  window.parent.postMessage({
+    isStreamlitMessage: true,
+    type: "streamlit:componentReady",
+    apiVersion: 1
+  }, "*");
+  setFrameHeight(76);
+</script>
+</body>
+</html>

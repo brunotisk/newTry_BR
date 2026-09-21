@@ -22,6 +22,7 @@ from servicos.vendas_import import (
 from telas.cadastros_auxiliares import tela_cadastros_auxiliares
 from componentes.campo_cliente import campo_cliente
 from componentes.campo_mascarado import campo_mascarado
+from componentes.contador_quantidade import contador_quantidade
 from componentes.paginacao import render_paginacao, get_itens_por_pagina, reset_paginacao
 
 # Compatibilidade: st.dialog é o nome estável (Streamlit >= 1.31); versões
@@ -495,6 +496,141 @@ def _secao_importar():
     _tela_validacao_importacao()
 
 
+
+def _parse_valor_input(valor, padrao=0.0):
+    """Converte valor digitado em formato BR/US para float."""
+    if valor is None:
+        return float(padrao)
+    texto = str(valor).strip()
+    if not texto:
+        return 0.0
+    try:
+        if "," in texto:
+            texto = texto.replace(".", "").replace(",", ".")
+        return max(0.0, float(texto))
+    except (TypeError, ValueError):
+        return float(padrao)
+
+
+def _fmt_valor_input(valor):
+    return f"{float(valor or 0):.2f}".replace(".", ",")
+
+
+def _resetar_controles_venda(venda, nova_venda, produto_selecionado):
+    """Inicializa os controles independentes do popup de venda."""
+    chave_venda = "nova" if nova_venda else str(venda.get("id"))
+    produto_id = (produto_selecionado or {}).get("id")
+    chave_produto = f"{chave_venda}:{produto_id}"
+
+    if st.session_state.get("venda_controles_chave") != chave_produto:
+        st.session_state["venda_controles_chave"] = chave_produto
+        st.session_state["venda_qtd"] = max(1.0, float(venda.get("quantidade") or 1))
+        if nova_venda and produto_selecionado:
+            st.session_state["venda_valor_lista"] = float(
+                produto_selecionado.get("estoque_preco_venda_sugerida") or 0
+            )
+        else:
+            st.session_state["venda_valor_lista"] = float(venda.get("valor_lista") or 0)
+        st.session_state["venda_desconto_texto"] = _fmt_valor_input(
+            venda.get("valor_desconto") or 0
+        )
+        # Valor lista inicia sempre protegido. O usuário pode abrir
+        # explicitamente pelo seletor Travado/Aberto.
+        st.session_state["venda_valor_lista_aberto"] = False
+        st.session_state["venda_valor_lista_input"] = _fmt_valor_input(
+            st.session_state["venda_valor_lista"]
+        )
+
+
+def _render_controles_valores_venda():
+    """Renderiza quantidade e os valores da venda.
+
+    Quantidade usa o mesmo contador da tela de Ajuste de estoque.
+    Valor lista inicia travado e pode ser liberado pelo seletor
+    Travado/Aberto. Desconto é editável e Valor final é calculado.
+    """
+
+    col_qtd, col_lista, col_desc, col_final = st.columns(4)
+
+    with col_qtd:
+        st.markdown("**Quantidade**")
+        estado_qtd = contador_quantidade(
+            valor=int(max(1.0, float(st.session_state.get("venda_qtd", 1)))),
+            min_valor=1,
+            bloqueado=True,
+            label="",
+            key="contador_venda_nova",
+        )
+        quantidade = max(
+            1,
+            int(estado_qtd.get("valor", st.session_state.get("venda_qtd", 1))),
+        )
+        st.session_state["venda_qtd"] = quantidade
+
+    with col_lista:
+        # O seletor é discreto e começa sempre em Travado. Antes usava um
+        # segmented_control/radio com textos ("🔒 Travado" / "🔓 Aberto")
+        # dividindo o espaço com o rótulo — nessa coluna estreita (1/4 do
+        # popup) o texto não cabia e cortava. Um toggle compacto (só o
+        # ícone + interruptor) resolve tanto o corte quanto o
+        # desalinhamento, porque ocupa a mesma altura de uma linha simples,
+        # igual às colunas vizinhas.
+        col_rotulo, col_bloqueio = st.columns([2, 1], vertical_alignment="center")
+        with col_rotulo:
+            st.markdown("**Valor lista**")
+        with col_bloqueio:
+            aberto = st.toggle(
+                "🔓",
+                value=st.session_state.get("venda_valor_lista_aberto", False),
+                key="venda_valor_lista_bloqueio",
+                help=(
+                    "Travado: usa o valor sugerido do estoque. "
+                    "Ative para digitar um valor lista diferente."
+                ),
+            )
+            st.session_state["venda_valor_lista_aberto"] = aberto
+
+        valor_lista_texto = st.text_input(
+            "Valor lista",
+            key="venda_valor_lista_input",
+            disabled=not aberto,
+            label_visibility="collapsed",
+        )
+        valor_lista = _parse_valor_input(
+            valor_lista_texto,
+            st.session_state.get("venda_valor_lista", 0),
+        )
+        # Não altere a chave do widget depois que ele foi instanciado.
+        # O valor normalizado fica separado do texto exibido no input.
+        st.session_state["venda_valor_lista"] = valor_lista
+
+    with col_desc:
+        st.markdown("**Desconto**")
+        desconto_texto = st.text_input(
+            "Desconto",
+            key="venda_desconto_texto",
+            label_visibility="collapsed",
+        )
+        valor_desconto = _parse_valor_input(desconto_texto, 0.0)
+
+    with col_final:
+        st.markdown("**Valor final**")
+        valor_final = (float(quantidade) * float(valor_lista)) - valor_desconto
+        st.text_input(
+            "Valor final",
+            value=_fmt_valor_input(valor_final),
+            disabled=True,
+            label_visibility="collapsed",
+        )
+
+    return (
+        float(quantidade),
+        float(valor_lista),
+        float(valor_desconto),
+        float(valor_final),
+    )
+
+
 @_dialog("💰 Venda", width="large")
 def _dialog_editar_venda(
     venda: dict | None,
@@ -536,7 +672,10 @@ def _dialog_editar_venda(
             resp_produtos = (
                 supabase
                 .table("estoque")
-                .select("quantidade_atual, produtos(id, codigo_interno, descricao)")
+                .select(
+                    "quantidade_atual, estoque_preco_venda_sugerida, "
+                    "produtos(id, codigo_interno, descricao)"
+                )
                 .gt("quantidade_atual", 0)
                 .execute()
             )
@@ -547,7 +686,14 @@ def _dialog_editar_venda(
                         f"{produto['codigo_interno']} — {produto['descricao']} "
                         f"(saldo: {float(linha.get('quantidade_atual') or 0):g})"
                     )
-                    produtos_opcoes[rotulo] = produto
+                    # Mantém junto ao produto o preço de venda sugerido
+                    # armazenado na tabela estoque.
+                    produtos_opcoes[rotulo] = {
+                        **produto,
+                        "estoque_preco_venda_sugerida": float(
+                            linha.get("estoque_preco_venda_sugerida") or 0
+                        ),
+                    }
         except Exception as e:
             st.error(f"Erro ao carregar produtos em estoque: {e}")
 
@@ -645,46 +791,10 @@ def _dialog_editar_venda(
                 )
 
 
+        _resetar_controles_venda(venda, nova_venda, produto_selecionado)
+        quantidade, valor_lista, valor_desconto, valor_final = _render_controles_valores_venda()
+
         with st.form(form_key, border=False):
-            # Linha 2: Quantidade | Valor unitário | Desconto | Valor total
-            col_qtd, col_unit, col_desc, col_total = st.columns(4)
-
-            with col_qtd:
-                quantidade = st.number_input(
-                    "Quantidade",
-                    min_value=0.01,
-                    step=1.0,
-                    format="%.2f",
-                    value=float(venda.get("quantidade") or 1),
-                )
-
-            with col_unit:
-                valor_lista = st.number_input(
-                    "Valor lista",
-                    min_value=0.0,
-                    step=0.01,
-                    format="%.2f",
-                    value=float(venda.get("valor_lista") or 0),
-                )
-
-            with col_desc:
-                valor_desconto = st.number_input(
-                    "Desconto",
-                    min_value=0.0,
-                    step=0.01,
-                    format="%.2f",
-                    value=float(venda.get("valor_desconto") or 0),
-                )
-
-            with col_total:
-                valor_final = st.number_input(
-                    "Valor final",
-                    min_value=0.0,
-                    step=0.01,
-                    format="%.2f",
-                    value=float(venda.get("valor_final") or 0),
-                )
-
             # Linha 3: Cliente (1/2) | Data da venda (1/4) | Forma de pagamento (1/4)
             col_cliente, col_data, col_forma = st.columns([2, 1, 1])
 

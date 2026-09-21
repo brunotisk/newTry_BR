@@ -65,6 +65,31 @@ def _filtrar_opcoes(opcoes, termo, buscar_descricao):
     return [o for o in opcoes if _normalizar_codigo(o["codigo"]).startswith(alvo)]
 
 
+def filtrar_por_termo(itens, termo, buscar_descricao=False):
+    """Aplica a mesma regra de busca usada dentro do componente (prefixo do
+    código interno, ignorando zeros à esquerda, no modo padrão; busca
+    flexível na descrição no modo "buscar_descricao") a uma lista de dicts
+    que tenham as chaves "codigo_interno" e "descricao".
+
+    Pensada para telas que reaproveitam o texto digitado no componente
+    busca_produto (exposto depois da chamada em
+    st.session_state[f"{key}_termo"] e
+    st.session_state[f"{key}_buscar_descricao"]) para filtrar sua própria
+    listagem — por exemplo, uma tabela com várias linhas, e não só um único
+    produto selecionado.
+    """
+    termo = str(termo or "").strip()
+    if not termo:
+        return list(itens)
+
+    if buscar_descricao:
+        alvo = _normalizar_texto(termo)
+        return [i for i in itens if alvo in _normalizar_texto(i.get("descricao"))]
+
+    alvo = _normalizar_codigo(termo)
+    return [i for i in itens if _normalizar_codigo(i.get("codigo_interno")).startswith(alvo)]
+
+
 def busca_produto(
     produtos,
     label="Produto",

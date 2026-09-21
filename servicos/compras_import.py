@@ -8,8 +8,9 @@ Fluxo (importar_nfe):
   4. upsert de produtos novos (atualizando ultima_compra e nr_compras)
   5. insert dos itens da compra
   6. atualiza saldo de estoque + grava movimento no ledger (via servicos.estoque)
-  7. atualiza o preço de venda sugerido em estoque (2x o valor_unitario da
-     compra mais recente do produto)
+  7. sincroniza em estoque o preço de venda sugerido (2x o valor_unitario da
+     compra mais recente), o preço de custo da última compra, a data da
+     última compra e o número de compras do produto
 
 O parsing de XML (antes em nfe_parser.py, separado) foi trazido pra cá porque
 só é usado por este pipeline de importação de compras.
@@ -219,31 +220,51 @@ def upsert_produto(sb: Client, item, data_emissao) -> int:
     return resp.data[0]["id"]
 
 
-def _atualizar_preco_venda_se_mais_recente(sb: Client, produto_id: int, valor_unitario: Decimal, data_movimento: str) -> None:
-    """Recalcula estoque.Estoque_Preco_venda (2x o valor_unitario da compra) somente
-    se esta compra for a mais recente já registrada para o produto (produtos.ultima_compra).
-    Isso evita que a importação de uma NF antiga sobrescreva um preço já calculado
-    a partir de uma compra mais nova."""
+def _sincronizar_estoque_pos_compra(sb: Client, produto_id: int, valor_unitario: Decimal, data_movimento: str) -> None:
+    """Após uma compra ser registrada, sincroniza em `estoque` os campos que
+    dependem do histórico de compras do produto:
+
+      - estoque_preco_venda_sugerida: 2x o valor_unitario, mas só é recalculado
+        se esta compra for a mais recente já registrada para o produto (evita
+        que a importação de uma NF antiga sobrescreva um preço calculado a
+        partir de uma compra mais nova).
+      - estoque_preco_ultima_compra: o valor_unitario "cru" (sem multiplicar)
+        pago na compra, com a mesma regra de recência acima.
+      - estoque_ultima_compra: sempre espelha produtos.ultima_compra (que já é
+        a data mais recente entre todas as compras do produto).
+      - estoque_num_compras: sempre espelha produtos.nr_compras (contagem total
+        de compras já feita em upsert_produto).
+    """
 
     prod_resp = (
         sb.table("produtos")
-        .select("ultima_compra")
+        .select("ultima_compra, nr_compras")
         .eq("id", produto_id)
         .execute()
     )
 
     ultima_compra_produto = None
-    if prod_resp.data and prod_resp.data[0].get("ultima_compra"):
-        ultima_compra_produto = str(prod_resp.data[0]["ultima_compra"])[:10]
+    nr_compras_produto = None
+    if prod_resp.data:
+        prod_atual = prod_resp.data[0]
+        if prod_atual.get("ultima_compra"):
+            ultima_compra_produto = str(prod_atual["ultima_compra"])[:10]
+        nr_compras_produto = prod_atual.get("nr_compras")
 
-    # Só atualiza o preço se esta compra for igual (ou, por segurança, posterior)
-    # à ultima_compra já registrada no produto.
+    dados_estoque = {
+        "produto_id": produto_id,
+        "estoque_ultima_compra": ultima_compra_produto,
+        "estoque_num_compras": nr_compras_produto,
+    }
+
+    # Só atualiza o preço (sugerido e o de custo da última compra) se esta
+    # compra for igual (ou, por segurança, posterior) à ultima_compra já
+    # registrada no produto.
     if ultima_compra_produto is None or data_movimento >= ultima_compra_produto:
-        novo_preco_venda = float(valor_unitario) * 2
-        sb.table("estoque").upsert({
-            "produto_id": produto_id,
-            "Estoque_Preco_venda": novo_preco_venda,
-        }, on_conflict="produto_id").execute()
+        dados_estoque["estoque_preco_venda_sugerida"] = float(valor_unitario) * 2
+        dados_estoque["estoque_preco_ultima_compra"] = float(valor_unitario)
+
+    sb.table("estoque").upsert(dados_estoque, on_conflict="produto_id").execute()
 
 
 def inserir_item_e_atualizar_estoque(sb: Client, compra_id: int, produto_id: int, item, data_emissao):
@@ -271,9 +292,10 @@ def inserir_item_e_atualizar_estoque(sb: Client, compra_id: int, produto_id: int
         compra_id=compra_id,
     )
 
-    # Atualiza o preço de venda sugerido (2x o valor_unitario da compra mais
-    # recente) sempre que esta compra for a mais nova para o produto.
-    _atualizar_preco_venda_se_mais_recente(sb, produto_id, item.valor_unitario, data_movimento)
+    # Sincroniza estoque_ultima_compra, estoque_num_compras e (quando aplicável)
+    # estoque_preco_venda_sugerida / estoque_preco_ultima_compra com base no
+    # histórico atualizado do produto.
+    _sincronizar_estoque_pos_compra(sb, produto_id, item.valor_unitario, data_movimento)
 
 
 def importar_nfe(caminho_xml: str) -> dict:

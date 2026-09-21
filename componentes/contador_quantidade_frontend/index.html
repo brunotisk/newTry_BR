@@ -20,7 +20,6 @@
 
     .wrap {
       width: 100%;
-      height: 66px;
       display: flex;
       flex-direction: column;
       gap: 6px;
@@ -34,6 +33,15 @@
       font-weight: 600;
       margin: 0;
       padding: 0;
+    }
+
+    /* Quando quem chama o componente já renderiza o próprio rótulo em
+       markdown (ex.: telas/vendas.py, com "**Quantidade**" fora do
+       componente), label="" é passado e este rótulo interno some por
+       completo — inclusive o espaço reservado a ele — em vez de cair de
+       volta no texto "Quantidade" e duplicar o label. */
+    .field-label.hidden {
+      display: none;
     }
 
     .control-row {
@@ -193,6 +201,14 @@
     return Math.max(minValor, n);
   }
 
+  function setFrameHeight(h) {
+    window.parent.postMessage({
+      isStreamlitMessage: true,
+      type: "streamlit:setFrameHeight",
+      height: h
+    }, "*");
+  }
+
   function enviar() {
     window.parent.postMessage({
       isStreamlitMessage: true,
@@ -202,7 +218,14 @@
   }
 
   function render() {
-    labelEl.textContent = args.label || "Quantidade";
+    // args.label vazio ("") ou ausente = quem chamou já mostra o próprio
+    // rótulo fora do componente. Só cai em "Quantidade" quando o label
+    // não foi informado (undefined/null), nunca quando veio "" de propósito.
+    const temLabel = args.label !== "" && args.label !== undefined && args.label !== null;
+    labelEl.classList.toggle("hidden", !temLabel);
+    labelEl.textContent = temLabel ? args.label : "";
+    setFrameHeight(temLabel ? 68 : 42);
+
     valor = clamp(valor);
     valueEl.value = String(valor);
     valueEl.readOnly = bloqueado;
@@ -260,7 +283,6 @@
     const data = event.data;
     if (data && data.type === "streamlit:render") {
       args = data.args || args;
-      labelEl.textContent = args.label || "Quantidade";
       minValor = Math.max(1, parseInt(args.min_valor ?? 1, 10) || 1);
       if (!pronto) {
         valor = clamp(args.valor ?? 1);
