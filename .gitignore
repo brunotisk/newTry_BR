@@ -16,3 +16,10 @@ ENV/
 .env.production
 .env.staging
 !.env.example
+
+
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.env
