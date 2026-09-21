@@ -1,21 +1,53 @@
 import streamlit as st
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from db import supabase
 from telas.importar_nf import tela_importar_nf
 from componentes.paginacao import render_paginacao, get_itens_por_pagina, reset_paginacao
+from servicos.arquivos_compra import (
+    upload_arquivo_compra,
+    listar_arquivos_compra,
+    gerar_url_arquivo_compra,
+    excluir_arquivo_compra,
+    nome_arquivo_compra,
+)
 
 # Compatibilidade: st.dialog é o nome estável (Streamlit >= 1.31); versões
 # um pouco mais antigas ainda expõem a mesma coisa como st.experimental_dialog.
 _dialog = getattr(st, "dialog", None) or st.experimental_dialog
 
 
-def _fmt_moeda(valor) -> str:
+def _fmt_numero(valor) -> str:
+    """Formata um número no padrão BR (1.234,56), sem o prefixo 'R$ '."""
     return (
-        f"R$ {float(valor or 0):,.2f}"
+        f"{float(valor or 0):,.2f}"
         .replace(",", "X")
         .replace(".", ",")
         .replace("X", ".")
     )
+
+
+def _fmt_moeda(valor) -> str:
+    return f"R$ {_fmt_numero(valor)}"
+
+
+def _parse_valor_input(valor, padrao=0.0):
+    """Converte valor digitado em formato BR/US para float."""
+    if valor is None:
+        return float(padrao)
+    texto = str(valor).strip()
+    if not texto:
+        return 0.0
+    try:
+        if "," in texto:
+            texto = texto.replace(".", "").replace(",", ".")
+        return max(0.0, float(texto))
+    except (TypeError, ValueError):
+        return float(padrao)
+
+
+def _fmt_valor_input(valor):
+    return f"{float(valor or 0):.2f}".replace(".", ",")
 
 
 def _fmt_qtd(valor) -> str:
@@ -101,6 +133,223 @@ def _dialog_itens_compra(compra: dict, produto_id: int | None = None):
             col_tot.write(_fmt_moeda(item.get("valor_total")))
 
 
+@_dialog("✏️ Desconto adicional")
+def _dialog_editar_desconto(compra: dict):
+    """Popup para preencher/editar o desconto adicional concedido numa compra
+    (além do desconto já descrito na própria NF-e) e o motivo dele."""
+    st.caption(
+        f"NF nº {compra.get('numero_nf') or '-'} — "
+        f"Chave: {compra.get('chave_acesso') or '-'}"
+    )
+
+    desconto_atual = float(compra.get("compras_desconto_adicional") or 0)
+    motivo_atual = compra.get("compras_motivo_desconto") or ""
+
+    with st.form(f"form_desconto_adicional_{compra['id']}", border=False):
+        desconto_texto = st.text_input(
+            "Desconto adicional (R$)",
+            value=_fmt_valor_input(desconto_atual),
+            help="Desconto concedido além do que já está descrito na nota fiscal.",
+        )
+        motivo_texto = st.text_area(
+            "Motivo do desconto",
+            value=motivo_atual,
+            placeholder="Ex.: Avaria no transporte, negociação com o fornecedor...",
+        )
+
+        col_salvar, col_cancelar = st.columns(2)
+        salvar = col_salvar.form_submit_button(
+            "💾 Salvar", type="secondary", use_container_width=True
+        )
+        cancelar = col_cancelar.form_submit_button(
+            "Cancelar", use_container_width=True
+        )
+
+    if cancelar:
+        st.rerun()
+
+    if not salvar:
+        return
+
+    desconto_valor = _parse_valor_input(desconto_texto, 0.0)
+    motivo_valor = motivo_texto.strip()
+
+    if desconto_valor > 0 and not motivo_valor:
+        st.error("Informe o motivo do desconto adicional.")
+        return
+
+    try:
+        supabase.table("compras").update({
+            "compras_desconto_adicional": desconto_valor,
+            "compras_motivo_desconto": motivo_valor or None,
+        }).eq("id", compra["id"]).execute()
+        st.success("Desconto adicional atualizado com sucesso!")
+        st.rerun()
+    except Exception as e:
+        st.error(f"Erro ao salvar desconto adicional: {e}")
+
+
+
+@_dialog("📎 Arquivos da compra", width="large")
+def _dialog_arquivos_compra(compra: dict):
+    """Gerencia XML/PDF vinculados a uma compra."""
+    st.caption(
+        f"NF nº {compra.get('numero_nf') or '-'} — "
+        f"Compra #{compra.get('id')}"
+    )
+
+    st.markdown("### Adicionar arquivo")
+
+    # Botão de envio em verde, mantendo o restante dos botões do sistema intactos.
+    st.markdown(
+        """
+        <style>
+        div[data-testid="stDialog"] div[data-testid="stForm"] button[kind="primary"] {
+            background-color: #198754 !important;
+            border-color: #198754 !important;
+        }
+        div[data-testid="stDialog"] div[data-testid="stForm"] button[kind="primary"]:hover {
+            background-color: #157347 !important;
+            border-color: #157347 !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    with st.form(f"form_arquivo_compra_{compra['id']}", border=False):
+        arquivo = st.file_uploader(
+            "Selecione o arquivo",
+            type=["xml", "pdf"],
+            key=f"upload_arquivo_compra_{compra['id']}",
+            help="Nesta versão são aceitos somente XML e PDF.",
+        )
+
+        tipo = st.selectbox(
+            "Tipo do arquivo",
+            ["PDF", "XML"],
+            key=f"tipo_arquivo_compra_{compra['id']}",
+        )
+
+        enviar = st.form_submit_button(
+            "⬆️ Enviar arquivo",
+            type="primary",
+            use_container_width=True,
+        )
+
+    if enviar:
+        if arquivo is None:
+            st.error("Selecione um arquivo.")
+        else:
+            extensao = arquivo.name.lower().rsplit(".", 1)[-1]
+            if extensao != tipo.lower():
+                st.error(
+                    f"O tipo selecionado é {tipo}, mas o arquivo "
+                    f"possui extensão .{extensao}."
+                )
+            else:
+                try:
+                    nome_padrao = nome_arquivo_compra(
+                        compra.get("numero_nf"),
+                        tipo,
+                    )
+                    registro = upload_arquivo_compra(
+                        compra_id=compra["id"],
+                        arquivo=arquivo,
+                        nome_arquivo=nome_padrao,
+                        tipo_arquivo=tipo,
+                        mime_type=arquivo.type,
+                    )
+                    st.success(
+                        f"Arquivo '{registro['nome_arquivo']}' enviado com sucesso."
+                    )
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Erro ao enviar arquivo: {e}")
+
+    st.divider()
+    st.markdown("### Arquivos na nuvem")
+
+    try:
+        arquivos = listar_arquivos_compra(compra["id"])
+    except Exception as e:
+        st.error(f"Erro ao carregar arquivos: {e}")
+        return
+
+    if arquivos:
+        # Lista dos arquivos dentro de uma área visualmente separada.
+        with st.container(border=True):
+            st.markdown("**Arquivos anexados**")
+
+            for arquivo in arquivos:
+                col_tipo, col_nome, col_data, col_acoes = st.columns(
+                    [0.8, 3.2, 1.4, 1.8],
+                    vertical_alignment="center",
+                )
+
+                tipo_arquivo = arquivo.get("tipo_arquivo") or "-"
+                nome = arquivo.get("nome_arquivo") or "-"
+                criado_em = arquivo.get("criado_em") or ""
+
+                col_tipo.write(f"**{tipo_arquivo}**")
+                col_nome.write(nome)
+
+                if criado_em:
+                    try:
+                        dt = datetime.fromisoformat(criado_em.replace("Z", "+00:00"))
+                        # Supabase/Postgres grava o timestamp em UTC; exibe no horário de Brasília.
+                        dt_br = dt.astimezone(ZoneInfo("America/Sao_Paulo"))
+                        col_data.write(dt_br.strftime("%d/%m/%Y %H:%M"))
+                    except (TypeError, ValueError):
+                        col_data.write("-")
+                else:
+                    col_data.write("-")
+
+                with col_acoes:
+                    col_baixar, col_excluir = st.columns(2)
+
+                    try:
+                        url = gerar_url_arquivo_compra(
+                            arquivo,
+                            validade_segundos=300,
+                        )
+                    except Exception:
+                        url = ""
+                        col_baixar.error("Erro")
+
+                    if url:
+                        col_baixar.link_button(
+                            "⬇️",
+                            url,
+                            help="Baixar/abrir arquivo",
+                            use_container_width=True,
+                        )
+
+                    if col_excluir.button(
+                        "🗑️",
+                        key=f"excluir_arquivo_compra_{arquivo['id']}",
+                        help="Excluir arquivo da nuvem",
+                        use_container_width=True,
+                    ):
+                        try:
+                            excluir_arquivo_compra(arquivo)
+                            st.success("Arquivo excluído.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Erro ao excluir arquivo: {e}")
+    else:
+        with st.container(border=True):
+            st.info("Nenhum arquivo anexado a esta compra.")
+
+    st.write("")
+    if st.button(
+        "Fechar",
+        key=f"fechar_arquivos_compra_{compra['id']}",
+        use_container_width=True,
+    ):
+        st.rerun()
+
+
 def _secao_listagem():
     # Abre automaticamente o detalhe solicitado pela tela de movimentações.
     compra_abrir_id = st.session_state.pop("compras_abrir_id", None)
@@ -127,14 +376,35 @@ def _secao_listagem():
             supabase.table("compras")
             .select(
                 "id, numero_nf, data_emissao, valor_produtos, valor_desconto,"
-                " valor_total, chave_acesso"
+                " valor_total, chave_acesso, compras_desconto_adicional,"
+                " compras_motivo_desconto"
             )
             .order("data_emissao", desc=True)
             .execute()
         )
         compras = response.data or []
 
-        # 2. Contagem de itens por compra numa única consulta a compras_itens
+        # 2. Identifica quais compras possuem arquivos anexados.
+        # Se a consulta falhar, a listagem principal continua funcionando.
+        compras_com_arquivos: set[int] = set()
+        compra_ids_arquivos = [c["id"] for c in compras]
+        if compra_ids_arquivos:
+            try:
+                arquivos_resp = (
+                    supabase.table("compras_arquivos")
+                    .select("compra_id")
+                    .in_("compra_id", compra_ids_arquivos)
+                    .execute()
+                )
+                compras_com_arquivos = {
+                    int(row["compra_id"])
+                    for row in (arquivos_resp.data or [])
+                    if row.get("compra_id") is not None
+                }
+            except Exception:
+                pass
+
+        # 3. Contagem de itens por compra numa única consulta a compras_itens
         qtd_itens_por_compra: dict[int, int] = {}
         compra_ids = [c["id"] for c in compras]
         if compra_ids:
@@ -151,7 +421,7 @@ def _secao_listagem():
             except Exception:
                 pass  # coluna de itens fica "-" se essa consulta falhar
 
-        # 3. Cálculo dos Cards (KPIs)
+        # 4. Cálculo dos Cards (KPIs)
         total_compras = len(compras)
         soma_valor_total = sum(
             float(item.get("valor_total") or 0) for item in compras
@@ -186,7 +456,7 @@ def _secao_listagem():
             unsafe_allow_html=True,
         )
 
-        # 4. Exibição dos Cards no Topo (KPIs)
+        # 5. Exibição dos Cards no Topo (KPIs)
         col_kpi1, col_kpi2, col_kpi3 = st.columns(3)
 
         with col_kpi1:
@@ -210,7 +480,7 @@ def _secao_listagem():
             st.info("Nenhuma compra registrada.")
             return
 
-        # 5. Paginação da listagem
+        # 6. Paginação da listagem
         filtro_atual = len(compras)
         if st.session_state.get("compras_total_anterior") != filtro_atual:
             st.session_state["compras_total_anterior"] = filtro_atual
@@ -234,10 +504,10 @@ def _secao_listagem():
             permitir_seletor=True,
         )
 
-        # 6. Tabela de Compras
+        # 7. Tabela de Compras
         with st.container(border=True):
-            c_nf, c_dt, c_prod, c_desc, c_tot, c_itens, c_chave, c_acao = st.columns(
-                [1.3, 1.7, 1.7, 1.7, 1.7, 0.9, 3.2, 0.9]
+            c_nf, c_dt, c_prod, c_desc, c_tot, c_desc_adic, c_itens, c_acao = st.columns(
+                [1.6, 1.6, 1.6, 1.6, 1.6, 1.5, 0.8, 1.6]
             )
 
             c_nf.markdown("**Número NF**")
@@ -245,18 +515,43 @@ def _secao_listagem():
             c_prod.markdown("**Valor Produto**")
             c_desc.markdown("**Desconto (-)**")
             c_tot.markdown("**Valor Total**")
+            c_desc_adic.markdown("**Desconto Adicional**")
             c_itens.markdown("**Itens**")
-            c_chave.markdown("**Chave Acesso**")
             c_acao.markdown("**Ações**")
 
             st.divider()
 
             for item in compras_pagina:
-                col_nf, col_dt, col_prod, col_desc, col_tot, col_itens, col_chave, col_acao = (
-                    st.columns([1.3, 1.7, 1.7, 1.7, 1.7, 0.9, 3.2, 0.9])
+                col_nf, col_dt, col_prod, col_desc, col_tot, col_desc_adic, col_itens, col_acao = (
+                    st.columns([1.6, 1.6, 1.6, 1.6, 1.6, 1.5, 0.8, 1.6])
                 )
 
-                col_nf.write(item.get("numero_nf") or "-")
+                desconto_adicional = float(item.get("compras_desconto_adicional") or 0)
+                motivo_desconto = (item.get("compras_motivo_desconto") or "").strip()
+                tem_desconto_adicional = desconto_adicional > 0
+                chave_acesso = item.get("chave_acesso") or "-"
+
+                # A chave de acesso (antes uma coluna própria) fica disponível
+                # ao passar o mouse, via tooltip nativo do navegador. O
+                # indicador de desconto adicional fica só na própria coluna
+                # "Desconto Adicional" (badge laranja).
+                rotulo_nf = item.get("numero_nf") or "-"
+                tem_arquivos = item["id"] in compras_com_arquivos
+                indicador_arquivos = (
+                    ' <span title="Esta NF possui arquivos anexados." '
+                    'style="font-size:0.85em;">📎</span>'
+                    if tem_arquivos
+                    else ""
+                )
+                tooltip_nf = f"Chave de acesso: {chave_acesso}"
+                if tem_desconto_adicional:
+                    tooltip_nf += f" | Desconto adicional: {motivo_desconto or 'motivo não informado'}"
+                tooltip_nf_html = tooltip_nf.replace('"', "&quot;")
+                col_nf.markdown(
+                    f'<span title="{tooltip_nf_html}" style="cursor: help;">'
+                    f'{rotulo_nf}{indicador_arquivos}</span>',
+                    unsafe_allow_html=True,
+                )
 
                 if item.get("data_emissao"):
                     dt_item = datetime.fromisoformat(
@@ -270,35 +565,51 @@ def _secao_listagem():
                 v_desc = float(item.get("valor_desconto") or 0)
                 v_tot = float(item.get("valor_total") or 0)
 
-                col_prod.write(
-                    f"{v_prod:,.2f}"
-                    .replace(",", "X")
-                    .replace(".", ",")
-                    .replace("X", ".")
-                )
-                col_desc.write(
-                    f"{v_desc:,.2f}"
-                    .replace(",", "X")
-                    .replace(".", ",")
-                    .replace("X", ".")
-                )
-                col_tot.write(
-                    f"{v_tot:,.2f}"
-                    .replace(",", "X")
-                    .replace(".", ",")
-                    .replace("X", ".")
-                )
+                col_prod.write(_fmt_numero(v_prod))
+                col_desc.write(_fmt_numero(v_desc))
+                col_tot.write(_fmt_numero(v_tot))
+
+                with col_desc_adic:
+                    if tem_desconto_adicional:
+                        motivo_tooltip = motivo_desconto or "Motivo não informado"
+                        # Escapa aspas para não quebrar o atributo title do HTML.
+                        motivo_html = motivo_tooltip.replace('"', "&quot;")
+                        st.markdown(
+                            f'<span title="{motivo_html}" '
+                            'style="color:#ff8a3d; font-weight:600; cursor: help;">'
+                            f'🏷️ {_fmt_numero(desconto_adicional)}</span>',
+                            unsafe_allow_html=True,
+                        )
+                    else:
+                        st.write("-")
 
                 col_itens.write(str(qtd_itens_por_compra.get(item["id"], 0)))
-                col_chave.write(item.get("chave_acesso") or "-")
 
-                if col_acao.button(
-                    "🔎",
-                    key=f"ver_itens_compra_{item['id']}",
-                    help="Ver itens da compra",
-                    use_container_width=True,
-                ):
-                    _dialog_itens_compra(item)
+                with col_acao:
+                    col_ver, col_editar, col_arquivos = st.columns(
+                        3, vertical_alignment="center"
+                    )
+                    if col_ver.button(
+                        "🔎",
+                        key=f"ver_itens_compra_{item['id']}",
+                        help="Ver itens da compra",
+                        use_container_width=True,
+                    ):
+                        _dialog_itens_compra(item)
+                    if col_editar.button(
+                        "✏️",
+                        key=f"editar_desconto_compra_{item['id']}",
+                        help="Editar desconto adicional",
+                        use_container_width=True,
+                    ):
+                        _dialog_editar_desconto(item)
+                    if col_arquivos.button(
+                        "📎",
+                        key=f"arquivos_compra_{item['id']}",
+                        help="Arquivos da compra",
+                        use_container_width=True,
+                    ):
+                        _dialog_arquivos_compra(item)
 
         render_paginacao(
             "compras",

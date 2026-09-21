@@ -49,6 +49,23 @@ def _estilo_links_origem():
             padding-bottom: 0 !important;
         }
 
+        /* Cada célula da tabela é o widget de UM componente (texto fixo em
+         * div, ou um st.button para "Origem"). Sem isto, o invólucro do
+         * botão carrega uma margem/altura padrão do Streamlit diferente da
+         * altura fixa (28px) usada nas células de texto, e as linhas da
+         * tabela ficam com espaçamento desigual entre si. Cobrimos os dois
+         * nomes de testid ("stElementContainer" e "element-container") para
+         * funcionar em diferentes versões do Streamlit.
+         */
+        div[data-testid="stVerticalBlockBorderWrapper"] div[data-testid="stHorizontalBlock"] div[data-testid="stElementContainer"],
+        div[data-testid="stVerticalBlockBorderWrapper"] div[data-testid="stHorizontalBlock"] .element-container,
+        div[data-testid="stVerticalBlockBorderWrapper"] div[data-testid="stHorizontalBlock"] div[data-testid="stButton"] {
+            margin: 0 !important;
+            min-height: 28px !important;
+            display: flex !important;
+            align-items: center !important;
+        }
+
         /* Links de origem da tabela de movimentações */
         div[data-testid="stButton"] button[kind="tertiary"] {
             color: #8ab4f8 !important;
@@ -88,16 +105,36 @@ def _estilo_links_origem():
 
 def _secao_movimentacoes():
     # Filtros: por padrão, mostra todo o histórico. O usuário pode optar por
-    # filtrar por mês/ano ou por um período específico.
-    col_data, col_tipo, col_busca = st.columns([2.2, 1.5, 2])
+    # filtrar por mês/ano ou por um período específico. O "detalhe" do modo
+    # escolhido (o dropdown de mês/ano, ou os campos De/Até) fica na coluna
+    # ao lado, na MESMA linha — antes ele aparecia solto, em largura cheia,
+    # numa linha própria abaixo do filtro, o que dava a impressão de ser um
+    # elemento desconectado do resto do filtro.
+    col_modo, col_detalhe, col_tipo, col_busca = st.columns([1.7, 2.6, 1.2, 1.7])
 
-    with col_data:
-        modo_data = st.selectbox(
-            "Filtro de data",
-            ["Todas as datas", "Mês/Ano", "Período"],
-            index=0,
-            key="movimentos_modo_data",
-        )
+    with col_modo:
+        if hasattr(st, "segmented_control"):
+            if "movimentos_modo_data" not in st.session_state:
+                st.session_state["movimentos_modo_data"] = "Todas as datas"
+            modo_selecionado = st.segmented_control(
+                "Filtro de data",
+                options=["Todas as datas", "Mês/Ano", "Período"],
+                default=st.session_state["movimentos_modo_data"],
+                key="movimentos_modo_data_widget",
+            )
+            # segmented_control em modo single permite desmarcar clicando de
+            # novo na opção ativa (retorna None); mantemos o último modo
+            # válido nesse caso, para nunca ficar sem filtro selecionado.
+            if modo_selecionado is not None:
+                st.session_state["movimentos_modo_data"] = modo_selecionado
+            modo_data = st.session_state["movimentos_modo_data"]
+        else:
+            modo_data = st.radio(
+                "Filtro de data",
+                ["Todas as datas", "Mês/Ano", "Período"],
+                horizontal=True,
+                key="movimentos_modo_data",
+            )
 
     with col_tipo:
         tipo_filtro = st.selectbox("Tipo", ["Todos", "Entrada", "Saída", "Ajuste"], key="movimentos_tipo")
@@ -109,71 +146,84 @@ def _secao_movimentacoes():
     data_fim = None
     mes_ano_filtro = None
 
-    if modo_data == "Mês/Ano":
-        # Busca somente as datas existentes para montar um único dropdown
-        # com os meses/anos que realmente possuem movimentações.
-        try:
-            datas_resp = (
-                supabase.table("estoque_movimentos")
-                .select("data_movimento")
-                .not_.is_("data_movimento", "null")
-                .order("data_movimento", desc=True)
-                .limit(10000)
-                .execute()
-            )
-            meses_existentes = set()
-            for row in datas_resp.data or []:
-                valor = row.get("data_movimento")
-                if not valor:
-                    continue
-                texto_data = str(valor)[:10]
-                try:
-                    dt = datetime.strptime(texto_data, "%Y-%m-%d")
-                    meses_existentes.add((dt.year, dt.month))
-                except ValueError:
-                    continue
-
-            meses_existentes = sorted(meses_existentes, reverse=True)
-            nomes_meses = [
-                "janeiro", "fevereiro", "março", "abril", "maio", "junho",
-                "julho", "agosto", "setembro", "outubro", "novembro", "dezembro"
-            ]
-            opcoes_mes_ano = [
-                (ano, mes, f"{ano}/{nomes_meses[mes - 1]}")
-                for ano, mes in meses_existentes
-            ]
-
-            if not opcoes_mes_ano:
-                st.info("Não existem movimentações com data registrada para filtrar por mês/ano.")
-            else:
-                escolha_mes_ano = st.selectbox(
-                    "Mês/Ano",
-                    opcoes_mes_ano,
-                    format_func=lambda item: item[2],
-                    key="movimentos_mes_ano",
+    with col_detalhe:
+        if modo_data == "Mês/Ano":
+            # Busca somente as datas existentes para montar um único dropdown
+            # com os meses/anos que realmente possuem movimentações.
+            try:
+                datas_resp = (
+                    supabase.table("estoque_movimentos")
+                    .select("data_movimento")
+                    .not_.is_("data_movimento", "null")
+                    .order("data_movimento", desc=True)
+                    .limit(10000)
+                    .execute()
                 )
-                ano_filtro, mes_filtro, mes_ano_filtro = escolha_mes_ano
-                data_inicio = date(int(ano_filtro), int(mes_filtro), 1)
-                ultimo_dia = calendar.monthrange(int(ano_filtro), int(mes_filtro))[1]
-                data_fim = date(int(ano_filtro), int(mes_filtro), ultimo_dia)
-        except Exception as e:
-            st.error(f"Erro ao carregar meses com movimentações: {e}")
-            return
+                meses_existentes = set()
+                for row in datas_resp.data or []:
+                    valor = row.get("data_movimento")
+                    if not valor:
+                        continue
+                    texto_data = str(valor)[:10]
+                    try:
+                        dt = datetime.strptime(texto_data, "%Y-%m-%d")
+                        meses_existentes.add((dt.year, dt.month))
+                    except ValueError:
+                        continue
 
-    elif modo_data == "Período":
-        col_dt_ini, col_dt_fim, _ = st.columns([1, 1, 2])
-        with col_dt_ini:
-            data_inicio = st.date_input(
-                "De",
-                value=date.today() - timedelta(days=30),
-                key="movimentos_data_inicio",
+                meses_existentes = sorted(meses_existentes, reverse=True)
+                nomes_meses = [
+                    "janeiro", "fevereiro", "março", "abril", "maio", "junho",
+                    "julho", "agosto", "setembro", "outubro", "novembro", "dezembro"
+                ]
+                opcoes_mes_ano = [
+                    (ano, mes, f"{ano}/{nomes_meses[mes - 1]}")
+                    for ano, mes in meses_existentes
+                ]
+
+                if not opcoes_mes_ano:
+                    st.caption("⚠️ Não há movimentações com data registrada para filtrar por mês/ano.")
+                else:
+                    escolha_mes_ano = st.selectbox(
+                        "Mês/Ano",
+                        opcoes_mes_ano,
+                        format_func=lambda item: item[2],
+                        key="movimentos_mes_ano",
+                    )
+                    ano_filtro, mes_filtro, mes_ano_filtro = escolha_mes_ano
+                    data_inicio = date(int(ano_filtro), int(mes_filtro), 1)
+                    ultimo_dia = calendar.monthrange(int(ano_filtro), int(mes_filtro))[1]
+                    data_fim = date(int(ano_filtro), int(mes_filtro), ultimo_dia)
+            except Exception as e:
+                st.error(f"Erro ao carregar meses com movimentações: {e}")
+                return
+
+        elif modo_data == "Período":
+            col_dt_ini, col_dt_fim = st.columns(2)
+            with col_dt_ini:
+                data_inicio = st.date_input(
+                    "De",
+                    value=date.today() - timedelta(days=30),
+                    key="movimentos_data_inicio",
+                )
+            with col_dt_fim:
+                data_fim = st.date_input(
+                    "Até",
+                    value=date.today(),
+                    key="movimentos_data_fim",
+                )
+
+        else:
+            # Mantém a coluna com a mesma altura/rótulo das demais e dá um
+            # retorno visual imediato do que está sendo exibido, em vez de
+            # deixar o espaço vazio (o que passava a impressão de algo
+            # faltando ou quebrado).
+            st.markdown(
+                "<div style='height:20px; line-height:20px; font-size:14px; "
+                "font-weight:600; color:#FAFAFA;'>&nbsp;</div>",
+                unsafe_allow_html=True,
             )
-        with col_dt_fim:
-            data_fim = st.date_input(
-                "Até",
-                value=date.today(),
-                key="movimentos_data_fim",
-            )
+            st.caption("📜 Mostrando todo o histórico de movimentações.")
 
     tipo_map = {"Entrada": "entrada", "Saída": "saida", "Ajuste": "ajuste"}
 
@@ -322,7 +372,7 @@ def _secao_movimentacoes():
                     ):
                         _navegar_para_transacao("venda", venda_id)
                 else:
-                    col_origem.write("-")
+                    col_origem.markdown(_texto_celula("-"), unsafe_allow_html=True)
                 col_obs.markdown(_texto_celula(m.get("motivo") or "-"), unsafe_allow_html=True)
             elif m.get("tipo") == "entrada":
                 compra_id = m.get("compra_id")
@@ -334,7 +384,7 @@ def _secao_movimentacoes():
                     ):
                         _navegar_para_transacao("compra", compra_id, produto.get("id"))
                 else:
-                    col_origem.write("-")
+                    col_origem.markdown(_texto_celula("-"), unsafe_allow_html=True)
                 # Compras não precisam de observação nesta visão.
                 col_obs.markdown(_texto_celula("-"), unsafe_allow_html=True)
             elif m.get("tipo") == "ajuste":
