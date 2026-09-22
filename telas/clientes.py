@@ -83,8 +83,23 @@ def _dialog_cliente(cliente=None):
         st.error(f"Erro ao carregar canais: {err}")
         return
 
+    try:
+        feiras_resp = (
+            supabase.table("detalhes_feira")
+            .select("id, nome_feira")
+            .eq("ativo", True)
+            .order("nome_feira")
+            .execute()
+        )
+        feiras = feiras_resp.data or []
+    except Exception as err:
+        st.error(f"Erro ao carregar feiras: {err}")
+        return
+
     canal_ids = [c["id"] for c in canais]
     canal_labels = {c["id"]: c["nome"] for c in canais}
+    feira_ids = [f["id"] for f in feiras]
+    feira_labels = {f["id"]: f["nome_feira"] for f in feiras}
     cliente_id = cliente.get("id") if cliente else "novo"
 
     telefone_inicial = _format_phone(cliente.get("telefone") if cliente else "")
@@ -105,16 +120,38 @@ def _dialog_cliente(cliente=None):
             key=f"cliente_telefone_mask_{cliente_id}",
         )
 
-    col_canal, col_nasc, col_cas = st.columns([1.4, 1.2, 1.2])
+    col_canal, col_feira, col_nasc, col_cas = st.columns([1.3, 1.5, 1.1, 1.1])
     with col_canal:
         atual_canal = cliente.get("canal_id") if cliente else None
         opcoes_canal = [None] + canal_ids
         canal_id = st.selectbox(
-            "Canal",
+            "Canal *",
             options=opcoes_canal,
             index=opcoes_canal.index(atual_canal) if atual_canal in opcoes_canal else 0,
             format_func=lambda x: "-" if x is None else canal_labels[x],
             key=f"cliente_canal_input_{cliente_id}",
+        )
+    with col_feira:
+        canal_e_feira = canal_id is not None and (canal_labels.get(canal_id) or "").strip().casefold() == "feira"
+        feira_key = f"cliente_feira_input_{cliente_id}"
+        atual_feira = cliente.get("detalhe_feira_id") if cliente else None
+        opcoes_feira = [None] + feira_ids
+
+        if not canal_e_feira:
+            # Limpa de fato o valor do campo (não só na hora de salvar):
+            # precisa ser feito ANTES de instanciar o widget abaixo, senão o
+            # Streamlit mantém o que já estava selecionado em session_state
+            # mesmo com o campo desabilitado.
+            st.session_state[feira_key] = None
+
+        detalhe_feira_id = st.selectbox(
+            "Feira *" if canal_e_feira else "Feira (só p/ canal Feira)",
+            options=opcoes_feira,
+            index=opcoes_feira.index(atual_feira) if atual_feira in opcoes_feira else 0,
+            format_func=lambda x: "-" if x is None else feira_labels[x],
+            key=feira_key,
+            disabled=not canal_e_feira,
+            help=None if canal_e_feira else "Disponível apenas quando o canal selecionado é \"Feira\".",
         )
     with col_nasc:
         nascimento = campo_mascarado(
@@ -153,8 +190,17 @@ def _dialog_cliente(cliente=None):
         st.error("Informe o nome do cliente.")
         return
 
-    # Todos os campos, exceto nome, são opcionais.
-    # Normalizamos valores vazios/None para permitir salvar NULL no banco.
+    if canal_id is None:
+        st.error("Selecione o canal.")
+        return
+
+    if canal_e_feira and detalhe_feira_id is None:
+        st.error("Selecione a feira: é obrigatória quando o canal é \"Feira\".")
+        return
+
+    # Todos os campos, exceto nome, canal (e a feira quando o canal é
+    # "Feira"), são opcionais. Normalizamos valores vazios/None para
+    # permitir salvar NULL no banco.
     telefone = str(telefone or "").strip()
     nascimento = str(nascimento or "").strip()
     casamento = str(casamento or "").strip()
@@ -180,6 +226,7 @@ def _dialog_cliente(cliente=None):
         "nome": nome,
         "telefone": _format_phone(telefone) or None,
         "canal_id": canal_id if canal_id is not None else None,
+        "detalhe_feira_id": detalhe_feira_id if detalhe_feira_id is not None else None,
         "data_nascimento": nascimento_data.isoformat() if nascimento_data else None,
         "data_casamento": casamento_data.isoformat() if casamento_data else None,
     }
@@ -193,7 +240,200 @@ def _dialog_cliente(cliente=None):
             st.toast("Cliente cadastrado com sucesso!", icon="✅")
         st.rerun()
     except Exception as err:
-        st.error(f"Erro ao salvar cliente: {err}")
+        mensagem = str(err)
+        # Detecta a violação da constraint de unicidade (nome + canal) e
+        # mostra uma mensagem compreensível, em vez do erro cru do Postgres.
+        # Cobre tanto o nome novo da constraint (uq_clientes_nome_canal)
+        # quanto o antigo (uq_clientes_nome_lower), caso a migração ainda
+        # não tenha sido rodada nesse banco.
+        if "duplicate key value violates unique constraint" in mensagem and (
+            "uq_clientes_nome_canal" in mensagem or "uq_clientes_nome_lower" in mensagem
+        ):
+            nome_canal = canal_labels.get(canal_id, "selecionado")
+            st.error(
+                f"Já existe um cliente chamado \"{nome}\" cadastrado no canal "
+                f"\"{nome_canal}\". Se for a mesma pessoa, use o botão 🔗 Unificar "
+                "na tela de clientes; se for outra pessoa, ajuste o nome ou "
+                "confirme se o canal está correto."
+            )
+        else:
+            st.error(f"Erro ao salvar cliente: {err}")
+
+
+@_dialog("🔗 Unificar clientes", width="large")
+def _dialog_unificar_clientes():
+    """Migra as vendas de dois ou mais clientes "duplicados" para um único
+    cliente "principal" e exclui os duplicados — pensado para o caso de
+    cadastros repetidos por não existir CPF/RG como identificador único.
+
+    Sempre que possível, a migração das vendas é feita por cliente_id
+    (vínculo real). Para vendas antigas que ainda não tenham cliente_id
+    preenchido, usamos a mesma comparação por nome (sem espaços nas pontas,
+    sem diferenciar maiúsculas/minúsculas) já usada em _buscar_resumo_compras.
+    """
+    st.caption(
+        "Selecione dois ou mais clientes duplicados **do mesmo canal**. As "
+        "vendas de todos eles serão reatribuídas ao cliente principal "
+        "escolhido, e os demais cadastros serão excluídos. Clientes de "
+        "canais diferentes nunca são unificados entre si."
+    )
+
+    try:
+        canais_resp = supabase.table("canais_venda").select("id, nome").order("nome").execute()
+        canais_todos = canais_resp.data or []
+    except Exception as err:
+        st.error(f"Erro ao carregar canais: {err}")
+        return
+    canal_labels_todos = {c["id"]: c["nome"] for c in canais_todos}
+
+    def _rotulo_canal(canal_id):
+        return canal_labels_todos.get(canal_id, "Sem canal") if canal_id is not None else "Sem canal"
+
+    try:
+        todos_resp = (
+            supabase.table("clientes")
+            .select("id, nome, telefone, canal_id, data_nascimento, data_casamento, detalhe_feira_id")
+            .order("nome")
+            .execute()
+        )
+        todos_clientes = todos_resp.data or []
+    except Exception as err:
+        st.error(f"Erro ao carregar clientes: {err}")
+        return
+
+    if len(todos_clientes) < 2:
+        st.info("É preciso ter pelo menos dois clientes cadastrados para unificar.")
+        return
+
+    # A unificação só é permitida DENTRO de um único canal — em vez de
+    # validar depois de selecionar, o próprio formulário só oferece
+    # candidatos do canal escolhido, tornando impossível misturar canais.
+    canais_com_cliente = sorted(
+        {cli.get("canal_id") for cli in todos_clientes},
+        key=lambda cid: _rotulo_canal(cid).casefold(),
+    )
+    canal_escolhido = st.selectbox(
+        "Canal",
+        options=canais_com_cliente,
+        format_func=_rotulo_canal,
+        key="unificar_clientes_canal",
+        help="Só é possível unificar clientes do mesmo canal.",
+    )
+
+    clientes_do_canal = [c for c in todos_clientes if c.get("canal_id") == canal_escolhido]
+
+    if len(clientes_do_canal) < 2:
+        st.info(f"Não há pelo menos dois clientes no canal \"{_rotulo_canal(canal_escolhido)}\" para unificar.")
+        return
+
+    clientes_por_id = {c["id"]: c for c in clientes_do_canal}
+    rotulos = {
+        c["id"]: c["nome"] + (f" — {c['telefone']}" if c.get("telefone") else "")
+        for c in clientes_do_canal
+    }
+
+    selecionados = st.multiselect(
+        "Clientes a unificar",
+        options=[c["id"] for c in clientes_do_canal],
+        format_func=lambda cid: rotulos[cid],
+        key="unificar_clientes_selecionados",
+    )
+
+    if len(selecionados) < 2:
+        st.info("Selecione pelo menos dois clientes para poder unificá-los.")
+        return
+
+    principal_id = st.radio(
+        "Cliente principal (os demais serão migrados para este e excluídos)",
+        options=selecionados,
+        format_func=lambda cid: rotulos[cid],
+        key="unificar_clientes_principal",
+    )
+
+    duplicados_ids = [cid for cid in selecionados if cid != principal_id]
+    principal = clientes_por_id[principal_id]
+    duplicados = [clientes_por_id[cid] for cid in duplicados_ids]
+    nomes_duplicados_lower = {(d.get("nome") or "").strip().casefold() for d in duplicados}
+
+    try:
+        vendas_resp = supabase.table("vendas").select("id, cliente, cliente_id").execute()
+        vendas_todas = vendas_resp.data or []
+    except Exception as err:
+        st.error(
+            "Erro ao consultar vendas — verifique se a coluna `cliente_id` já "
+            f"foi criada na tabela `vendas`. Detalhe: {err}"
+        )
+        return
+
+    def _pertence_a_duplicado(venda: dict) -> bool:
+        if venda.get("cliente_id") in duplicados_ids:
+            return True
+        if venda.get("cliente_id") is None:
+            nome_venda = (venda.get("cliente") or "").strip().casefold()
+            return nome_venda in nomes_duplicados_lower
+        return False
+
+    vendas_afetadas = [v for v in vendas_todas if _pertence_a_duplicado(v)]
+
+    st.markdown(f"**Cliente principal:** {rotulos[principal_id]}")
+    st.markdown("**Serão excluídos:** " + ", ".join(rotulos[cid] for cid in duplicados_ids))
+    st.warning(
+        f"{len(vendas_afetadas)} venda(s) terão o cliente reatribuído para "
+        f"\"{principal.get('nome')}\". {len(duplicados_ids)} cadastro(s) de "
+        "cliente serão excluídos permanentemente. Essa ação não pode ser desfeita."
+    )
+
+    confirmar = st.checkbox(
+        "Confirmo que quero unificar esses clientes.",
+        key="unificar_clientes_confirmar",
+    )
+
+    col_unificar, col_cancelar = st.columns(2)
+    unificar = col_unificar.button(
+        "🔗 Unificar clientes",
+        type="primary",
+        use_container_width=True,
+        disabled=not confirmar,
+    )
+    cancelar = col_cancelar.button("Cancelar", use_container_width=True)
+
+    if cancelar:
+        st.rerun()
+
+    if not unificar:
+        return
+
+    try:
+        # 1. Reatribui as vendas afetadas (por cliente_id OU por nome em
+        #    texto para vendas antigas), usando os IDs já calculados acima —
+        #    evita depender de ILIKE no banco para casar nome com espaços/
+        #    maiúsculas diferentes.
+        ids_vendas_afetadas = [v["id"] for v in vendas_afetadas]
+        if ids_vendas_afetadas:
+            supabase.table("vendas").update({
+                "cliente_id": principal_id,
+                "cliente": principal.get("nome"),
+            }).in_("id", ids_vendas_afetadas).execute()
+
+        # 2. Completa dados do principal com o que os duplicados tiverem e
+        #    o principal ainda não tiver preenchido.
+        atualizacoes_principal = {}
+        for campo in ("telefone", "canal_id", "detalhe_feira_id", "data_nascimento", "data_casamento"):
+            if not principal.get(campo):
+                for dup in duplicados:
+                    if dup.get(campo):
+                        atualizacoes_principal[campo] = dup[campo]
+                        break
+        if atualizacoes_principal:
+            supabase.table("clientes").update(atualizacoes_principal).eq("id", principal_id).execute()
+
+        # 3. Remove os cadastros duplicados.
+        supabase.table("clientes").delete().in_("id", duplicados_ids).execute()
+
+        st.toast("Clientes unificados com sucesso!", icon="✅")
+        st.rerun()
+    except Exception as err:
+        st.error(f"Erro ao unificar clientes: {err}")
 
 
 def _buscar_resumo_compras():
@@ -226,7 +466,9 @@ def _secao_clientes():
         canais = canais_resp.data or []
         canal_labels = {c["id"]: c["nome"] for c in canais}
 
-        col_nome, col_canal, col_limpar, col_adicionar = st.columns([3.0, 2.0, 1.2, 1.5])
+        col_nome, col_canal, col_limpar, col_unificar, col_adicionar = st.columns(
+            [2.4, 1.7, 1.1, 1.5, 1.5]
+        )
 
         with col_nome:
             filtro_nome = st.text_input(
@@ -239,6 +481,9 @@ def _secao_clientes():
             )
         with col_limpar:
             st.button("Limpar filtros", use_container_width=True, on_click=_limpar_filtros)
+        with col_unificar:
+            if st.button("🔗 Unificar", use_container_width=True, help="Unificar clientes duplicados"):
+                _dialog_unificar_clientes()
         with col_adicionar:
             if st.button("➕ Adicionar cliente", type="secondary", use_container_width=True):
                 _dialog_cliente()

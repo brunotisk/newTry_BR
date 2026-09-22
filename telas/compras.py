@@ -439,7 +439,7 @@ def _secao_listagem():
             .select(
                 "id, numero_nf, data_emissao, valor_produtos, valor_desconto,"
                 " valor_total, chave_acesso, compras_desconto_adicional,"
-                " compras_motivo_desconto"
+                " compras_motivo_desconto, compra_origem"
             )
             .order("data_emissao", desc=True)
             .execute()

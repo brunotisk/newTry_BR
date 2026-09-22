@@ -19,7 +19,8 @@ from telas.compras import tela_compras
 from telas.vendas import tela_vendas
 from telas.clientes import tela_clientes
 from telas.estoque_saldo import tela_estoque_saldo
-from auth import autenticar_usuario, renderizar_usuario_sidebar, renderizar_botao_sair
+from telas.admin import tela_admin
+from auth import autenticar_usuario, renderizar_usuario_sidebar, renderizar_botao_sair, usuario_e_admin
 
 # 2. Trava de Autenticação
 autenticar_usuario()
@@ -172,7 +173,10 @@ PAGINAS = {
     "📈 Relatórios": tela_report,
 }
 
-if "pagina_atual" not in st.session_state:
+if usuario_e_admin():
+    PAGINAS["⚙️ Administração"] = tela_admin
+
+if "pagina_atual" not in st.session_state or st.session_state.pagina_atual not in PAGINAS:
     st.session_state.pagina_atual = list(PAGINAS.keys())[0]
 
 # 4. Sidebar

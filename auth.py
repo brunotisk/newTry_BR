@@ -333,3 +333,16 @@ def renderizar_botao_sair():
 def renderizar_logout_sidebar():
     renderizar_usuario_sidebar()
     renderizar_botao_sair()
+
+
+def usuario_e_admin() -> bool:
+    """Retorna True se o usuário atual possui privilégios de administrador.
+    Permitido quando SKIP_AUTH=True ou quando autenticado com bruno.ishikawa@gmail.com.
+    """
+    if _skip_auth():
+        return True
+    user = st.session_state.get("user")
+    if user and getattr(user, "email", "").strip().lower() == "bruno.ishikawa@gmail.com":
+        return True
+    return False
+

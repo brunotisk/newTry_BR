@@ -20,11 +20,12 @@ data + valor + cliente), são puladas e reportadas no resumo, sem interromper
 a importação das demais.
 """
 from __future__ import annotations
+import uuid
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from io import BytesIO
 
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.formatting.rule import FormulaRule
 from openpyxl.styles import Alignment, Font, PatternFill, Protection
 from openpyxl.utils import get_column_letter
@@ -123,6 +124,33 @@ COLUNAS_MODELO_VENDAS = [
 # Quantidade de linhas vazias preparadas no modelo. É intencionalmente maior
 # que uma importação comum, mas sem deixar o arquivo excessivamente pesado.
 LINHAS_MODELO_VENDAS = 500
+
+# Coluna reservada na aba "Dados de Apoio" para o ID único de controle da
+# planilha (ver `gerar_planilha_modelo_vendas` e `extrair_id_planilha`).
+COLUNA_ID_PLANILHA_APOIO = "L"
+TITULO_ID_PLANILHA = "ID da Planilha (não alterar)"
+
+
+class PlanilhaJaImportadaError(Exception):
+    """Levantada quando a planilha enviada (identificada pelo ID gravado na
+    aba 'Dados de Apoio' no momento da exportação do modelo) já foi
+    importada anteriormente.
+
+    Evita que o mesmo arquivo seja processado duas vezes, mesmo que o
+    usuário reenvie exatamente o mesmo .xlsx que já foi importado antes.
+    """
+
+    def __init__(self, id_planilha: str, importado_em: str | None = None, arquivo: str | None = None):
+        self.id_planilha = id_planilha
+        self.importado_em = importado_em
+        self.arquivo = arquivo
+        partes = ["Esta planilha já foi importada anteriormente"]
+        if importado_em:
+            partes.append(f"em {str(importado_em)[:19].replace('T', ' ')}")
+        if arquivo:
+            partes.append(f"(arquivo: {arquivo})")
+        mensagem = " ".join(partes) + ". Gere uma nova planilha modelo para importar dados adicionais."
+        super().__init__(mensagem)
 
 
 def _consultar_dados_modelo_vendas(sb: Client) -> dict:
@@ -409,6 +437,21 @@ def gerar_planilha_modelo_vendas(sb: Client | None = None) -> bytes:
     apoio.column_dimensions["J"].width = 55
     apoio.row_dimensions[2].height = 45
 
+    # ---------- ID único de controle da planilha ----------
+    # Gerado a cada exportação do modelo. Ao importar, o sistema confere se
+    # esse ID já foi registrado como importado (tabela `planilhas_importadas`)
+    # e bloqueia a reimportação do mesmo arquivo. Fica em coluna oculta,
+    # apenas para controle interno — não é destinado ao preenchimento.
+    id_planilha = str(uuid.uuid4())
+    celula_titulo = apoio[f"{COLUNA_ID_PLANILHA_APOIO}1"]
+    celula_titulo.value = TITULO_ID_PLANILHA
+    celula_titulo.fill = cabecalho_fill
+    celula_titulo.font = cabecalho_font
+    celula_titulo.alignment = Alignment(horizontal="center")
+    apoio[f"{COLUNA_ID_PLANILHA_APOIO}2"] = id_planilha
+    apoio.column_dimensions[COLUNA_ID_PLANILHA_APOIO].width = 38
+    apoio.column_dimensions[COLUNA_ID_PLANILHA_APOIO].hidden = True
+
     # A aba fica visível nesta primeira versão para facilitar o teste. Depois
     # podemos ocultá-la/protegê-la se esse for o comportamento desejado.
     apoio.sheet_view.showGridLines = False
@@ -513,6 +556,40 @@ def ler_planilha(caminho_arquivo) -> pd.DataFrame:
     return df
 
 
+def extrair_id_planilha(caminho_arquivo) -> str | None:
+    """Lê o ID de controle gravado pelo `gerar_planilha_modelo_vendas` na aba
+    'Dados de Apoio'. Retorna None quando a planilha não tem esse ID (ex.:
+    arquivo sem cabeçalho no formato legado, aba de apoio apagada pelo
+    usuário, ou modelo gerado antes desta trava existir) — nesse caso a
+    checagem de reimportação simplesmente não se aplica a essa planilha.
+    """
+    try:
+        wb = load_workbook(caminho_arquivo, data_only=True, read_only=True)
+    except Exception:
+        return None
+
+    if "Dados de Apoio" not in wb.sheetnames:
+        return None
+
+    apoio = wb["Dados de Apoio"]
+    coluna_id = None
+    try:
+        primeira_linha = next(apoio.iter_rows(min_row=1, max_row=1))
+    except StopIteration:
+        return None
+    for cell in primeira_linha:
+        titulo = str(cell.value or "").strip().lower()
+        if titulo.startswith("id da planilha"):
+            coluna_id = cell.column
+            break
+    if coluna_id is None:
+        return None
+
+    valor = apoio.cell(row=2, column=coluna_id).value
+    valor = str(valor).strip() if valor else ""
+    return valor or None
+
+
 def buscar_produto_id(sb: Client, codigo_interno: str) -> int | None:
     resp = (
         sb.table("produtos")
@@ -537,6 +614,52 @@ def venda_ja_existe(sb: Client, produto_id: int, data_venda: str, valor_final: f
         .execute()
     )
     return len(resp.data) > 0
+
+
+def planilha_ja_importada(sb: Client, id_planilha: str) -> dict | None:
+    """Verifica na tabela `planilhas_importadas` se este ID de planilha já
+    foi registrado como importado. Retorna o registro (com data e nome do
+    arquivo, quando disponíveis) ou None se ainda não foi importada.
+
+    Requer a tabela `planilhas_importadas` (id_planilha texto único,
+    importado_em timestamp, arquivo texto, total_linhas inteiro).
+    """
+    if not id_planilha:
+        return None
+    resp = (
+        sb.table("planilhas_importadas")
+        .select("id_planilha, importado_em, arquivo")
+        .eq("id_planilha", id_planilha)
+        .limit(1)
+        .execute()
+    )
+    return resp.data[0] if resp.data else None
+
+
+def registrar_planilha_importada(
+    sb: Client,
+    id_planilha: str,
+    arquivo: str | None = None,
+    total_linhas: int | None = None,
+) -> None:
+    """Registra o ID da planilha como já importado, para bloquear reimportações
+    futuras do mesmo arquivo. Chamada só depois que a importação já gravou
+    ao menos uma venda com sucesso.
+    """
+    if not id_planilha:
+        return
+    try:
+        sb.table("planilhas_importadas").insert({
+            "id_planilha": id_planilha,
+            "arquivo": arquivo,
+            "total_linhas": total_linhas,
+        }).execute()
+    except Exception:
+        # Se o registro já existir (ex.: duas abas importando a mesma
+        # planilha quase ao mesmo tempo), a restrição de unicidade no banco
+        # já garante o bloqueio na próxima tentativa; não há necessidade de
+        # interromper uma importação que já foi concluída por causa disso.
+        pass
 
 
 def obter_ou_criar_lista_id(sb: Client, tabela: str, nome: str) -> int:
@@ -757,6 +880,20 @@ def validar_planilha_vendas(caminho_arquivo, sb: Client | None = None) -> dict:
     if sb is None:
         sb = get_client()
     df = ler_planilha(caminho_arquivo)
+
+    # Trava de reimportação: bloqueia antes mesmo de rodar toda a validação
+    # linha a linha, já que se a planilha inteira já foi importada não há
+    # motivo para prosseguir.
+    id_planilha = extrair_id_planilha(caminho_arquivo)
+    if id_planilha:
+        registro_existente = planilha_ja_importada(sb, id_planilha)
+        if registro_existente:
+            raise PlanilhaJaImportadaError(
+                id_planilha,
+                importado_em=registro_existente.get("importado_em"),
+                arquivo=registro_existente.get("arquivo"),
+            )
+
     dados = consultar_dados_validacao_vendas(sb)
 
     mapas = {
@@ -917,6 +1054,7 @@ def validar_planilha_vendas(caminho_arquivo, sb: Client | None = None) -> dict:
     return {
         "linhas": resultados,
         "cadastros": dados,
+        "id_planilha": id_planilha,
         "total": len(resultados),
         "erros": bloqueios,
         "produtos_nao_cadastrados": sum(1 for x in resultados if x["status_linha"] == "PRODUTO_NAO_CADASTRADO"),
@@ -928,12 +1066,22 @@ def validar_planilha_vendas(caminho_arquivo, sb: Client | None = None) -> dict:
     }
 
 
-def importar_linhas_validadas(linhas: list[dict], sb: Client | None = None) -> dict:
+def importar_linhas_validadas(
+    linhas: list[dict],
+    sb: Client | None = None,
+    id_planilha: str | None = None,
+    nome_arquivo: str | None = None,
+) -> dict:
     """Grava somente as linhas liberadas pela tela de validação.
 
     Produtos sem cadastro, estoque insuficiente, duplicadas e erros de
     cadastro nunca entram neste lote. Clientes novos são criados uma única
     vez e a venda guarda o nome, compatível com o schema atual.
+
+    Quando `id_planilha` é informado (vindo de `validar_planilha_vendas`) e
+    ao menos uma venda é gravada com sucesso, o ID é registrado em
+    `planilhas_importadas` para bloquear uma futura reimportação do mesmo
+    arquivo.
     """
     if sb is None:
         sb = get_client()
@@ -957,7 +1105,13 @@ def importar_linhas_validadas(linhas: list[dict], sb: Client | None = None) -> d
                     if existente:
                         clientes_cache[chave] = existente[0]["id"]
                     else:
-                        criado = sb.table("clientes").insert({"nome": cliente}).execute()
+                        # Cliente novo: além do nome, já grava o canal de
+                        # venda desta linha em `clientes.canal_id`, registrando
+                        # por qual canal esse cliente entrou pela primeira vez.
+                        criado = sb.table("clientes").insert({
+                            "nome": cliente,
+                            "canal_id": item.get("canal_id"),
+                        }).execute()
                         clientes_cache[chave] = criado.data[0]["id"]
                         clientes_criados += 1
 
@@ -981,7 +1135,15 @@ def importar_linhas_validadas(linhas: list[dict], sb: Client | None = None) -> d
         except Exception as exc:
             erros.append(f"Linha {item.get('linha')}: {exc}")
 
-    return {"importadas": importadas, "clientes_criados": clientes_criados, "erros": erros}
+    if id_planilha and importadas > 0:
+        registrar_planilha_importada(sb, id_planilha, arquivo=nome_arquivo, total_linhas=importadas)
+
+    return {
+        "importadas": importadas,
+        "clientes_criados": clientes_criados,
+        "erros": erros,
+        "id_planilha": id_planilha,
+    }
 
 def preparar_linhas_corrigidas_validacao(linhas: list[dict]) -> list[dict]:
     """Converte o resultado da validação em linhas compatíveis com a rotina de importação."""
@@ -1014,6 +1176,16 @@ def importar_vendas_excel(caminho_arquivo) -> dict:
     (duplicado) ou deu erro."""
     df = ler_planilha(caminho_arquivo)
     sb = get_client()
+
+    id_planilha = extrair_id_planilha(caminho_arquivo)
+    if id_planilha:
+        registro_existente = planilha_ja_importada(sb, id_planilha)
+        if registro_existente:
+            raise PlanilhaJaImportadaError(
+                id_planilha,
+                importado_em=registro_existente.get("importado_em"),
+                arquivo=registro_existente.get("arquivo"),
+            )
 
     importadas = 0
     duplicadas = 0
@@ -1060,11 +1232,15 @@ def importar_vendas_excel(caminho_arquivo) -> dict:
         except Exception as e:
             erros.append(f"Linha {numero_linha}: {e}")
 
+    if id_planilha and importadas > 0:
+        registrar_planilha_importada(sb, id_planilha, total_linhas=importadas)
+
     return {
         "total_linhas": len(df),
         "importadas": importadas,
         "duplicadas": duplicadas,
         "erros": erros,
+        "id_planilha": id_planilha,
     }
 
 

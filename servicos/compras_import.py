@@ -21,11 +21,12 @@ from __future__ import annotations
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from decimal import Decimal
-from datetime import datetime
+from datetime import datetime, date
 
 from supabase import Client
 
-from .estoque import registrar_movimento
+from .estoque import registrar_movimento, registrar_ajuste
+from .arquivos_compra import excluir_arquivo_compra
 from .supabase_admin import get_client  # noqa: F401  (re-exportado por conveniência)
 
 # ---------------------------------------------------------------------------
@@ -166,6 +167,7 @@ def inserir_compra(sb: Client, nota: NotaFiscal, fornecedor_id: int) -> int:
         "valor_desconto": float(nota.valor_desconto),
         "valor_total": float(nota.valor_total),
         "xml_original": nota.xml_original,
+        "compra_origem": "Importação XML",
     }).execute()
     return resp.data[0]["id"]
 
@@ -319,7 +321,142 @@ def importar_nfe(caminho_xml: str) -> dict:
     }
 
 
+def excluir_compra(sb: Client, compra_id: int) -> dict:
+    """Exclui uma compra e seus itens, revertendo os impactos no estoque e ledger.
+
+    Etapas executadas:
+      1. Carrega dados da compra e de seus itens em compras_itens.
+      2. Para cada item da compra:
+         - Grava no ledger (estoque_movimentos) um ajuste negativo estornando
+           a quantidade comprada, atualizando estoque.quantidade_atual.
+         - Recalcula produtos.nr_compras, produtos.ultima_compra e
+           estoque.estoque_preco_ultima_compra com base nas demais compras do produto.
+      3. Desvincula o compra_id das movimentações originais em estoque_movimentos (para não violar FK).
+      4. Remove arquivos anexados em compras_arquivos e no Storage.
+      5. Exclui os registros de compras_itens.
+      6. Exclui o registro de compras.
+    """
+    compra_resp = sb.table("compras").select("*").eq("id", compra_id).execute()
+    if not compra_resp.data:
+        raise ValueError(f"Compra #{compra_id} não encontrada.")
+    compra = compra_resp.data[0]
+    numero_nf = compra.get("numero_nf") or "-"
+
+    itens_resp = (
+        sb.table("compras_itens")
+        .select("id, produto_id, quantidade, valor_unitario")
+        .eq("compra_id", compra_id)
+        .execute()
+    )
+    itens = itens_resp.data or []
+
+    produtos_afetados = set()
+    hoje = date.today().isoformat()
+
+    # 1. Estorno de estoque para cada item
+    for item in itens:
+        produto_id = item["produto_id"]
+        quantidade = float(item.get("quantidade") or 0)
+        produtos_afetados.add(produto_id)
+
+        if quantidade > 0:
+            motivo_estorno = (
+                f"Estorno da compra #{compra_id} (NF {numero_nf}) - Exclusão de XML"
+            )
+            registrar_ajuste(
+                sb,
+                produto_id=produto_id,
+                quantidade=-quantidade,
+                motivo=motivo_estorno,
+                data_movimento=hoje,
+            )
+
+    # 2. Recalcula indicadores de compras dos produtos afetados
+    for produto_id in produtos_afetados:
+        outras_resp = (
+            sb.table("compras_itens")
+            .select("valor_unitario, compra_id, compras(data_emissao)")
+            .eq("produto_id", produto_id)
+            .neq("compra_id", compra_id)
+            .execute()
+        )
+        outras = outras_resp.data or []
+
+        if outras:
+            nr_compras_novo = len(outras)
+            outras_ord = sorted(
+                outras,
+                key=lambda x: str((x.get("compras") or {}).get("data_emissao") or ""),
+                reverse=True,
+            )
+            mais_recente = outras_ord[0]
+            data_ult = (
+                str((mais_recente.get("compras") or {}).get("data_emissao") or "")[:10]
+                or None
+            )
+            preco_ult = float(mais_recente.get("valor_unitario") or 0)
+
+            sb.table("produtos").update({
+                "nr_compras": nr_compras_novo,
+                "ultima_compra": data_ult,
+            }).eq("id", produto_id).execute()
+
+            sb.table("estoque").update({
+                "estoque_num_compras": nr_compras_novo,
+                "estoque_ultima_compra": data_ult,
+                "estoque_preco_ultima_compra": preco_ult,
+            }).eq("produto_id", produto_id).execute()
+        else:
+            # Não restaram outras compras deste produto
+            sb.table("produtos").update({
+                "nr_compras": 0,
+                "ultima_compra": None,
+            }).eq("id", produto_id).execute()
+
+            sb.table("estoque").update({
+                "estoque_num_compras": 0,
+                "estoque_ultima_compra": None,
+                "estoque_preco_ultima_compra": None,
+            }).eq("produto_id", produto_id).execute()
+
+    # 3. Desvincula compra_id de estoque_movimentos para preservar histórico
+    sb.table("estoque_movimentos").update({"compra_id": None}).eq(
+        "compra_id", compra_id
+    ).execute()
+
+    # 4. Remove arquivos anexados da compra
+    try:
+        arqs_resp = (
+            sb.table("compras_arquivos")
+            .select("id, caminho_storage")
+            .eq("compra_id", compra_id)
+            .execute()
+        )
+        for arq in (arqs_resp.data or []):
+            try:
+                excluir_arquivo_compra(arq, supabase=sb)
+            except Exception:
+                sb.table("compras_arquivos").delete().eq("id", arq["id"]).execute()
+    except Exception:
+        pass
+
+    # 5. Exclui itens da compra
+    sb.table("compras_itens").delete().eq("compra_id", compra_id).execute()
+
+    # 6. Exclui a compra
+    sb.table("compras").delete().eq("id", compra_id).execute()
+
+    return {
+        "status": "sucesso",
+        "compra_id": compra_id,
+        "numero_nf": numero_nf,
+        "itens_estornados": len(itens),
+        "produtos_afetados": len(produtos_afetados),
+    }
+
+
 if __name__ == "__main__":
     import sys
     resultado = importar_nfe(sys.argv[1])
     print(resultado)
+

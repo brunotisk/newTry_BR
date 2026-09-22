@@ -17,6 +17,7 @@ from servicos.vendas_import import (
     gerar_planilha_modelo_vendas,
     validar_planilha_vendas,
     importar_linhas_validadas,
+    PlanilhaJaImportadaError,
     _normalizar_nome,
 )
 from telas.cadastros_gerais import tela_cadastros_gerais
@@ -391,7 +392,13 @@ def _tela_validacao_importacao():
         if st.button("🔄 Validar novamente", key="validar_importacao_novamente"):
             # Revalida contra o BD, preservando as correções feitas nos dropdowns.
             correcoes = st.session_state.get("vendas_importacao_correcoes", {})
-            resultado_novo = validar_planilha_vendas(st.session_state["vendas_importacao_tmp_path"], supabase)
+            try:
+                resultado_novo = validar_planilha_vendas(st.session_state["vendas_importacao_tmp_path"], supabase)
+            except PlanilhaJaImportadaError as e:
+                st.error(f"🚫 {e}")
+                for chave in ("vendas_importacao_resultado", "vendas_importacao_tmp_path", "vendas_importacao_hash", "vendas_importacao_correcoes", "vendas_importacao_pronta", "vendas_importacao_nome_arquivo"):
+                    st.session_state.pop(chave, None)
+                st.rerun()
             st.session_state["vendas_importacao_resultado"] = resultado_novo
             # Reaplica as correções escolhidas na tela, inclusive os IDs
             # oficiais correspondentes.
@@ -418,7 +425,12 @@ def _tela_validacao_importacao():
     with col_prosseguir:
         if st.button("Prosseguir com importação →", type="primary", disabled=bloqueios > 0, key="prosseguir_importacao"):
             with st.spinner("Importando as linhas válidas e atualizando o estoque..."):
-                resultado_importacao = importar_linhas_validadas(resultado["linhas"], supabase)
+                resultado_importacao = importar_linhas_validadas(
+                    resultado["linhas"],
+                    supabase,
+                    id_planilha=resultado.get("id_planilha"),
+                    nome_arquivo=st.session_state.get("vendas_importacao_nome_arquivo"),
+                )
             if resultado_importacao["erros"]:
                 st.error("A importação terminou com ocorrências:\n" + "\n".join(resultado_importacao["erros"]))
             else:
@@ -426,7 +438,7 @@ def _tela_validacao_importacao():
                     f"Importação concluída: {resultado_importacao['importadas']} venda(s) importada(s) e "
                     f"{resultado_importacao['clientes_criados']} cliente(s) criado(s)."
                 )
-            for chave in ("vendas_importacao_resultado", "vendas_importacao_tmp_path", "vendas_importacao_hash", "vendas_importacao_correcoes", "vendas_importacao_pronta"):
+            for chave in ("vendas_importacao_resultado", "vendas_importacao_tmp_path", "vendas_importacao_hash", "vendas_importacao_correcoes", "vendas_importacao_pronta", "vendas_importacao_nome_arquivo"):
                 st.session_state.pop(chave, None)
             st.rerun()
 
@@ -484,12 +496,16 @@ def _secao_importar():
         try:
             with st.spinner("Consultando os cadastros atuais e validando a planilha..."):
                 resultado = validar_planilha_vendas(tmp_path, supabase)
+        except PlanilhaJaImportadaError as e:
+            st.error(f"🚫 {e}")
+            return
         except Exception as e:
             st.error(f"Não foi possível validar a planilha: {e}")
             return
         st.session_state["vendas_importacao_hash"] = assinatura
         st.session_state["vendas_importacao_tmp_path"] = tmp_path
         st.session_state["vendas_importacao_resultado"] = resultado
+        st.session_state["vendas_importacao_nome_arquivo"] = arquivo.name
         st.session_state.pop("vendas_importacao_pronta", None)
         st.rerun()
 
@@ -933,10 +949,16 @@ def _dialog_editar_venda(
                 st.error("Não foi possível identificar a feira selecionada.")
                 return
 
-        # Garante que o cliente digitado exista na tabela `clientes`.
-        # Para clientes novos, somente `nome` é preenchido.
+        # Garante que o cliente digitado exista na tabela `clientes`. Para
+        # clientes novos, além do nome, já grava o canal e (quando aplicável)
+        # a feira desta venda — assim como na importação por planilha.
         cliente_nome = cliente.strip()
-        _obter_ou_criar_cliente(sb, cliente_nome)
+        _obter_ou_criar_cliente(
+            sb,
+            cliente_nome,
+            canal_id=canal_id,
+            detalhe_feira_id=detalhe_feira_id,
+        )
 
         try:
             data_venda = datetime.strptime(data_venda_texto.strip(), "%d/%m/%Y").date()
@@ -989,11 +1011,20 @@ def _resetar_filtros_vendas():
 
 
 
-def _obter_ou_criar_cliente(sb, nome: str) -> int | None:
+def _obter_ou_criar_cliente(
+    sb,
+    nome: str,
+    canal_id: int | None = None,
+    detalhe_feira_id: int | None = None,
+) -> int | None:
     """Retorna o id do cliente pelo nome ou cria um cliente mínimo.
 
-    Se o usuário digitar um nome que ainda não existe, somente o campo
-    `nome` é preenchido; telefone, canal e datas permanecem nulos.
+    Se o usuário digitar um nome que ainda não existe, o cliente é criado
+    com `nome` e, quando informados, `canal_id` e `detalhe_feira_id` —
+    registrando por qual canal (e feira, se aplicável) esse cliente entrou
+    pela primeira vez. Telefone e datas de nascimento/casamento continuam
+    nulos, pois não são coletados nesta tela. Um cliente já existente nunca
+    tem esses campos sobrescritos aqui.
     """
     nome = (nome or "").strip()
     if not nome:
@@ -1013,8 +1044,14 @@ def _obter_ou_criar_cliente(sb, nome: str) -> int | None:
         if (cliente.get("nome") or "").strip().casefold() == normalizado:
             return cliente["id"]
 
+    dados_novo_cliente = {"nome": nome}
+    if canal_id is not None:
+        dados_novo_cliente["canal_id"] = canal_id
+    if detalhe_feira_id is not None:
+        dados_novo_cliente["detalhe_feira_id"] = detalhe_feira_id
+
     try:
-        resp = sb.table("clientes").insert({"nome": nome}).execute()
+        resp = sb.table("clientes").insert(dados_novo_cliente).execute()
         return resp.data[0]["id"] if resp.data else None
     except Exception as e:
         # O índice único lower(trim(nome)) também protege contra corrida
