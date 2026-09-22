@@ -78,12 +78,12 @@ def _eh_ajuste_manual(movimento):
 
 
 def _carregar_ajustes():
-    """Carrega os ajustes manuais diretamente de estoque_movimentos."""
+    """Carrega os ajustes de estoque, manuais e automáticos, diretamente do ledger."""
     resposta = (
         supabase.table("estoque_movimentos")
         .select(
             "id, produto_id, tipo, quantidade, saldo_apos, data_movimento, "
-            "criado_em, venda_id, compra_id, motivo"
+            "criado_em, venda_id, compra_id, motivo, realizado_por"
         )
         .eq("tipo", "ajuste")
         .is_("venda_id", "null")
@@ -92,7 +92,7 @@ def _carregar_ajustes():
         .order("id", desc=True)
         .execute()
     )
-    ajustes = [m for m in (resposta.data or []) if _eh_ajuste_manual(m)]
+    ajustes = list(resposta.data or [])
 
     produto_ids = list({a.get("produto_id") for a in ajustes if a.get("produto_id") is not None})
     produtos = {}
@@ -111,6 +111,9 @@ def _carregar_ajustes():
         ajuste["_tipo_exibicao"] = _tipo_exibicao(ajuste)
         ajuste["_quantidade_assinada"] = _signed_quantidade(ajuste)
         ajuste["_data_exibicao"] = _campo_data(ajuste)
+        # Registros antigos sem o campo preenchido são considerados manuais.
+        realizado_por = str(ajuste.get("realizado_por") or "").strip()
+        ajuste["_realizado_por"] = realizado_por or "Manual"
 
     return ajustes
 
@@ -137,6 +140,7 @@ def _alterar_estoque_e_movimento(sb, produto_id, delta, data_movimento):
             "quantidade": float(delta),
             "saldo_apos": novo_saldo,
             "data_movimento": data_movimento,
+            "realizado_por": "Manual",
         }
     ).execute()
 
@@ -220,6 +224,7 @@ def _atualizar_ajuste(ajuste, produto_id_novo, signed_novo, data_nova, descricao
         "venda_id": None,
         "compra_id": None,
         "motivo": descricao_ajuste.strip() or None,
+        "realizado_por": "Manual",
     }
     sb.table("estoque_movimentos").update(payload).eq("id", ajuste_id).execute()
 
@@ -421,30 +426,76 @@ def _secao_listagem():
     pagina_ajustes = ajustes[inicio:inicio + itens_por_pagina]
 
     with st.container(border=True):
-        c_data, c_tipo, c_codigo, c_produto, c_qtd, c_acoes = st.columns(
-            [1.2, 1.2, 1.2, 2.8, 0.9, 0.8]
+        c_data, c_tipo, c_realizado, c_codigo, c_motivo, c_qtd, c_acoes = st.columns(
+            [1.1, 1.15, 1.15, 1.25, 3.0, 0.9, 0.8]
         )
         c_data.markdown("**Data**")
         c_tipo.markdown("**Tipo**")
-        c_codigo.markdown("**Código**")
-        c_produto.markdown("**Produto**")
-        c_qtd.markdown("**Qtd**")
+        c_realizado.markdown("**Realizado**")
+        c_codigo.markdown("**Cod. Produto**")
+        c_motivo.markdown("**Motivo**")
+        c_qtd.markdown("**Qtd.**")
         c_acoes.markdown("**Ações**")
         st.divider()
 
         for ajuste in pagina_ajustes:
-            col_data, col_tipo, col_codigo, col_produto, col_qtd, col_acoes = st.columns(
-                [1.2, 1.2, 1.2, 2.8, 0.9, 0.8]
+            col_data, col_tipo, col_realizado, col_codigo, col_motivo, col_qtd, col_acoes = st.columns(
+                [1.1, 1.15, 1.15, 1.25, 3.0, 0.9, 0.8],
+                vertical_alignment="center",
             )
+
+            # Data
             col_data.write(str(ajuste.get("_data_exibicao") or "-")[:10])
-            col_tipo.write(ajuste["_tipo_exibicao"])
+
+            # Tipo com indicação visual
+            signed = ajuste["_quantidade_assinada"]
+            tipo_texto = "Retirada" if signed < 0 else "Adição"
+            tipo_icone = "🔴" if signed < 0 else "🟢"
+            col_tipo.markdown(f"{tipo_icone} {tipo_texto}")
+
+            # Realizado: automático em amarelo; manual sem fundo.
+            realizado = ajuste.get("_realizado_por") or "Manual"
+            if str(realizado).strip().casefold() == "automático":
+                col_realizado.markdown(
+                    '<span style="display:inline-block;padding:4px 9px;'
+                    'border-radius:6px;background:rgba(254,243,199,0.50);color:#92400e;'
+                    'font-weight:600;">Automático</span>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                col_realizado.write("Manual")
 
             produto = ajuste.get("_produto") or {}
             col_codigo.write(produto.get("codigo_interno") or "-")
-            col_produto.write(produto.get("descricao") or "-")
-            col_qtd.write(_fmt_qtd(abs(ajuste["_quantidade_assinada"])))
+            col_motivo.write(ajuste.get("motivo") or "-")
 
-            if col_acoes.button(
+            # Qtd. com sinal e fundo conforme o efeito no estoque.
+            qtd_txt = f"{signed:+g}"
+            if signed < 0:
+                col_qtd.markdown(
+                    f'<span style="display:inline-block;padding:4px 9px;'
+                    f'border-radius:6px;background:rgba(254,226,226,0.50);color:#991b1b;'
+                    f'font-weight:700;">{qtd_txt}</span>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                col_qtd.markdown(
+                    f'<span style="display:inline-block;padding:4px 9px;'
+                    f'border-radius:6px;background:#dcfce7;color:#166534;'
+                    f'font-weight:700;">{qtd_txt}</span>',
+                    unsafe_allow_html=True,
+                )
+
+            # Ajustes automáticos não podem ser editados.
+            if str(realizado).strip().casefold() == "automático":
+                col_acoes.button(
+                    "🔒",
+                    key=f"editar_bloqueado_ajuste_{ajuste.get('id')}",
+                    help="Ajustes automáticos não podem ser editados.",
+                    disabled=True,
+                    use_container_width=True,
+                )
+            elif col_acoes.button(
                 "✏️",
                 key=f"editar_ajuste_{ajuste.get('id')}",
                 help="Editar ajuste",

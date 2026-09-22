@@ -50,3 +50,7 @@ Descrição: criação da tabela planilhas_importadas para controle da importaç
 **Arquivo**: migrations/008_Alterar_unicidade_clientes_nome_canal.sql
 Data: 21/09/2026
 Descrição: alteração da regra de unicidade da tabela public.clientes, removendo a restrição anterior baseada somente no nome e criando um índice único considerando o nome normalizado e o canal_id, permitindo que clientes com o mesmo nome existam em canais diferentes.
+
+**Arquivo**: migrations/009_Adicionar_desconto_item_compras.sql
+Data: 21/09/2026
+Descrição: inclusão dos campos pct_desconto_item na tabela public.compras, valor_unit_ajustado na tabela public.compras_itens e estoque_flag_pct_desconto_item na tabela public.estoque, com valor padrão false para o controle de desconto percentual nos itens de compra.
