@@ -14,6 +14,7 @@ Projeto: **Projeto AC**
 | 006    | Adicionar cliente_id venda            | ✅ Aplicada     | ✅ Aplicada  |
 | 007    | Criar planilhas_importadas            | ✅ Aplicada     | ✅ Aplicada  |
 | 008    | Alterar unicidade clientes nome canal | ✅ Aplicada     | ✅ Aplicada  |
+| 009    | Adicionar campos - des e valor unit.  | ✅ Aplicada     | ⬜ Pendente  |
 ------------------------------------------------------------------------------------
 
 
