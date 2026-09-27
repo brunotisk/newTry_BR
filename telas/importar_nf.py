@@ -1,5 +1,9 @@
 import streamlit as st
-from servicos.compras_import import parse_nfe_string, importar_nfe
+from servicos.compras_import import (
+    parse_nfe_string,
+    importar_nfe,
+    ErroValidacaoImportacao,
+)
 import tempfile
 
 
@@ -19,7 +23,7 @@ def tela_importar_nf():
         st.dataframe(
             [{"Código": i.codigo_interno, "Produto": i.descricao, "Qtd": float(i.quantidade),
               "Valor unit.": float(i.valor_unitario)} for i in nota.itens],
-            use_container_width=True,   
+            use_container_width=True,
         )
 
         if st.button("Confirmar e importar", type="primary"):
@@ -27,11 +31,29 @@ def tela_importar_nf():
                 tmp.write(conteudo)
                 tmp_path = tmp.name
 
-            with st.spinner("Importando..."):
-                resultado = importar_nfe(tmp_path)
+            try:
+                with st.spinner("Validando e importando a NF-e..."):
+                    resultado = importar_nfe(tmp_path)
 
-            if resultado["status"] == "ja_importada":
-                st.warning(f"Essa nota (chave {resultado['chave_acesso']}) já tinha sido importada antes. Nada foi duplicado.")
-            else:
-                st.success(f"Importado! {resultado['itens_processados']} itens processados, "
-                           f"compra #{resultado['compra_id']} registrada, estoque atualizado.")
+                if resultado["status"] == "ja_importada":
+                    st.warning(
+                        f"Essa nota (chave {resultado['chave_acesso']}) já tinha sido "
+                        "importada antes. Nada foi duplicado."
+                    )
+                else:
+                    st.success(
+                        f"Importado! {resultado['itens_processados']} itens processados, "
+                        f"compra #{resultado['compra_id']} registrada, estoque atualizado."
+                    )
+            except ErroValidacaoImportacao as exc:
+                st.error(
+                    "A NF-e não foi importada porque foram encontrados problemas "
+                    "antes da gravação:"
+                )
+                st.code(str(exc), language="text")
+            except Exception as exc:
+                st.error(
+                    "A importação falhou. O sistema tentou desfazer as alterações "
+                    "realizadas durante a tentativa. Nenhum cabeçalho parcial deve permanecer."
+                )
+                st.exception(exc)

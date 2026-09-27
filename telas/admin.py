@@ -104,11 +104,18 @@ def _secao_exclusao_compras():
         return
 
     if not itens:
-        st.warning("Esta compra não possui itens vinculados.")
-        return
-
-    # Consulta saldos em estoque dos produtos afetados
-    produto_ids = [it["produto_id"] for it in itens]
+        # Compras órfãs/incompletas podem existir quando uma importação foi
+        # interrompida depois da criação do cabeçalho e antes da gravação dos itens.
+        # Nesse caso não há estoque a estornar, mas o cabeçalho deve continuar
+        # podendo ser excluído pela rotina administrativa.
+        st.warning(
+            "Esta compra não possui itens vinculados. Nenhum estoque será estornado; "
+            "a exclusão removerá apenas o cabeçalho (e eventuais anexos/movimentos vinculados)."
+        )
+        produto_ids = []
+    else:
+        # Consulta saldos em estoque dos produtos afetados
+        produto_ids = [it["produto_id"] for it in itens]
     saldos_atuais = {}
     if produto_ids:
         try:
@@ -153,7 +160,9 @@ def _secao_exclusao_compras():
 
     st.markdown("#### Prévia de Impacto no Estoque")
 
-    if tem_negativo:
+    if not itens:
+        st.info("Sem itens vinculados: não haverá alteração de saldo de estoque.")
+    elif tem_negativo:
         st.warning(
             "⚠️ **Atenção:** Um ou mais produtos ficarão com **saldo de estoque negativo**. "
             "Isso significa que já houve saídas ou vendas registradas para esses itens após a importação desta compra."
@@ -165,12 +174,19 @@ def _secao_exclusao_compras():
 
     # Confirmação e ação de exclusão
     st.markdown("#### Confirmar Exclusão Definitiva")
-    st.write(
-        "Ao confirmar, o sistema irá:  \n"
-        "1. Gravar movimentos de ajuste no ledger estornando a quantidade de cada produto.  \n"
-        "2. Recalcular os dados de última compra e número de compras dos produtos afetados.  \n"
-        "3. Excluir anexos vinculados e remover o registro da compra e de seus itens."
-    )
+    if itens:
+        st.write(
+            "Ao confirmar, o sistema irá:  \n"
+            "1. Gravar movimentos de ajuste no ledger estornando a quantidade de cada produto.  \n"
+            "2. Recalcular os dados de última compra e número de compras dos produtos afetados.  \n"
+            "3. Excluir anexos vinculados e remover o registro da compra e de seus itens."
+        )
+    else:
+        st.write(
+            "Ao confirmar, o sistema irá remover os anexos vinculados, eventuais "
+            "movimentos vinculados e o cabeçalho da compra. Como não há itens, "
+            "nenhum ajuste de estoque será realizado."
+        )
 
     nf_esperada = str(compra.get("numero_nf") or "").strip()
     col_conf, col_btn = st.columns([1.5, 1])
@@ -187,7 +203,7 @@ def _secao_exclusao_compras():
         st.write("")  # Espaçamento vertical
         st.write("")
         if st.button(
-            "🗑️ Excluir Compra e Estornar Estoque",
+            "🗑️ Excluir Compra e Estornar Estoque" if itens else "🗑️ Excluir Compra sem Itens",
             type="primary",
             disabled=not pode_excluir,
             use_container_width=True,

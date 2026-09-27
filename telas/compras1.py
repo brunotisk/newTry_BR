@@ -607,58 +607,28 @@ def _secao_listagem():
         compras = response.data or []
 
         # 2. Identifica quais compras possuem arquivos anexados, e conta os
-        #    itens por compra — ambas via IN(), buscadas em LOTES pequenos e
-        #    PAGINADAS. Isso evita estourar o limite de URL/parâmetros quando
-        #    há muitas compras e, principalmente, evita perder itens quando
-        #    o limite máximo de linhas do PostgREST é menor que a quantidade
-        #    total de registros.
-        def _buscar_em_lotes(
-            tabela: str,
-            coluna_filtro: str,
-            valores: list,
-            colunas_select: str,
-            tamanho_lote: int = 200,
-            tamanho_pagina: int = 1000,
-        ) -> list[dict]:
-            """Busca registros em lotes e pagina cada lote até esgotar os dados.
-
-            O limite máximo de linhas configurado no PostgREST/Supabase pode ser
-            menor que o `.limit(50000)` solicitado pelo cliente. Sem paginação,
-            isso fazia algumas compras aparecerem com zero itens quando seus
-            registros ficavam além da primeira página retornada.
-            """
+        #    itens por compra — ambas via IN(), buscadas em LOTES pequenos
+        #    (em vez de um único IN() com todos os IDs de uma vez). Isso
+        #    evita estourar o limite de URL/parâmetros da consulta quando há
+        #    muitas compras, e reporta o erro de verdade na tela em vez de
+        #    engolir silenciosamente (o que fazia a coluna "Itens" mostrar 0
+        #    sem nenhuma pista do motivo real).
+        def _buscar_em_lotes(tabela: str, coluna_filtro: str, valores: list, colunas_select: str, tamanho_lote: int = 200) -> list[dict]:
             linhas: list[dict] = []
-
             for inicio in range(0, len(valores), tamanho_lote):
                 lote = valores[inicio:inicio + tamanho_lote]
-                numero_lote = inicio // tamanho_lote + 1
-                offset = 0
-
                 try:
-                    while True:
-                        fim = offset + tamanho_pagina - 1
-                        resp = (
-                            supabase.table(tabela)
-                            .select(colunas_select)
-                            .in_(coluna_filtro, lote)
-                            .range(offset, fim)
-                            .execute()
-                        )
-                        dados_pagina = resp.data or []
-                        linhas.extend(dados_pagina)
-
-                        # Menos que o tamanho da página significa que não há
-                        # mais registros para este lote.
-                        if len(dados_pagina) < tamanho_pagina:
-                            break
-
-                        offset += tamanho_pagina
-                except Exception as err:
-                    st.warning(
-                        f"Erro ao consultar {tabela} (lote {numero_lote}, "
-                        f"a partir da linha {offset}): {err}"
+                    resp = (
+                        supabase.table(tabela)
+                        .select(colunas_select)
+                        .in_(coluna_filtro, lote)
+                        .limit(50000)
+                        .execute()
                     )
-
+                    linhas.extend(resp.data or [])
+                except Exception as err:
+                    numero_lote = inicio // tamanho_lote + 1
+                    st.warning(f"Erro ao consultar {tabela} (lote {numero_lote}): {err}")
             return linhas
 
         compras_com_arquivos: set[int] = set()

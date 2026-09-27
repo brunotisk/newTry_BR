@@ -296,29 +296,256 @@ def inserir_item_e_atualizar_estoque(sb: Client, compra_id: int, produto_id: int
     _sincronizar_estoque_pos_compra(sb, produto_id, item.valor_unitario, data_movimento)
 
 
+class ErroValidacaoImportacao(Exception):
+    """Erro de validação antes de qualquer gravação da NF-e."""
+
+
+def _validar_nota_antes_de_gravar(sb: Client, nota: NotaFiscal) -> None:
+    """Valida a NF-e inteira antes de criar o cabeçalho.
+
+    Regra principal: nenhum registro de compra, item, produto ou estoque é
+    gravado enquanto a nota inteira não passar pela validação.
+    """
+    erros = []
+
+    if not nota.chave_acesso:
+        erros.append("A NF-e não possui chave de acesso.")
+    if not nota.numero_nf:
+        erros.append("A NF-e não possui número.")
+    if not nota.fornecedor_cnpj:
+        erros.append("A NF-e não possui CNPJ do fornecedor.")
+    if not nota.itens:
+        erros.append("A NF-e não possui itens para importar.")
+
+    numeros_itens = set()
+    for item in nota.itens:
+        prefixo = f"Item {item.numero_item}"
+        if item.numero_item in numeros_itens:
+            erros.append(f"{prefixo}: número do item duplicado no XML.")
+        numeros_itens.add(item.numero_item)
+
+        if not item.codigo_interno or not str(item.codigo_interno).strip():
+            erros.append(f"{prefixo}: código interno (cProd) não informado.")
+        if item.quantidade is None or item.quantidade <= 0:
+            erros.append(f"{prefixo}: quantidade deve ser maior que zero.")
+        if item.valor_unitario is None or item.valor_unitario < 0:
+            erros.append(f"{prefixo}: valor unitário inválido.")
+        if item.valor_total is None or item.valor_total < 0:
+            erros.append(f"{prefixo}: valor total inválido.")
+
+    # Não consultamos apenas o cabeçalho. Se a mesma chave já existir,
+    # verificamos se há itens para distinguir uma importação completa de um
+    # cabeçalho órfão deixado por uma tentativa anterior.
+    if nota.chave_acesso:
+        compra_resp = (
+            sb.table("compras")
+            .select("id")
+            .eq("chave_acesso", nota.chave_acesso)
+            .execute()
+        )
+        if compra_resp.data:
+            compra_existente_id = compra_resp.data[0]["id"]
+            itens_existentes = (
+                sb.table("compras_itens")
+                .select("id", count="exact")
+                .eq("compra_id", compra_existente_id)
+                .execute()
+            )
+            qtd_itens = itens_existentes.count or 0
+            if qtd_itens > 0:
+                erros.append(
+                    f"A NF-e já está importada (compra #{compra_existente_id}, "
+                    f"com {qtd_itens} item(ns))."
+                )
+            else:
+                erros.append(
+                    f"Existe um cabeçalho órfão da NF-e (compra #{compra_existente_id}) "
+                    "sem itens. Exclua essa compra antes de importar novamente."
+                )
+
+    if erros:
+        raise ErroValidacaoImportacao("\n".join(f"• {erro}" for erro in erros))
+
+
+def _capturar_estado_antes_da_importacao(sb: Client, nota: NotaFiscal) -> dict:
+    """Captura somente os registros que poderão ser alterados pelo pipeline.
+
+    Esse snapshot permite desfazer a operação se alguma gravação posterior
+    falhar. O Supabase REST não oferece uma transação multi-request aqui, então
+    usamos rollback compensatório como segunda linha de proteção.
+    """
+    codigos = list(dict.fromkeys(item.codigo_interno for item in nota.itens if item.codigo_interno))
+
+    produtos = []
+    if codigos:
+        produtos_resp = (
+            sb.table("produtos")
+            .select("*")
+            .in_("codigo_interno", codigos)
+            .execute()
+        )
+        produtos = produtos_resp.data or []
+
+    produto_ids = [p["id"] for p in produtos]
+    estoque = []
+    if produto_ids:
+        estoque_resp = (
+            sb.table("estoque")
+            .select("*")
+            .in_("produto_id", produto_ids)
+            .execute()
+        )
+        estoque = estoque_resp.data or []
+
+    fornecedor_resp = (
+        sb.table("fornecedores")
+        .select("*")
+        .eq("cnpj", nota.fornecedor_cnpj)
+        .execute()
+    )
+
+    return {
+        "produtos": produtos,
+        "estoque": estoque,
+        "fornecedor": (fornecedor_resp.data[0] if fornecedor_resp.data else None),
+    }
+
+
+def _rollback_importacao(sb: Client, compra_id: int | None, snapshot: dict, produto_ids_criados: list[int]) -> None:
+    """Desfaz uma importação que falhou depois de iniciar as gravações."""
+    # Primeiro removemos os movimentos ligados à compra e restauramos o saldo
+    # do estoque. Isso evita deixar movimento de entrada de uma compra que não
+    # chegou a ser concluída.
+    movimentos = []
+    if compra_id is not None:
+        mov_resp = (
+            sb.table("estoque_movimentos")
+            .select("id, produto_id")
+            .eq("compra_id", compra_id)
+            .execute()
+        )
+        movimentos = mov_resp.data or []
+
+    estoque_anterior = {row["produto_id"]: row for row in snapshot.get("estoque", [])}
+    produtos_atuais_ids = set()
+    for movimento in movimentos:
+        produto_id = movimento["produto_id"]
+        anterior = estoque_anterior.get(produto_id)
+        if anterior:
+            sb.table("estoque").update(anterior).eq("produto_id", produto_id).execute()
+        else:
+            sb.table("estoque").delete().eq("produto_id", produto_id).execute()
+
+    if compra_id is not None:
+        sb.table("estoque_movimentos").delete().eq("compra_id", compra_id).execute()
+        sb.table("compras_itens").delete().eq("compra_id", compra_id).execute()
+        sb.table("compras").delete().eq("id", compra_id).execute()
+
+    # Restaura os produtos que já existiam antes da tentativa.
+    for produto in snapshot.get("produtos", []):
+        pid = produto["id"]
+        produtos_atuais_ids.add(pid)
+        sb.table("produtos").update(produto).eq("id", pid).execute()
+
+    # Produtos criados exclusivamente por esta NF são removidos após os itens
+    # e movimentos terem sido apagados. Se algum deles já tiver outra referência,
+    # mantemos o registro para não apagar dados legítimos.
+    for produto_id in produto_ids_criados:
+        if produto_id in produtos_atuais_ids:
+            continue
+        try:
+            sb.table("estoque").delete().eq("produto_id", produto_id).execute()
+            sb.table("produtos").delete().eq("id", produto_id).execute()
+        except Exception:
+            # Não mascarar o erro original se houver uma referência externa.
+            pass
+
+    # Restaura o estoque dos produtos que existiam antes, inclusive quando não
+    # houve movimento registrado porque a falha ocorreu antes do ledger.
+    for row in snapshot.get("estoque", []):
+        sb.table("estoque").upsert(row, on_conflict="produto_id").execute()
+
+    # Se o fornecedor foi criado durante a tentativa, remove-o somente se ainda
+    # não estiver sendo usado por outra compra.
+    fornecedor_anterior = snapshot.get("fornecedor")
+    if fornecedor_anterior is None:
+        try:
+            fornecedor_resp = (
+                sb.table("fornecedores")
+                .select("id")
+                .eq("cnpj", snapshot.get("fornecedor_cnpj", ""))
+                .execute()
+            )
+            if fornecedor_resp.data:
+                fid = fornecedor_resp.data[0]["id"]
+                compras_ref = (
+                    sb.table("compras")
+                    .select("id", count="exact")
+                    .eq("fornecedor_id", fid)
+                    .execute()
+                )
+                if (compras_ref.count or 0) == 0:
+                    sb.table("fornecedores").delete().eq("id", fid).execute()
+        except Exception:
+            pass
+
+
 def importar_nfe(caminho_xml: str) -> dict:
-    """Roda o pipeline completo. Retorna um resumo do que foi feito."""
+    """Importa uma NF-e somente depois de validar todos os itens.
+
+    O pipeline segue duas fases:
+      1. Parse + validação completa, sem gravações.
+      2. Persistência: fornecedor, cabeçalho, produtos, itens, estoque e
+         movimentos.
+
+    Se qualquer etapa da fase 2 falhar, é executado rollback compensatório para
+    evitar que o cabeçalho ou alterações parciais permaneçam no banco.
+    """
     nota = parse_nfe_file(caminho_xml)
     sb = get_client()
 
-    if nota_ja_importada(sb, nota.chave_acesso):
-        return {"status": "ja_importada", "chave_acesso": nota.chave_acesso}
+    # FASE 1 — absolutamente nenhuma gravação antes daqui terminar.
+    _validar_nota_antes_de_gravar(sb, nota)
+    snapshot = _capturar_estado_antes_da_importacao(sb, nota)
+    snapshot["fornecedor_cnpj"] = nota.fornecedor_cnpj
 
-    fornecedor_id = upsert_fornecedor(sb, nota)
-    compra_id = inserir_compra(sb, nota, fornecedor_id)
+    compra_id = None
+    produto_ids_criados = []
 
-    for item in nota.itens:
-        # Passa a data da nota para calcular ultima_compra e nr_compras
-        produto_id = upsert_produto(sb, item, nota.data_emissao)
-        inserir_item_e_atualizar_estoque(sb, compra_id, produto_id, item, nota.data_emissao)
+    try:
+        # FASE 2 — persistência.
+        fornecedor_id = upsert_fornecedor(sb, nota)
+        compra_id = inserir_compra(sb, nota, fornecedor_id)
 
-    return {
-        "status": "importado",
-        "chave_acesso": nota.chave_acesso,
-        "compra_id": compra_id,
-        "itens_processados": len(nota.itens),
-        "valor_total": str(nota.valor_total),
-    }
+        for item in nota.itens:
+            # Se o produto já existia, upsert_produto atualiza seus indicadores.
+            # Se não existia, ele é criado e guardamos o id para rollback.
+            produto_id = upsert_produto(sb, item, nota.data_emissao)
+
+            ids_anteriores = {p["id"] for p in snapshot.get("produtos", [])}
+            if produto_id not in ids_anteriores:
+                produto_ids_criados.append(produto_id)
+
+            inserir_item_e_atualizar_estoque(
+                sb, compra_id, produto_id, item, nota.data_emissao
+            )
+
+        return {
+            "status": "importado",
+            "chave_acesso": nota.chave_acesso,
+            "compra_id": compra_id,
+            "itens_processados": len(nota.itens),
+            "valor_total": str(nota.valor_total),
+        }
+
+    except Exception:
+        try:
+            _rollback_importacao(sb, compra_id, snapshot, produto_ids_criados)
+        except Exception:
+            # O erro original é mais útil para diagnóstico; o rollback é uma
+            # tentativa de limpeza e não deve mascará-lo.
+            pass
+        raise
 
 
 def excluir_compra(sb: Client, compra_id: int) -> dict:
