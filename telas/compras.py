@@ -74,6 +74,28 @@ def _badge_clipe_arquivos() -> str:
     )
 
 
+def _badge_pct_desconto(pct_desconto_item) -> str:
+    """Indicador de 'NF possui % de desconto dos itens salvo' (pct_desconto_item
+    > 0): um ícone de percentual discreto ao lado do número da NF, no mesmo
+    estilo do clipe de arquivos."""
+    pct = float(pct_desconto_item or 0)
+    if pct <= 0:
+        return ""
+    return (
+        f'<span title="Esta NF possui % de desconto dos itens: {pct:g}%." '
+        'style="display:inline-flex;align-items:center;margin-left:6px;'
+        'vertical-align:middle;color:#34d399;">'
+        '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" '
+        'stroke="currentColor" stroke-width="2.4" stroke-linecap="round" '
+        'stroke-linejoin="round">'
+        '<line x1="19" y1="5" x2="5" y2="19"/>'
+        '<circle cx="6.5" cy="6.5" r="2.5"/>'
+        '<circle cx="17.5" cy="17.5" r="2.5"/>'
+        '</svg>'
+        '</span>'
+    )
+
+
 def _badge_tipo_arquivo(tipo: str) -> str:
     """Selo colorido para o tipo do arquivo (PDF/XML) na lista de anexados."""
     tipo_norm = (tipo or "-").upper()
@@ -88,6 +110,14 @@ def _badge_tipo_arquivo(tipo: str) -> str:
     )
 
 
+def _manter_dialog_aberto(tipo: str, compra_id: int, **extra):
+    """Guarda no session_state qual diálogo deve continuar aberto no próximo
+    rerun. Sem isso, qualquer st.rerun() disparado por um botão DENTRO do
+    diálogo derruba o popup, pois o script inteiro roda de novo e o botão
+    que originalmente abriu o diálogo não está mais "clicado"."""
+    st.session_state["_compras_dialog"] = {"tipo": tipo, "compra_id": compra_id, **extra}
+
+
 @_dialog("📦 Itens da compra", width="large")
 def _dialog_itens_compra(compra: dict, produto_id: int | None = None):
     # Alarga o popup para acomodar a visualização detalhada
@@ -98,16 +128,26 @@ def _dialog_itens_compra(compra: dict, produto_id: int | None = None):
             max-width: 1180px !important;
             width: 94vw !important;
         }
+        .btn-popover-desc div[data-testid="stPopover"] {
+            overflow: visible !important;
+        }
+        .btn-popover-desc div[data-testid="stPopover"] > div {
+            overflow: visible !important;
+        }
         .btn-popover-desc div[data-testid="stPopover"] button {
-            padding: 2px 4px !important;
-            min-height: 26px !important;
-            height: 26px !important;
+            padding: 2px 6px !important;
+            min-height: 30px !important;
+            height: 30px !important;
+            min-width: 32px !important;
+            width: auto !important;
             border: 1px solid rgba(255, 255, 255, 0.2) !important;
             background: transparent !important;
             display: inline-flex !important;
             align-items: center !important;
             justify-content: center !important;
             border-radius: 4px !important;
+            overflow: visible !important;
+            line-height: normal !important;
         }
         .btn-popover-desc div[data-testid="stPopover"] button svg {
             display: none !important;
@@ -115,8 +155,10 @@ def _dialog_itens_compra(compra: dict, produto_id: int | None = None):
         .btn-popover-desc div[data-testid="stPopover"] button p {
             margin: 0 !important;
             padding: 0 !important;
-            font-size: 0.95rem !important;
-            line-height: 1 !important;
+            font-size: 1rem !important;
+            line-height: normal !important;
+            overflow: visible !important;
+            white-space: nowrap !important;
         }
         </style>
         """,
@@ -174,14 +216,68 @@ def _dialog_itens_compra(compra: dict, produto_id: int | None = None):
     chave_vis = f"visualizar_ajuste_{compra_id}"
     exibir_ajustado = itens_com_ajuste or st.session_state.get(chave_vis, False)
 
-    # Linha superior: Subtítulo à esquerda e botões de ação à direita
-    col_sub, col_botoes = st.columns([1.3, 1.7], vertical_alignment="center")
+    # Linha superior: Subtítulo à esquerda, botão de reverter logo à direita
+    # dele (sem sobrepor o texto), botões de ação de cálculo mais à direita,
+    # e por fim um "Fechar" explícito — necessário porque o "X" nativo do
+    # popup só fecha visualmente: ele não limpa o session_state que mantém
+    # este diálogo marcado como "aberto", e por isso o popup voltava a
+    # aparecer sozinho ao navegar de volta para a tela de Compras.
+    col_sub, col_revert, col_botoes, col_fechar = st.columns(
+        [1.3, 0.9, 1.3, 0.5], vertical_alignment="center"
+    )
+
+    with col_fechar:
+        if st.button("✖ Fechar", key=f"fechar_itens_{compra_id}", use_container_width=True):
+            st.session_state.pop("_compras_dialog", None)
+            st.rerun()
 
     with col_sub:
         rotulo_sub = f"NF nº {compra_dados.get('numero_nf') or '-'} — Chave: {compra_dados.get('chave_acesso') or '-'}"
         if pct_desconto > 0:
             rotulo_sub += f" | **Desconto:** {pct_desconto:g}%"
         st.caption(rotulo_sub)
+
+    with col_revert:
+        if exibir_ajustado:
+            if st.button(
+                "↩️ Retornar ao Original",
+                key=f"btn_revert_ajuste_{compra_id}",
+                help=(
+                    "Reverte o Vlr. Unit. Ajust. dos itens, zera o % de desconto "
+                    "da NF e desfaz o 'Aplicar Valor Sugerido' no estoque (flag "
+                    "e preço sugerido)."
+                ),
+                use_container_width=True,
+            ):
+                with st.spinner("Revertendo valores ao original..."):
+                    for it in itens:
+                        supabase.table("compras_itens").update(
+                            {"valor_unit_ajustado": 0}
+                        ).eq("id", it["id"]).execute()
+                        it["valor_unit_ajustado"] = 0
+
+                        # Desfaz também o que "Aplicar Valor Sugerido" gravou
+                        # no estoque para o produto deste item: o preço
+                        # sugerido original é 2x o valor unitário de compra.
+                        produto_id_item = it.get("produto_id")
+                        if produto_id_item:
+                            v_unit_original = float(it.get("valor_unitario") or 0)
+                            supabase.table("estoque").update({
+                                "estoque_flag_pct_desconto_item": False,
+                                "estoque_preco_venda_sugerida": round(v_unit_original * 2, 2),
+                            }).eq("produto_id", produto_id_item).execute()
+
+                    st.session_state[chave_vis] = False
+
+                    # Zera também o % de desconto dos itens salvo para a NF.
+                    supabase.table("compras").update(
+                        {"pct_desconto_item": 0}
+                    ).eq("id", compra_id).execute()
+                    st.success(
+                        "Valores revertidos ao original (itens, % desconto e estoque)!"
+                    )
+                    _manter_dialog_aberto("itens", compra_id, produto_id=produto_id)
+                    st.rerun()
 
     with col_botoes:
         if pct_desconto > 0:
@@ -210,6 +306,7 @@ def _dialog_itens_compra(compra: dict, produto_id: int | None = None):
                             it["valor_unit_ajustado"] = v_ajust
                         st.session_state[chave_vis] = True
                         st.success(f"Valores de lista calculados com desconto de {rotulo_pct_fmt}!")
+                        _manter_dialog_aberto("itens", compra_id, produto_id=produto_id)
                         st.rerun()
 
                 if b2.button(
@@ -235,6 +332,7 @@ def _dialog_itens_compra(compra: dict, produto_id: int | None = None):
                             }).eq("produto_id", it["produto_id"]).execute()
 
                         st.success("Valores sugeridos aplicados com sucesso ao estoque!")
+                        _manter_dialog_aberto("itens", compra_id, produto_id=produto_id)
                         st.rerun()
             else:
                 if st.button(
@@ -252,6 +350,7 @@ def _dialog_itens_compra(compra: dict, produto_id: int | None = None):
                             ).eq("id", it["id"]).execute()
                             it["valor_unit_ajustado"] = v_ajust
                         st.session_state[chave_vis] = True
+                        _manter_dialog_aberto("itens", compra_id, produto_id=produto_id)
                         st.rerun()
 
     # Define as larguras de colunas da tabela
@@ -268,21 +367,26 @@ def _dialog_itens_compra(compra: dict, produto_id: int | None = None):
 
         # Cabeçalho Vlr. Unit. com o lápis ao lado
         c_unit_header = colunas_cab[3]
-        col_lbl, col_pop = c_unit_header.columns([0.65, 0.35], gap="small", vertical_alignment="center")
+        col_lbl, col_pop = c_unit_header.columns([0.55, 0.45], gap="small", vertical_alignment="center")
         col_lbl.markdown("**Vlr. Unit.**")
         with col_pop:
             st.markdown('<div class="btn-popover-desc">', unsafe_allow_html=True)
             with st.popover("✏️", help="Definir % desconto dos itens desta NF"):
                 st.markdown("##### % Desconto dos Itens")
                 st.caption("Define o percentual de desconto sobre o valor unitário dos itens desta compra.")
+                if pct_desconto > 0:
+                    st.caption(f"Percentual atualmente salvo: **{pct_desconto:g}%**")
+                # Sempre abre zerado e pronto para digitação — o valor
+                # digitado SUBSTITUI o percentual atual (não soma a ele).
                 novo_pct = st.number_input(
-                    "Percentual (%)",
+                    "Novo percentual (%)",
                     min_value=0.0,
                     max_value=100.0,
-                    value=pct_desconto,
+                    value=0.0,
                     step=0.5,
                     format="%.2f",
                     key=f"input_pct_desc_{compra_id}",
+                    help="Este valor substitui o percentual salvo atualmente.",
                 )
                 if st.button(
                     "Adicionar desconto",
@@ -294,6 +398,7 @@ def _dialog_itens_compra(compra: dict, produto_id: int | None = None):
                         {"pct_desconto_item": float(novo_pct)}
                     ).eq("id", compra_id).execute()
                     st.success("Percentual salvo!")
+                    _manter_dialog_aberto("itens", compra_id, produto_id=produto_id)
                     st.rerun()
             st.markdown('</div>', unsafe_allow_html=True)
 
@@ -327,9 +432,22 @@ def _dialog_itens_compra(compra: dict, produto_id: int | None = None):
 
 
 @_dialog("✏️ Desconto adicional")
-def _dialog_editar_desconto(compra: dict):
+def _dialog_editar_desconto(compra_id: int):
     """Popup para preencher/editar o desconto adicional concedido numa compra
     (além do desconto já descrito na própria NF-e) e o motivo dele."""
+    try:
+        resp = (
+            supabase.table("compras")
+            .select("id, numero_nf, chave_acesso, compras_desconto_adicional, compras_motivo_desconto")
+            .eq("id", compra_id)
+            .single()
+            .execute()
+        )
+        compra = resp.data or {"id": compra_id}
+    except Exception as e:
+        st.error(f"Erro ao carregar a compra: {e}")
+        return
+
     st.caption(
         f"NF nº {compra.get('numero_nf') or '-'} — "
         f"Chave: {compra.get('chave_acesso') or '-'}"
@@ -359,6 +477,7 @@ def _dialog_editar_desconto(compra: dict):
         )
 
     if cancelar:
+        st.session_state.pop("_compras_dialog", None)
         st.rerun()
 
     if not salvar:
@@ -377,14 +496,28 @@ def _dialog_editar_desconto(compra: dict):
             "compras_motivo_desconto": motivo_valor or None,
         }).eq("id", compra["id"]).execute()
         st.success("Desconto adicional atualizado com sucesso!")
+        st.session_state.pop("_compras_dialog", None)
         st.rerun()
     except Exception as e:
         st.error(f"Erro ao salvar desconto adicional: {e}")
 
 
 @_dialog("📎 Arquivos da compra", width="large")
-def _dialog_arquivos_compra(compra: dict):
+def _dialog_arquivos_compra(compra_id: int):
     """Gerencia XML/PDF vinculados a uma compra."""
+    try:
+        resp = (
+            supabase.table("compras")
+            .select("id, numero_nf")
+            .eq("id", compra_id)
+            .single()
+            .execute()
+        )
+        compra = resp.data or {"id": compra_id}
+    except Exception as e:
+        st.error(f"Erro ao carregar a compra: {e}")
+        return
+
     chave_wrap_upload = f"upload_arquivo_wrap_{compra['id']}"
 
     # CSS único, escopado só ao container deste botão (mesma técnica usada
@@ -428,10 +561,14 @@ def _dialog_arquivos_compra(compra: dict):
         unsafe_allow_html=True,
     )
 
-    st.caption(
+    col_cap, col_fechar = st.columns([3, 1], vertical_alignment="center")
+    col_cap.caption(
         f"NF nº {compra.get('numero_nf') or '-'} — "
         f"Compra #{compra.get('id')}"
     )
+    if col_fechar.button("Fechar", key=f"fechar_arquivos_{compra['id']}", use_container_width=True):
+        st.session_state.pop("_compras_dialog", None)
+        st.rerun()
 
     with st.container(border=True):
         st.markdown("**📤 Adicionar arquivo**")
@@ -485,6 +622,7 @@ def _dialog_arquivos_compra(compra: dict):
                     st.success(
                         f"Arquivo '{registro['nome_arquivo']}' enviado com sucesso."
                     )
+                    _manter_dialog_aberto("arquivos", compra["id"])
                     st.rerun()
                 except Exception as e:
                     st.error(f"Erro ao enviar arquivo: {e}")
@@ -563,6 +701,7 @@ def _dialog_arquivos_compra(compra: dict):
                             try:
                                 excluir_arquivo_compra(arquivo)
                                 st.success("Arquivo excluído.")
+                                _manter_dialog_aberto("arquivos", compra["id"])
                                 st.rerun()
                             except Exception as e:
                                 st.error(f"Erro ao excluir arquivo: {e}")
@@ -572,23 +711,37 @@ def _dialog_arquivos_compra(compra: dict):
 
 
 def _secao_listagem():
-    # Abre automaticamente o detalhe solicitado pela tela de movimentações.
+    # Abre automaticamente o detalhe solicitado pela tela de movimentações
+    # (navegação externa). Convertido para o mesmo mecanismo de estado usado
+    # pelos botões da lista, para que o popup fique aberto ao longo de todos
+    # os passos internos (e não só na primeira renderização).
     compra_abrir_id = st.session_state.pop("compras_abrir_id", None)
     if compra_abrir_id:
+        produto_id_nav = st.session_state.pop("compras_abrir_produto_id", None)
+        st.session_state["_compras_dialog"] = {
+            "tipo": "itens",
+            "compra_id": int(compra_abrir_id),
+            "produto_id": produto_id_nav,
+        }
+
+    # Reabre, em TODA renderização, o diálogo que estiver marcado como aberto
+    # em session_state. Isso é o que garante que a tela não feche sozinha
+    # quando um botão de dentro do diálogo dispara um st.rerun().
+    dialog_estado = st.session_state.get("_compras_dialog")
+    if dialog_estado:
+        tipo = dialog_estado.get("tipo")
+        compra_id_dialog = dialog_estado.get("compra_id")
         try:
-            compra_resp = (
-                supabase.table("compras")
-                .select("id, numero_nf, data_emissao, valor_produtos, valor_desconto, valor_total, chave_acesso")
-                .eq("id", int(compra_abrir_id))
-                .single()
-                .execute()
-            )
-            compra = compra_resp.data
-            if compra:
-                produto_id = st.session_state.pop("compras_abrir_produto_id", None)
-                _dialog_itens_compra(compra, produto_id=produto_id)
+            if tipo == "itens":
+                _dialog_itens_compra(
+                    {"id": compra_id_dialog}, produto_id=dialog_estado.get("produto_id")
+                )
+            elif tipo == "desconto":
+                _dialog_editar_desconto(compra_id_dialog)
+            elif tipo == "arquivos":
+                _dialog_arquivos_compra(compra_id_dialog)
         except Exception as e:
-            st.error(f"Erro ao abrir a compra #{compra_abrir_id}: {e}")
+            st.error(f"Erro ao abrir a compra #{compra_id_dialog}: {e}")
 
     try:
         # 1. Consulta dos dados na tabela 'compras' (agora incluindo o id,
@@ -884,13 +1037,14 @@ def _secao_listagem():
                 rotulo_nf = item.get("numero_nf") or "-"
                 tem_arquivos = item["id"] in compras_com_arquivos
                 indicador_arquivos = _badge_clipe_arquivos() if tem_arquivos else ""
+                indicador_pct = _badge_pct_desconto(item.get("pct_desconto_item"))
                 tooltip_nf = f"Chave de acesso: {chave_acesso}"
                 if tem_desconto_adicional:
                     tooltip_nf += f" | Desconto adicional: {motivo_desconto or 'motivo não informado'}"
                 tooltip_nf_html = tooltip_nf.replace('"', "&quot;")
                 col_nf.markdown(
                     f'<span title="{tooltip_nf_html}" style="cursor: help;">'
-                    f'{rotulo_nf}{indicador_arquivos}</span>',
+                    f'{rotulo_nf}{indicador_arquivos}{indicador_pct}</span>',
                     unsafe_allow_html=True,
                 )
 
@@ -936,21 +1090,30 @@ def _secao_listagem():
                         help="Ver itens da compra",
                         use_container_width=True,
                     ):
-                        _dialog_itens_compra(item)
+                        st.session_state["_compras_dialog"] = {
+                            "tipo": "itens", "compra_id": item["id"], "produto_id": None,
+                        }
+                        st.rerun()
                     if col_editar.button(
                         "✏️",
                         key=f"editar_desconto_compra_{item['id']}",
                         help="Editar desconto adicional",
                         use_container_width=True,
                     ):
-                        _dialog_editar_desconto(item)
+                        st.session_state["_compras_dialog"] = {
+                            "tipo": "desconto", "compra_id": item["id"],
+                        }
+                        st.rerun()
                     if col_arquivos.button(
                         "📎",
                         key=f"arquivos_compra_{item['id']}",
                         help="Arquivos da compra",
                         use_container_width=True,
                     ):
-                        _dialog_arquivos_compra(item)
+                        st.session_state["_compras_dialog"] = {
+                            "tipo": "arquivos", "compra_id": item["id"],
+                        }
+                        st.rerun()
 
         render_paginacao(
             "compras",
