@@ -65,13 +65,40 @@ _dialog = getattr(st, "dialog", None) or st.experimental_dialog
 def _dialog_editar_preco_venda(produto_id, codigo_interno, descricao, preco_atual, preco_original=None, flag_ajuste=False):
     """Permite editar o preço de venda sugerido e registra o ajuste no estoque."""
     st.markdown(f"**{codigo_interno} — {descricao}**")
-    st.caption(f"Preço de venda atual: {_fmt_moeda(preco_atual)}")
 
-    if preco_original is not None:
-        if flag_ajuste:
-            st.info(f"Preço original antes do primeiro ajuste: {_fmt_moeda(preco_original)}")
-        else:
-            st.caption(f"Preço original de referência: {_fmt_moeda(preco_original)} (atualmente igual ao original)")
+    if preco_original is not None and flag_ajuste:
+        # O botão de retorno fica na área superior direita do diálogo,
+        # alinhado com a informação do preço atual.
+        col_atual, col_revert_btn = st.columns([2.2, 1.3], vertical_alignment="center")
+        with col_atual:
+            st.caption(f"Preço de venda atual: {_fmt_moeda(preco_atual)}")
+        with col_revert_btn:
+            if st.button(
+                "↩️ Retornar ao Original",
+                key=f"revert_preco_venda_{produto_id}",
+                help="Restaura o preço de venda sugerido para o valor original e remove a marcação de editado.",
+                use_container_width=True,
+            ):
+                valor_original = round(float(preco_original), 2)
+                try:
+                    supabase.table("estoque").update({
+                        "estoque_preco_venda_sugerida": valor_original,
+                        "estoque_flag_ajuste_preco_venda": False,
+                    }).eq("produto_id", produto_id).execute()
+                except Exception as e:
+                    st.error(f"Erro ao reverter o preço de venda: {e}")
+                    return
+                st.success("Preço de venda revertido ao original.")
+                st.rerun()
+
+        st.info(f"Preço original antes do primeiro ajuste: {_fmt_moeda(preco_original)}")
+    else:
+        st.caption(f"Preço de venda atual: {_fmt_moeda(preco_atual)}")
+        if preco_original is not None:
+            st.caption(
+                f"Preço original de referência: {_fmt_moeda(preco_original)} "
+                "(atualmente igual ao original)"
+            )
 
     preco_novo = st.number_input(
         "Novo preço de venda",
