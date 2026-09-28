@@ -306,13 +306,33 @@ def _secao_log_automacoes():
         if apenas_falhas:
             query = query.eq("sucesso", False)
 
-        registros = query.execute().data or []
+        registros_base = query.execute().data or []
     except Exception as e:
         st.error(
             "Erro ao carregar o log de automações. Verifique se a tabela "
             f"`logs_automacao` já foi criada no banco. Detalhe: {e}"
         )
         return
+
+    if not registros_base:
+        st.info("Nenhum registro encontrado para os filtros selecionados.")
+        return
+
+    # Filtro de usuário: as opções vêm do próprio resultado já carregado
+    # (não dá pra oferecer antes de saber quem aparece no período/fluxo).
+    usuarios_distintos = sorted({r.get("usuario") for r in registros_base if r.get("usuario")})
+    if usuarios_distintos:
+        usuario_selecionado = st.selectbox(
+            "Usuário",
+            options=["Todos"] + usuarios_distintos,
+            key="admin_log_filtro_usuario",
+        )
+        registros = (
+            registros_base if usuario_selecionado == "Todos"
+            else [r for r in registros_base if r.get("usuario") == usuario_selecionado]
+        )
+    else:
+        registros = registros_base
 
     if not registros:
         st.info("Nenhum registro encontrado para os filtros selecionados.")
@@ -333,8 +353,42 @@ def _secao_log_automacoes():
 
     st.markdown("---")
 
-    # Agrupa as etapas: por compra_id, por venda_id, ou por operacao_id
-    # quando o registro não pertence a nenhuma compra/venda específica.
+    aba_resumo, aba_detalhe = st.tabs(["📊 Log Resumo", "📄 Log Detalhe"])
+
+    grupos = _agrupar_registros(registros)
+
+    with aba_resumo:
+        _renderizar_log_resumo(grupos)
+
+    with aba_detalhe:
+        _renderizar_log_detalhe(grupos)
+
+
+_COLUNAS_RESUMO_CONDICAO = {
+    "Compras": lambda r: r.get("compra_id") is not None,
+    "Vendas": lambda r: r.get("venda_id") is not None,
+    "Produto": lambda r: r["etapa"] == "cadastro_produto",
+    "Mov. Estoque": lambda r: r["etapa"] == "ajusta_movimentacao",
+    "Saldo Estoque": lambda r: r["etapa"] == "ajusta_estoque",
+}
+
+
+def _farol_coluna(etapas: list[dict], condicao) -> str:
+    """🟢 todas as ocorrências dessa área tiveram sucesso, 🔴 pelo menos uma
+    falhou, '—' quando essa área nem se aplica a esta execução (nenhum
+    registro correspondente)."""
+    filtrados = [r for r in etapas if condicao(r)]
+    if not filtrados:
+        return "—"
+    return "🔴" if any(not r.get("sucesso") for r in filtrados) else "🟢"
+
+
+def _agrupar_registros(registros: list[dict]) -> list[dict]:
+    """Agrupa as etapas de uma mesma execução: por compra_id, por venda_id,
+    ou por operacao_id quando o registro não pertence a nenhuma compra/venda
+    específica. Cada grupo representa UMA atividade individual — uma
+    importação de XML, uma venda (manual ou importada), uma edição, uma
+    exclusão — na ordem em que ocorreu."""
     grupos: dict = {}
     for r in registros:
         if r.get("compra_id"):
@@ -357,11 +411,40 @@ def _secao_log_automacoes():
         if r["criado_em"] > grupos[chave]["criado_em_max"]:
             grupos[chave]["criado_em_max"] = r["criado_em"]
 
-    grupos_ordenados = sorted(
-        grupos.values(), key=lambda g: g["criado_em_max"], reverse=True
+    return sorted(grupos.values(), key=lambda g: g["criado_em_max"], reverse=True)
+
+
+def _renderizar_log_resumo(grupos: list[dict]):
+    st.caption(
+        "Uma linha por execução — cada importação de XML, cada venda "
+        "(importada ou manual), cada edição/exclusão gera sua própria linha. "
+        "Cada coluna mostra o farol daquela área: 🟢 tudo certo, 🔴 houve "
+        "falha, — a área não se aplica a essa atividade."
     )
 
-    for grupo in grupos_ordenados:
+    tabela = []
+    for grupo in grupos:
+        etapas = grupo["etapas"]
+        usuarios = sorted({e.get("usuario") for e in etapas if e.get("usuario")})
+        sucesso_geral = all(e.get("sucesso") for e in etapas)
+
+        tabela.append({
+            "Status": "🟢" if sucesso_geral else "🔴",
+            "Atividade": FLUXOS.get(grupo["fluxo"], grupo["fluxo"]),
+            "Referência": _rotulo_referencia(grupo),
+            **{
+                coluna: _farol_coluna(etapas, condicao)
+                for coluna, condicao in _COLUNAS_RESUMO_CONDICAO.items()
+            },
+            "Usuário": ", ".join(usuarios) if usuarios else "—",
+            "Quando": _fmt_hora(grupo["criado_em_max"]),
+        })
+
+    st.dataframe(tabela, use_container_width=True, hide_index=True)
+
+
+def _renderizar_log_detalhe(grupos: list[dict]):
+    for grupo in grupos:
         etapas = sorted(
             grupo["etapas"], key=lambda e: _ORDEM_ETAPA.get(e["etapa"], 99)
         )
@@ -370,9 +453,14 @@ def _secao_log_automacoes():
         rotulo_fluxo = FLUXOS.get(grupo["fluxo"], grupo["fluxo"])
         rotulo_ref = _rotulo_referencia(grupo)
 
+        usuarios_grupo = sorted({e.get("usuario") for e in etapas if e.get("usuario")})
+        rotulo_usuario = f" — 👤 {usuarios_grupo[0]}" if len(usuarios_grupo) == 1 else (
+            f" — 👤 {len(usuarios_grupo)} usuários" if len(usuarios_grupo) > 1 else ""
+        )
+
         titulo = (
             f"{icone_geral} {rotulo_fluxo} — {rotulo_ref} — "
-            f"{_fmt_hora(grupo['criado_em_max'])} ({len(etapas)} etapa(s))"
+            f"{_fmt_hora(grupo['criado_em_max'])} ({len(etapas)} etapa(s)){rotulo_usuario}"
         )
 
         with st.expander(titulo):
@@ -386,6 +474,8 @@ def _secao_log_automacoes():
                     partes.append(f"produto #{e['produto_id']}")
                 if e.get("quantidade") is not None:
                     partes.append(f"qtd {e['quantidade']:g}")
+                if e.get("usuario"):
+                    partes.append(f"👤 {e['usuario']}")
                 partes.append(_fmt_hora(e["criado_em"]))
 
                 st.write(" · ".join(partes))

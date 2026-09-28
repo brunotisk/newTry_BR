@@ -15,6 +15,7 @@ Projeto: **Projeto AC**
 | 007    | Criar planilhas_importadas            | ✅ Aplicada     | ✅ Aplicada  |
 | 008    | Alterar unicidade clientes nome canal | ✅ Aplicada     | ✅ Aplicada  |
 | 009    | Adicionar campos - des e valor unit.  | ✅ Aplicada     | ✅ Aplicada  |
+| 010    | Criar logs de automação               | ✅ Aplicada     | ✅ Aplicada  |
 ------------------------------------------------------------------------------------
 
 
@@ -54,3 +55,7 @@ Descrição: alteração da regra de unicidade da tabela public.clientes, remove
 **Arquivo**: migrations/009_Adicionar_desconto_item_compras.sql
 Data: 21/09/2026
 Descrição: inclusão dos campos pct_desconto_item na tabela public.compras, valor_unit_ajustado na tabela public.compras_itens e estoque_flag_pct_desconto_item na tabela public.estoque, com valor padrão false para o controle de desconto percentual nos itens de compra.
+
+**Arquivo**: migrations/010_criar_logs_automacao.sql
+Data: 28/09/2026
+Descrição: criação da tabela public.logs_automacao para registrar as inserções e ajustes automáticos realizados pelo sistema, agrupados por operacao_id e identificados por fluxo e etapa. Foram adicionados os relacionamentos com produtos, compras e vendas, índices para consulta dos logs e RLS com policies de leitura e inserção para usuários autenticados.

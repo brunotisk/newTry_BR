@@ -34,7 +34,11 @@ create table if not exists public.logs_automacao (
     venda_id     bigint references public.vendas(id)   on delete set null,
 
     quantidade   numeric,
-    mensagem     text
+    mensagem     text,
+
+    -- e-mail do usuário logado no momento da ação (st.session_state.user.email);
+    -- fica vazio quando a etapa roda sem sessão Streamlit ativa.
+    usuario      text
 );
 
 comment on table public.logs_automacao is
@@ -45,6 +49,7 @@ create index if not exists idx_logs_automacao_criado_em   on public.logs_automac
 create index if not exists idx_logs_automacao_compra_id   on public.logs_automacao (compra_id);
 create index if not exists idx_logs_automacao_venda_id    on public.logs_automacao (venda_id);
 create index if not exists idx_logs_automacao_fluxo       on public.logs_automacao (fluxo);
+create index if not exists idx_logs_automacao_usuario     on public.logs_automacao (usuario);
 create index if not exists idx_logs_automacao_sucesso     on public.logs_automacao (sucesso) where sucesso = false;
 
 -- ----------------------------------------------------------------------------
