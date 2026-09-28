@@ -1,6 +1,9 @@
 import streamlit as st
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from io import BytesIO
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, PatternFill
 from db import supabase
 from telas.importar_nf import tela_importar_nf
 from componentes.paginacao import render_paginacao, get_itens_por_pagina, reset_paginacao
@@ -54,6 +57,128 @@ def _fmt_valor_input(valor):
 def _fmt_qtd(valor) -> str:
     """Mostra quantidade sem casas decimais desnecessárias (ex.: 1 em vez de 1.000)."""
     return f"{float(valor or 0):g}"
+
+
+def _fmt_data_iso(valor_iso: str | None) -> str:
+    """Converte um timestamp ISO (como vem do Supabase) em dd/mm/aaaa."""
+    if not valor_iso:
+        return ""
+    try:
+        return datetime.fromisoformat(valor_iso.replace("Z", "+00:00")).strftime("%d/%m/%Y")
+    except Exception:
+        return str(valor_iso)
+
+
+_EXCEL_CABECALHO_FILL = PatternFill(fill_type="solid", fgColor="1F4E78")
+_EXCEL_CABECALHO_FONT = Font(color="FFFFFF", bold=True)
+
+
+def _estilizar_cabecalho_planilha(ws, ultima_coluna: int) -> None:
+    for col in range(1, ultima_coluna + 1):
+        cel = ws.cell(row=1, column=col)
+        cel.fill = _EXCEL_CABECALHO_FILL
+        cel.font = _EXCEL_CABECALHO_FONT
+        cel.alignment = Alignment(horizontal="center")
+    ws.freeze_panes = "A2"
+
+
+def _gerar_excel_compras(compras_lista: list[dict], qtd_itens_por_compra: dict) -> bytes:
+    """Gera um .xlsx com exatamente os mesmos campos exibidos na tabela de
+    compras da tela (uma linha por compra/NF)."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Compras"
+
+    cabecalho = [
+        "Número NF", "Data Compra", "Valor Produto", "Desconto",
+        "Valor Total", "Desconto Adicional", "Itens",
+    ]
+    ws.append(cabecalho)
+
+    for compra in compras_lista:
+        ws.append([
+            compra.get("numero_nf") or "",
+            _fmt_data_iso(compra.get("data_emissao")),
+            float(compra.get("valor_produtos") or 0),
+            float(compra.get("valor_desconto") or 0),
+            float(compra.get("valor_total") or 0),
+            float(compra.get("compras_desconto_adicional") or 0),
+            qtd_itens_por_compra.get(compra["id"], 0),
+        ])
+
+    _estilizar_cabecalho_planilha(ws, len(cabecalho))
+
+    larguras = [16, 14, 15, 13, 15, 18, 8]
+    for indice, largura in enumerate(larguras, start=1):
+        ws.column_dimensions[ws.cell(row=1, column=indice).column_letter].width = largura
+
+    for linha in ws.iter_rows(min_row=2, min_col=3, max_col=6):
+        for cel in linha:
+            cel.number_format = "#,##0.00"
+
+    buffer = BytesIO()
+    wb.save(buffer)
+    return buffer.getvalue()
+
+
+def _gerar_excel_itens_compras(compras_lista: list[dict], itens_lista: list[dict]) -> bytes:
+    """Gera um .xlsx com uma linha por item de compra. Os dados da NF
+    (cabeçalho da compra) são repetidos em toda linha de item que pertence
+    a ela, já que uma mesma compra pode ter vários itens."""
+    compras_por_id = {compra["id"]: compra for compra in compras_lista}
+
+    itens_por_compra: dict[int, list[dict]] = {}
+    for item in itens_lista:
+        itens_por_compra.setdefault(item["compra_id"], []).append(item)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Itens das Compras"
+
+    cabecalho = [
+        "Número NF", "Data Compra", "Nº Item", "Código", "Produto",
+        "Quantidade", "Valor Unitário", "Valor Desconto", "Valor Total",
+        "Valor Unit. Ajustado",
+    ]
+    ws.append(cabecalho)
+
+    # Mantém a mesma ordem de exibição da tela (compras_lista já vem
+    # ordenada por data de emissão, decrescente).
+    for compra in compras_lista:
+        itens_da_compra = sorted(
+            itens_por_compra.get(compra["id"], []),
+            key=lambda it: it.get("numero_item") or 0,
+        )
+        numero_nf = compra.get("numero_nf") or ""
+        data_compra_fmt = _fmt_data_iso(compra.get("data_emissao"))
+        for item in itens_da_compra:
+            produto = item.get("produtos") or {}
+            ws.append([
+                numero_nf,
+                data_compra_fmt,
+                item.get("numero_item") or "",
+                produto.get("codigo_interno") or "",
+                produto.get("descricao") or "",
+                float(item.get("quantidade") or 0),
+                float(item.get("valor_unitario") or 0),
+                float(item.get("valor_desconto") or 0),
+                float(item.get("valor_total") or 0),
+                float(item.get("valor_unit_ajustado") or 0),
+            ])
+
+    _estilizar_cabecalho_planilha(ws, len(cabecalho))
+
+    larguras = [16, 14, 9, 14, 40, 12, 15, 15, 15, 18]
+    for indice, largura in enumerate(larguras, start=1):
+        ws.column_dimensions[ws.cell(row=1, column=indice).column_letter].width = largura
+
+    for linha in ws.iter_rows(min_row=2, min_col=6, max_col=10):
+        for indice_col, cel in enumerate(linha, start=6):
+            cel.number_format = "#,##0.####" if indice_col == 6 else "#,##0.00"
+
+    buffer = BytesIO()
+    wb.save(buffer)
+    return buffer.getvalue()
 
 
 def _badge_clipe_arquivos() -> str:
@@ -895,7 +1020,9 @@ def _secao_listagem():
         # 5. Filtros da listagem
         # Os filtros ficam abaixo dos KPIs e imediatamente antes da tabela,
         # conforme o layout solicitado.
-        col_filtro_nf, col_filtro_pct = st.columns([2.2, 1.3], vertical_alignment="center")
+        col_filtro_nf, col_filtro_pct, col_exportar = st.columns(
+            [2.2, 1.3, 0.4], vertical_alignment="center"
+        )
 
         with col_filtro_nf:
             filtro_nf = st.text_input(
@@ -927,6 +1054,64 @@ def _secao_listagem():
                 compra for compra in compras_filtradas
                 if float(compra.get("pct_desconto_item") or 0) > 0
             ]
+
+        # 5.1 Exportação em Excel — botão de ícone que abre um popup com as
+        # opções de download. Respeita os filtros acima (NF / % desconto),
+        # mas ignora a paginação: exporta todas as compras filtradas de uma vez.
+        with col_exportar:
+            with st.popover("⬇️", use_container_width=True, help="Exportar para Excel"):
+                st.caption("📊 Compras (uma linha por NF)")
+                if st.button(
+                    "Gerar Excel — Compras",
+                    use_container_width=True,
+                    key="btn_gerar_excel_compras",
+                    disabled=not compras_filtradas,
+                ):
+                    with st.spinner("Gerando planilha de compras..."):
+                        st.session_state["_excel_compras_bytes"] = _gerar_excel_compras(
+                            compras_filtradas, qtd_itens_por_compra
+                        )
+                if st.session_state.get("_excel_compras_bytes"):
+                    st.download_button(
+                        "⬇️ Baixar compras.xlsx",
+                        data=st.session_state["_excel_compras_bytes"],
+                        file_name=f"compras_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                        key="dl_excel_compras",
+                    )
+
+                st.divider()
+
+                st.caption("📄 Itens das compras (uma linha por item)")
+                if st.button(
+                    "Gerar Excel — Itens das compras",
+                    use_container_width=True,
+                    key="btn_gerar_excel_itens",
+                    disabled=not compras_filtradas,
+                ):
+                    with st.spinner("Consultando itens e gerando planilha..."):
+                        compra_ids_export = [c["id"] for c in compras_filtradas]
+                        itens_completos = _buscar_em_lotes(
+                            "compras_itens",
+                            "compra_id",
+                            compra_ids_export,
+                            "compra_id, numero_item, quantidade, valor_unitario,"
+                            " valor_desconto, valor_total, valor_unit_ajustado,"
+                            " produtos(codigo_interno, descricao)",
+                        )
+                        st.session_state["_excel_itens_bytes"] = _gerar_excel_itens_compras(
+                            compras_filtradas, itens_completos
+                        )
+                if st.session_state.get("_excel_itens_bytes"):
+                    st.download_button(
+                        "⬇️ Baixar itens_compras.xlsx",
+                        data=st.session_state["_excel_itens_bytes"],
+                        file_name=f"itens_compras_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                        key="dl_excel_itens",
+                    )
 
         if not compras_filtradas:
             if filtro_nf or mostrar_pct:
