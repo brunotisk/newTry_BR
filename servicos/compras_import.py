@@ -18,6 +18,7 @@ só é usado por este pipeline de importação de compras.
 Instalar: pip install supabase
 """
 from __future__ import annotations
+import uuid
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -28,6 +29,7 @@ from supabase import Client
 from .estoque import registrar_movimento, registrar_ajuste
 from .arquivos_compra import excluir_arquivo_compra
 from .supabase_admin import get_client  # noqa: F401  (re-exportado por conveniência)
+from .log_automacao import registrar_log
 
 # ---------------------------------------------------------------------------
 # Parsing de NF-e (modelo 55, padrão SEFAZ / nfeProc)
@@ -172,50 +174,84 @@ def inserir_compra(sb: Client, nota: NotaFiscal, fornecedor_id: int) -> int:
     return resp.data[0]["id"]
 
 
-def upsert_produto(sb: Client, item, data_emissao) -> int:
+def upsert_produto(
+    sb: Client,
+    item,
+    data_emissao,
+    operacao_id: str | None = None,
+    compra_id: int | None = None,
+) -> int:
     """Cadastra o produto se ainda não existir (pelo codigo_interno = cProd).
-    Se já existir, atualiza descrição, incrementa nr_compras e calcula a maior ultima_compra."""
+    Se já existir, atualiza descrição, incrementa nr_compras e calcula a maior ultima_compra.
+
+    `operacao_id`/`compra_id` são usados apenas para registrar a etapa
+    "cadastro_produto" no log de automações (servicos/log_automacao.py);
+    não alteram o comportamento de cadastro em si.
+    """
+    operacao_id = operacao_id or str(uuid.uuid4())
 
     # Extrai a data do XML em formato ISO (YYYY-MM-DD)
     data_xml_str = data_emissao.isoformat()[:10] if hasattr(data_emissao, "isoformat") else str(data_emissao)[:10]
 
-    # Consulta o registro atual do produto no banco
-    prod_resp = (
-        sb.table("produtos")
-        .select("id, ultima_compra, nr_compras")
-        .eq("codigo_interno", item.codigo_interno)
-        .execute()
+    try:
+        # Consulta o registro atual do produto no banco
+        prod_resp = (
+            sb.table("produtos")
+            .select("id, ultima_compra, nr_compras")
+            .eq("codigo_interno", item.codigo_interno)
+            .execute()
+        )
+
+        produto_ja_existia = bool(prod_resp.data)
+
+        if prod_resp.data:
+            prod_atual = prod_resp.data[0]
+
+            # Incrementar quantidade de compras
+            nr_compras_atual = prod_atual.get("nr_compras") or 0
+            nr_compras_novo = nr_compras_atual + 1
+
+            # Comparar datas e manter a maior (mais recente)
+            ultima_compra_banco = prod_atual.get("ultima_compra")
+            if ultima_compra_banco:
+                str_banco = str(ultima_compra_banco)[:10]
+                nova_ultima_compra = max(data_xml_str, str_banco)
+            else:
+                nova_ultima_compra = data_xml_str
+        else:
+            # Primeira compra registrada
+            nr_compras_novo = 1
+            nova_ultima_compra = data_xml_str
+
+        resp = sb.table("produtos").upsert({
+            "codigo_interno": item.codigo_interno,
+            "descricao": item.descricao,
+            "ncm": item.ncm,
+            "unidade": item.unidade,
+            "ultima_compra": nova_ultima_compra,
+            "nr_compras": nr_compras_novo
+        }, on_conflict="codigo_interno").execute()
+
+        produto_id = resp.data[0]["id"]
+    except Exception as exc:
+        registrar_log(
+            sb, operacao_id=operacao_id, fluxo="compra_importacao",
+            etapa="cadastro_produto", sucesso=False, compra_id=compra_id,
+            mensagem=f"{item.codigo_interno}: {exc}",
+        )
+        raise
+
+    registrar_log(
+        sb, operacao_id=operacao_id, fluxo="compra_importacao",
+        etapa="cadastro_produto", sucesso=True, produto_id=produto_id,
+        compra_id=compra_id,
+        mensagem=(
+            f"Produto atualizado (nr_compras={nr_compras_novo})" if produto_ja_existia
+            else f"Produto novo cadastrado ({item.codigo_interno})"
+        ),
     )
 
-    if prod_resp.data:
-        prod_atual = prod_resp.data[0]
-
-        # Incrementar quantidade de compras
-        nr_compras_atual = prod_atual.get("nr_compras") or 0
-        nr_compras_novo = nr_compras_atual + 1
-
-        # Comparar datas e manter a maior (mais recente)
-        ultima_compra_banco = prod_atual.get("ultima_compra")
-        if ultima_compra_banco:
-            str_banco = str(ultima_compra_banco)[:10]
-            nova_ultima_compra = max(data_xml_str, str_banco)
-        else:
-            nova_ultima_compra = data_xml_str
-    else:
-        # Primeira compra registrada
-        nr_compras_novo = 1
-        nova_ultima_compra = data_xml_str
-
-    resp = sb.table("produtos").upsert({
-        "codigo_interno": item.codigo_interno,
-        "descricao": item.descricao,
-        "ncm": item.ncm,
-        "unidade": item.unidade,
-        "ultima_compra": nova_ultima_compra,
-        "nr_compras": nr_compras_novo
-    }, on_conflict="codigo_interno").execute()
-
-    return resp.data[0]["id"]
+    return produto_id
 
 
 def _sincronizar_estoque_pos_compra(sb: Client, produto_id: int, valor_unitario: Decimal, data_movimento: str) -> None:
@@ -265,7 +301,14 @@ def _sincronizar_estoque_pos_compra(sb: Client, produto_id: int, valor_unitario:
     sb.table("estoque").upsert(dados_estoque, on_conflict="produto_id").execute()
 
 
-def inserir_item_e_atualizar_estoque(sb: Client, compra_id: int, produto_id: int, item, data_emissao):
+def inserir_item_e_atualizar_estoque(
+    sb: Client,
+    compra_id: int,
+    produto_id: int,
+    item,
+    data_emissao,
+    operacao_id: str | None = None,
+):
     sb.table("compras_itens").insert({
         "compra_id": compra_id,
         "produto_id": produto_id,
@@ -280,7 +323,8 @@ def inserir_item_e_atualizar_estoque(sb: Client, compra_id: int, produto_id: int
 
     # Antes, a atualização de saldo + inserção no ledger estava duplicada
     # aqui (era idêntica à de vendas_import.py e estoque_ajuste.py). Agora
-    # é uma única implementação em servicos/estoque.py.
+    # é uma única implementação em servicos/estoque.py, que também é onde o
+    # log de automações ("ajusta_estoque" / "ajusta_movimentacao") é gravado.
     registrar_movimento(
         sb,
         produto_id=produto_id,
@@ -288,6 +332,8 @@ def inserir_item_e_atualizar_estoque(sb: Client, compra_id: int, produto_id: int
         tipo="entrada",
         data_movimento=data_movimento,
         compra_id=compra_id,
+        operacao_id=operacao_id,
+        fluxo="compra_importacao",
     )
 
     # Sincroniza estoque_ultima_compra, estoque_num_compras e (quando aplicável)
@@ -511,6 +557,11 @@ def importar_nfe(caminho_xml: str) -> dict:
 
     compra_id = None
     produto_ids_criados = []
+    # Todas as etapas desta importação (cadastro de produto, ajuste de
+    # estoque e de movimentação, para cada item da NF) compartilham este id
+    # no log de automações, permitindo reconstruir a esteira completa na
+    # tela de administração.
+    operacao_id = str(uuid.uuid4())
 
     try:
         # FASE 2 — persistência.
@@ -520,14 +571,18 @@ def importar_nfe(caminho_xml: str) -> dict:
         for item in nota.itens:
             # Se o produto já existia, upsert_produto atualiza seus indicadores.
             # Se não existia, ele é criado e guardamos o id para rollback.
-            produto_id = upsert_produto(sb, item, nota.data_emissao)
+            produto_id = upsert_produto(
+                sb, item, nota.data_emissao,
+                operacao_id=operacao_id, compra_id=compra_id,
+            )
 
             ids_anteriores = {p["id"] for p in snapshot.get("produtos", [])}
             if produto_id not in ids_anteriores:
                 produto_ids_criados.append(produto_id)
 
             inserir_item_e_atualizar_estoque(
-                sb, compra_id, produto_id, item, nota.data_emissao
+                sb, compra_id, produto_id, item, nota.data_emissao,
+                operacao_id=operacao_id,
             )
 
         return {
@@ -579,6 +634,7 @@ def excluir_compra(sb: Client, compra_id: int) -> dict:
 
     produtos_afetados = set()
     hoje = date.today().isoformat()
+    operacao_id = str(uuid.uuid4())
 
     # 1. Estorno de estoque para cada item
     for item in itens:
@@ -596,6 +652,8 @@ def excluir_compra(sb: Client, compra_id: int) -> dict:
                 quantidade=-quantidade,
                 motivo=motivo_estorno,
                 data_movimento=hoje,
+                operacao_id=operacao_id,
+                fluxo="compra_exclusao",
             )
 
     # 2. Recalcula indicadores de compras dos produtos afetados

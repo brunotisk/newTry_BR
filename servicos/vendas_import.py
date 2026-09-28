@@ -690,7 +690,14 @@ def inserir_venda_e_baixar_estoque(
     cadastro manual da tela de vendas. Os campos novos de forma de pagamento
     e feira são opcionais para manter a importação de planilhas antigas
     compatível; quando informados, ficam gravados na venda.
+
+    O fluxo registrado no log de automações (servicos/log_automacao.py) é
+    inferido de `motivo_saida`: "Importação XLSX" -> venda_importacao,
+    qualquer outro valor (ex.: "Venda Manual") -> venda_manual. Não é preciso
+    passar nenhum parâmetro extra nas telas existentes.
     """
+    operacao_id = str(uuid.uuid4())
+    fluxo = "venda_importacao" if motivo_saida == "Importação XLSX" else "venda_manual"
     dados_venda = {
         "produto_id": produto_id,
         "canal_venda_id": linha["canal_venda_id"],
@@ -728,6 +735,8 @@ def inserir_venda_e_baixar_estoque(
         data_movimento=linha["data_venda"],
         motivo=motivo_saida,
         venda_id=venda_id,
+        operacao_id=operacao_id,
+        fluxo=fluxo,
     )
 
     return venda_id
@@ -749,6 +758,7 @@ def editar_venda(sb: Client, venda_antiga: dict, dados_novos: dict) -> None:
     produto_id_novo = dados_novos["produto_id"]
     quantidade_nova = float(dados_novos["quantidade"])
     hoje = date.today().isoformat()
+    operacao_id = str(uuid.uuid4())
 
     if produto_id_novo != produto_id_antigo:
         # devolve a quantidade antiga ao estoque do produto antigo
@@ -758,6 +768,8 @@ def editar_venda(sb: Client, venda_antiga: dict, dados_novos: dict) -> None:
             quantidade=quantidade_antiga,
             motivo=f"Estorno por edição da venda #{venda_id} (produto alterado)",
             data_movimento=hoje,
+            operacao_id=operacao_id,
+            fluxo="venda_edicao",
         )
         # dá baixa da quantidade nova no estoque do produto novo
         registrar_ajuste(
@@ -766,6 +778,8 @@ def editar_venda(sb: Client, venda_antiga: dict, dados_novos: dict) -> None:
             quantidade=-quantidade_nova,
             motivo=f"Ajuste por edição da venda #{venda_id} (produto alterado)",
             data_movimento=hoje,
+            operacao_id=operacao_id,
+            fluxo="venda_edicao",
         )
     else:
         # mesmo produto: só a diferença de quantidade precisa ser ajustada
@@ -777,6 +791,8 @@ def editar_venda(sb: Client, venda_antiga: dict, dados_novos: dict) -> None:
                 quantidade=delta,
                 motivo=f"Ajuste por edição da venda #{venda_id} (quantidade alterada)",
                 data_movimento=hoje,
+                operacao_id=operacao_id,
+                fluxo="venda_edicao",
             )
 
     sb.table("vendas").update(dados_novos).eq("id", venda_id).execute()
@@ -815,6 +831,8 @@ def excluir_venda(sb: Client, venda: dict) -> None:
             quantidade=quantidade,
             motivo=motivo_estorno,
             data_movimento=date.today().isoformat(),
+            operacao_id=str(uuid.uuid4()),
+            fluxo="venda_exclusao",
         )
 
     # Preserva o histórico de estoque, mas elimina a referência que impediria

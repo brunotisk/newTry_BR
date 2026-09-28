@@ -1,8 +1,9 @@
 import streamlit as st
-from datetime import datetime
+from datetime import datetime, timedelta
 from db import supabase
 from auth import usuario_e_admin
 from servicos.compras_import import excluir_compra
+from servicos.log_automacao import FLUXOS, ETAPAS
 
 
 def _fmt_moeda(valor) -> str:
@@ -221,6 +222,177 @@ def _secao_exclusao_compras():
                     st.error(f"Erro ao excluir compra: {e}")
 
 
+_ICONE_ETAPA = {
+    "cadastro_produto": "📇",
+    "ajusta_estoque": "📦",
+    "ajusta_movimentacao": "🔄",
+}
+
+_ORDEM_ETAPA = {"cadastro_produto": 0, "ajusta_estoque": 1, "ajusta_movimentacao": 2}
+
+_PERIODOS = {
+    "Últimas 24 horas": 1,
+    "Últimos 7 dias": 7,
+    "Últimos 30 dias": 30,
+    "Tudo": None,
+}
+
+
+def _fmt_hora(valor_iso) -> str:
+    if not valor_iso:
+        return "-"
+    try:
+        dt = datetime.fromisoformat(str(valor_iso).replace("Z", "+00:00"))
+        return dt.strftime("%d/%m/%Y %H:%M:%S")
+    except Exception:
+        return str(valor_iso)
+
+
+def _rotulo_referencia(grupo: dict) -> str:
+    if grupo.get("compra_id"):
+        return f"Compra #{grupo['compra_id']}"
+    if grupo.get("venda_id"):
+        return f"Venda #{grupo['venda_id']}"
+    return f"Operação {str(grupo['operacao_id'])[:8]}"
+
+
+def _secao_log_automacoes():
+    st.subheader("📋 Log de Automações")
+    st.caption(
+        "Histórico das inserções e ajustes que o sistema faz automaticamente: "
+        "cadastro de produto (só em importação de compra), ajuste de saldo de "
+        "estoque e gravação do movimento no ledger (`estoque_movimentos`)."
+    )
+
+    col_f1, col_f2, col_f3 = st.columns([2, 2, 1.3])
+
+    with col_f1:
+        opcoes_fluxo = ["Todos"] + list(FLUXOS.keys())
+        fluxo_selecionado = st.selectbox(
+            "Fluxo",
+            options=opcoes_fluxo,
+            format_func=lambda f: "Todos os fluxos" if f == "Todos" else FLUXOS.get(f, f),
+            key="admin_log_filtro_fluxo",
+        )
+
+    with col_f2:
+        periodo_selecionado = st.selectbox(
+            "Período",
+            options=list(_PERIODOS.keys()),
+            index=1,
+            key="admin_log_filtro_periodo",
+        )
+
+    with col_f3:
+        st.write("")
+        apenas_falhas = st.toggle("Somente falhas", value=False, key="admin_log_filtro_falhas")
+
+    try:
+        query = (
+            supabase.table("logs_automacao")
+            .select("*")
+            .order("criado_em", desc=True)
+            .limit(1000)
+        )
+
+        if fluxo_selecionado != "Todos":
+            query = query.eq("fluxo", fluxo_selecionado)
+
+        dias = _PERIODOS[periodo_selecionado]
+        if dias is not None:
+            cutoff = (datetime.utcnow() - timedelta(days=dias)).isoformat()
+            query = query.gte("criado_em", cutoff)
+
+        if apenas_falhas:
+            query = query.eq("sucesso", False)
+
+        registros = query.execute().data or []
+    except Exception as e:
+        st.error(
+            "Erro ao carregar o log de automações. Verifique se a tabela "
+            f"`logs_automacao` já foi criada no banco. Detalhe: {e}"
+        )
+        return
+
+    if not registros:
+        st.info("Nenhum registro encontrado para os filtros selecionados.")
+        return
+
+    total = len(registros)
+    total_falhas = sum(1 for r in registros if not r.get("sucesso"))
+
+    col_k1, col_k2 = st.columns(2)
+    with col_k1:
+        with st.container(border=True):
+            st.caption("Etapas registradas no período")
+            st.title(f"{total}")
+    with col_k2:
+        with st.container(border=True):
+            st.caption("Etapas com falha")
+            st.title(f"{total_falhas}")
+
+    st.markdown("---")
+
+    # Agrupa as etapas: por compra_id, por venda_id, ou por operacao_id
+    # quando o registro não pertence a nenhuma compra/venda específica.
+    grupos: dict = {}
+    for r in registros:
+        if r.get("compra_id"):
+            chave = ("compra", r["compra_id"])
+        elif r.get("venda_id"):
+            chave = ("venda", r["venda_id"])
+        else:
+            chave = ("op", r["operacao_id"])
+
+        if chave not in grupos:
+            grupos[chave] = {
+                "fluxo": r["fluxo"],
+                "compra_id": r.get("compra_id"),
+                "venda_id": r.get("venda_id"),
+                "operacao_id": r.get("operacao_id"),
+                "etapas": [],
+                "criado_em_max": r["criado_em"],
+            }
+        grupos[chave]["etapas"].append(r)
+        if r["criado_em"] > grupos[chave]["criado_em_max"]:
+            grupos[chave]["criado_em_max"] = r["criado_em"]
+
+    grupos_ordenados = sorted(
+        grupos.values(), key=lambda g: g["criado_em_max"], reverse=True
+    )
+
+    for grupo in grupos_ordenados:
+        etapas = sorted(
+            grupo["etapas"], key=lambda e: _ORDEM_ETAPA.get(e["etapa"], 99)
+        )
+        sucesso_geral = all(e.get("sucesso") for e in etapas)
+        icone_geral = "✅" if sucesso_geral else "❌"
+        rotulo_fluxo = FLUXOS.get(grupo["fluxo"], grupo["fluxo"])
+        rotulo_ref = _rotulo_referencia(grupo)
+
+        titulo = (
+            f"{icone_geral} {rotulo_fluxo} — {rotulo_ref} — "
+            f"{_fmt_hora(grupo['criado_em_max'])} ({len(etapas)} etapa(s))"
+        )
+
+        with st.expander(titulo):
+            for e in etapas:
+                icone_etapa = _ICONE_ETAPA.get(e["etapa"], "•")
+                icone_status = "✅" if e.get("sucesso") else "❌"
+                rotulo_etapa = ETAPAS.get(e["etapa"], e["etapa"])
+
+                partes = [f"{icone_status} {icone_etapa} **{rotulo_etapa}**"]
+                if e.get("produto_id"):
+                    partes.append(f"produto #{e['produto_id']}")
+                if e.get("quantidade") is not None:
+                    partes.append(f"qtd {e['quantidade']:g}")
+                partes.append(_fmt_hora(e["criado_em"]))
+
+                st.write(" · ".join(partes))
+                if e.get("mensagem"):
+                    st.caption(e["mensagem"])
+
+
 def _secao_info_sistema():
     st.subheader("ℹ️ Informações Administrativas")
     st.write(
@@ -236,13 +408,17 @@ def tela_admin():
 
     st.header("⚙️ Painel de Administração")
 
-    aba_compras, aba_info = st.tabs([
+    aba_compras, aba_log, aba_info = st.tabs([
         "🗑️ Exclusão de Compras (XML)",
+        "📋 Log de Automações",
         "ℹ️ Informações do Sistema",
     ])
 
     with aba_compras:
         _secao_exclusao_compras()
+
+    with aba_log:
+        _secao_log_automacoes()
 
     with aba_info:
         _secao_info_sistema()
