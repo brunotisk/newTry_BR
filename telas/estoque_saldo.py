@@ -1,4 +1,5 @@
 import html
+from datetime import date
 import streamlit as st
 from db import supabase
 from componentes.paginacao import render_paginacao, reset_paginacao, get_itens_por_pagina
@@ -20,10 +21,7 @@ def _fmt_qtd(valor) -> str:
 
 
 def _injetar_estilo_tabela_estoque():
-    """CSS da tabela de estoque: descrição sem quebra de linha (com ...
-    e tooltip no hover) e o botão de preço de venda centralizado, com
-    largura fixa (não varia conforme o tamanho do valor), o que também
-    mantém um respiro constante antes da coluna 'Data Ult. Compra'."""
+    """CSS da tabela de estoque e dos indicadores de idade."""
     st.markdown(
         """
         <style>
@@ -45,10 +43,361 @@ def _injetar_estilo_tabela_estoque():
             overflow: hidden;
             text-overflow: ellipsis;
         }
+        .idade-produto {
+            display: inline-flex;
+            align-items: center;
+            gap: 7px;
+            font-weight: 700;
+            white-space: nowrap;
+            cursor: help;
+            padding: 5px 10px;
+            border-radius: 7px;
+            border: 1px solid transparent;
+            line-height: 1.2;
+        }
+        .idade-dot {
+            width: 11px;
+            height: 11px;
+            border-radius: 50%;
+            display: inline-block;
+            flex: 0 0 11px;
+            border: 1px solid rgba(0, 0, 0, 0.18);
+        }
+        .idade-verde {
+            background: #166534;
+            border-color: #22c55e;
+            color: #ffffff;
+        }
+        .idade-verde .idade-dot { background: #4ade80; }
+        .idade-amarela {
+            background: #854d0e;
+            border-color: #facc15;
+            color: #ffffff;
+        }
+        .idade-amarela .idade-dot { background: #fde047; }
+        .idade-laranja {
+            background: #9a3412;
+            border-color: #fb923c;
+            color: #ffffff;
+        }
+        .idade-laranja .idade-dot { background: #fb923c; }
+        .idade-vermelha {
+            background: #991b1b;
+            border-color: #f87171;
+            color: #ffffff;
+        }
+        .idade-vermelha .idade-dot { background: #f87171; }
+
+        .idade-legenda {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 7px 10px;
+            border-radius: 7px;
+            font-size: 0.88rem;
+            font-weight: 600;
+            white-space: nowrap;
+        }
+        .idade-legenda .idade-dot {
+            width: 10px;
+            height: 10px;
+            flex-basis: 10px;
+        }
+        .idade-legenda-verde { background: #166534; color: #fff; }
+        .idade-legenda-amarela { background: #854d0e; color: #fff; }
+        .idade-legenda-laranja { background: #9a3412; color: #fff; }
+        .idade-legenda-vermelha { background: #991b1b; color: #fff; }
+
+        /* KPIs de idade são filtros clicáveis. */
+        div[class*="st-key-filtro_idade_"] button {
+            width: 100%;
+            min-height: 46px;
+            border-radius: 8px;
+            font-weight: 700;
+            white-space: nowrap;
+        }
+        div[class*="st-key-filtro_idade_verde_"] button {
+            background: #166534;
+            color: #ffffff;
+            border: 1px solid #22c55e;
+        }
+        div[class*="st-key-filtro_idade_amarela_"] button {
+            background: #854d0e;
+            color: #ffffff;
+            border: 1px solid #facc15;
+        }
+        div[class*="st-key-filtro_idade_laranja_"] button {
+            background: #9a3412;
+            color: #ffffff;
+            border: 1px solid #fb923c;
+        }
+        div[class*="st-key-filtro_idade_vermelha_"] button {
+            background: #991b1b;
+            color: #ffffff;
+            border: 1px solid #f87171;
+        }
         </style>
         """,
         unsafe_allow_html=True,
     )
+
+
+def _classificar_idade(idade_dias):
+    """Retorna classe CSS e cores para as faixas de idade do estoque.
+
+    Faixas adotadas: 0-60 (verde), >60-120 (amarelo), >120-180
+    (laranja) e >180 (vermelho).
+    """
+    if idade_dias is None:
+        return {
+            "classe": "idade-verde",
+            "cor_fundo": "#f0fdf4",
+            "cor_borda": "#86efac",
+            "rotulo": "Sem idade",
+        }
+    idade = float(idade_dias)
+    if idade <= 60:
+        return {
+            "classe": "idade-verde",
+            "cor_fundo": "#f0fdf4",
+            "cor_borda": "#86efac",
+            "rotulo": "0-60 dias",
+        }
+    if idade <= 120:
+        return {
+            "classe": "idade-amarela",
+            "cor_fundo": "#fefce8",
+            "cor_borda": "#fde047",
+            "rotulo": ">60-120 dias",
+        }
+    if idade <= 180:
+        return {
+            "classe": "idade-laranja",
+            "cor_fundo": "#fff7ed",
+            "cor_borda": "#fdba74",
+            "rotulo": ">120-180 dias",
+        }
+    return {
+        "classe": "idade-vermelha",
+        "cor_fundo": "#fef2f2",
+        "cor_borda": "#fca5a5",
+        "rotulo": ">180 dias",
+    }
+
+
+def _formatar_data(data_valor):
+    if not data_valor:
+        return "-"
+    try:
+        texto = str(data_valor)[:10]
+        ano, mes, dia = texto.split("-")
+        return f"{dia}/{mes}/{ano}"
+    except (ValueError, AttributeError):
+        return str(data_valor)
+
+
+def _carregar_historico_compras_completo():
+    """Carrega os itens de compras com a data e NF da compra, em lotes."""
+    tamanho_lote = 1000
+    offset = 0
+    linhas = []
+    while True:
+        response = (
+            supabase.table("compras_itens")
+            .select("id, compra_id, produto_id, quantidade, compras(numero_nf, data_emissao, criado_em)")
+            .order("produto_id")
+            .range(offset, offset + tamanho_lote - 1)
+            .execute()
+        )
+        lote = response.data or []
+        linhas.extend(lote)
+        if len(lote) < tamanho_lote:
+            break
+        offset += tamanho_lote
+    return linhas
+
+
+def _carregar_movimentos_estoque_completo():
+    """Carrega o ledger de estoque para reconstruir as camadas remanescentes."""
+    tamanho_lote = 1000
+    offset = 0
+    linhas = []
+    while True:
+        response = (
+            supabase.table("estoque_movimentos")
+            .select("id, produto_id, tipo, quantidade, data_movimento, criado_em, compra_id, motivo")
+            .order("id")
+            .range(offset, offset + tamanho_lote - 1)
+            .execute()
+        )
+        lote = response.data or []
+        linhas.extend(lote)
+        if len(lote) < tamanho_lote:
+            break
+        offset += tamanho_lote
+    return linhas
+
+
+def _data_evento(data_movimento, criado_em=None):
+    """Transforma data e timestamp em chave ordenável, priorizando a data do movimento."""
+    data = str(data_movimento or "")[:10]
+    criado = str(criado_em or "")
+    return (data, criado)
+
+
+def _calcular_idade_produto(produto_id, saldo_atual, compras_por_produto, movimentos_por_produto):
+    """Calcula a idade do estoque por camadas, usando FIFO.
+
+    Cada compra cria uma camada na data da NF. Saídas e ajustes negativos
+    consomem as camadas mais antigas. Ajustes/entradas positivas sem compra
+    criam uma camada própria na data do movimento. A idade média é ponderada
+    pela quantidade que permanece em cada camada.
+    """
+    eventos = []
+
+    for compra in compras_por_produto.get(produto_id, []):
+        compra_ref = compra.get("compras") or {}
+        data_emissao = str(compra_ref.get("data_emissao") or "")[:10]
+        criado_em = compra_ref.get("criado_em") or data_emissao
+        try:
+            quantidade = float(compra.get("quantidade") or 0)
+        except (TypeError, ValueError):
+            quantidade = 0.0
+        if quantidade <= 0 or not data_emissao:
+            continue
+        eventos.append({
+            "ordem": _data_evento(data_emissao, criado_em),
+            "data": data_emissao,
+            "quantidade": quantidade,
+            "restante": quantidade,
+            "tipo": "compra",
+            "compra_id": compra.get("compra_id"),
+            "numero_nf": compra_ref.get("numero_nf") or "-",
+            "numero_item": compra.get("numero_item"),
+        })
+
+    # Movimentos ligados a uma compra já foram representados pelo item da
+    # compra e, portanto, não devem criar uma segunda camada.
+    for movimento in movimentos_por_produto.get(produto_id, []):
+        if movimento.get("compra_id") is not None:
+            continue
+        tipo = str(movimento.get("tipo") or "").lower()
+        try:
+            quantidade = float(movimento.get("quantidade") or 0)
+        except (TypeError, ValueError):
+            quantidade = 0.0
+        data_mov = str(movimento.get("data_movimento") or movimento.get("criado_em") or "")[:10]
+        if not data_mov or quantidade == 0:
+            continue
+        if tipo == "entrada" or (tipo == "ajuste" and quantidade > 0):
+            eventos.append({
+                "ordem": _data_evento(data_mov, movimento.get("criado_em")),
+                "data": data_mov,
+                "quantidade": abs(quantidade),
+                "restante": abs(quantidade),
+                "tipo": "ajuste",
+                "compra_id": None,
+                "numero_nf": "Ajuste",
+                "numero_item": None,
+            })
+        elif tipo == "saida" or (tipo == "ajuste" and quantidade < 0):
+            eventos.append({
+                "ordem": _data_evento(data_mov, movimento.get("criado_em")),
+                "data": data_mov,
+                "quantidade": -abs(quantidade),
+                "restante": 0.0,
+                "tipo": "saida",
+                "compra_id": None,
+                "numero_nf": "Saída",
+                "numero_item": None,
+            })
+
+    eventos.sort(key=lambda e: e["ordem"])
+    camadas = []
+    for evento in eventos:
+        if evento["quantidade"] > 0:
+            camadas.append(evento)
+            continue
+
+        a_consumir = abs(evento["quantidade"])
+        for camada in camadas:
+            if a_consumir <= 0:
+                break
+            disponivel = float(camada.get("restante") or 0)
+            if disponivel <= 0:
+                continue
+            consumo = min(disponivel, a_consumir)
+            camada["restante"] = disponivel - consumo
+            a_consumir -= consumo
+
+    # O ledger é a fonte da verdade para o saldo. Se houver alguma diferença
+    # histórica entre as camadas e o saldo atual, ajustamos o excedente pelas
+    # camadas mais antigas para que a média represente o estoque exibido.
+    saldo_positivo = max(float(saldo_atual or 0), 0.0)
+    restante_calculado = sum(float(c.get("restante") or 0) for c in camadas)
+    diferenca = restante_calculado - saldo_positivo
+    if diferenca > 0.000001:
+        for camada in camadas:
+            if diferenca <= 0:
+                break
+            disponivel = float(camada.get("restante") or 0)
+            consumo = min(disponivel, diferenca)
+            camada["restante"] = disponivel - consumo
+            diferenca -= consumo
+    elif diferenca < -0.000001:
+        # Saldo maior que as camadas históricas: trata o excedente como uma
+        # camada sem origem de compra, com idade zero.
+        camadas.append({
+            "ordem": ("9999-12-31", "9999-12-31"),
+            "data": date.today().isoformat(),
+            "quantidade": abs(diferenca),
+            "restante": abs(diferenca),
+            "tipo": "ajuste",
+            "compra_id": None,
+            "numero_nf": "Saldo sem origem de compra",
+            "numero_item": None,
+        })
+
+    hoje = date.today()
+    peso_total = 0.0
+    soma_idade = 0.0
+    for camada in camadas:
+        restante = float(camada.get("restante") or 0)
+        if restante <= 0:
+            continue
+        try:
+            data_camada = date.fromisoformat(str(camada["data"])[:10])
+        except (ValueError, TypeError):
+            continue
+        idade = max((hoje - data_camada).days, 0)
+        camada["idade_dias"] = idade
+        peso_total += restante
+        soma_idade += restante * idade
+
+    idade_media = (soma_idade / peso_total) if peso_total > 0 else None
+
+    # Mantém todas as compras no tooltip, inclusive as já consumidas, para que
+    # o usuário consiga enxergar o histórico de idades.
+    compras_tooltip = []
+    for camada in camadas:
+        if camada.get("tipo") != "compra":
+            continue
+        try:
+            data_camada = date.fromisoformat(str(camada["data"])[:10])
+            idade = max((hoje - data_camada).days, 0)
+        except (ValueError, TypeError):
+            idade = 0
+        compras_tooltip.append({
+            "data": camada.get("data"),
+            "data_fmt": _formatar_data(camada.get("data")),
+            "idade_dias": idade,
+            "quantidade": float(camada.get("quantidade") or 0),
+            "restante": float(camada.get("restante") or 0),
+            "numero_nf": camada.get("numero_nf") or "-",
+        })
+
+    compras_tooltip.sort(key=lambda x: x["data"] or "", reverse=True)
+    return idade_media, compras_tooltip
 
 
 def _celula_truncada(texto: str) -> str:
@@ -208,22 +557,49 @@ def _secao_estoque_atual():
         st.error(f"Erro ao carregar estoque: {e}")
         return
 
-    # Achata a estrutura (produto embutido) e ignora linhas órfãs
+    # Carrega o histórico uma única vez para calcular a idade de cada produto
+    # sem fazer uma consulta por linha da tabela.
+    try:
+        historico_compras = _carregar_historico_compras_completo()
+        movimentos_estoque = _carregar_movimentos_estoque_completo()
+    except Exception as e:
+        st.error(f"Erro ao carregar histórico de compras/movimentações: {e}")
+        return
+
+    compras_por_produto = {}
+    for compra in historico_compras:
+        compras_por_produto.setdefault(compra.get("produto_id"), []).append(compra)
+
+    movimentos_por_produto = {}
+    for movimento in movimentos_estoque:
+        movimentos_por_produto.setdefault(movimento.get("produto_id"), []).append(movimento)
+
+    # Achata a estrutura (produto embutido), calcula idade e ignora linhas órfãs.
     itens = []
     for linha in linhas_brutas:
         prod = linha.get("produtos")
         if not prod:
             continue
+        produto_id = prod["id"]
+        saldo = float(linha.get("quantidade_atual") or 0)
+        idade_media, compras_idade = _calcular_idade_produto(
+            produto_id,
+            saldo,
+            compras_por_produto,
+            movimentos_por_produto,
+        )
         itens.append({
-            "id": prod["id"],
+            "id": produto_id,
             "codigo_interno": prod.get("codigo_interno") or "-",
             "descricao": prod.get("descricao") or "-",
-            "saldo": float(linha.get("quantidade_atual") or 0),
+            "saldo": saldo,
             "preco_compra": float(linha.get("estoque_preco_ultima_compra") or 0),
             "preco_venda": float(linha.get("estoque_preco_venda_sugerida") or 0),
             "preco_venda_original": linha.get("estoque_preco_venda_original"),
             "flag_ajuste_preco_venda": bool(linha.get("estoque_flag_ajuste_preco_venda", False)),
             "data_ultima_compra": linha.get("estoque_ultima_compra"),
+            "idade_media": idade_media,
+            "compras_idade": compras_idade,
         })
 
     # Custo unitário estimado: preço da última compra armazenado em estoque.
@@ -272,6 +648,75 @@ def _secao_estoque_atual():
         "Valores calculados pela quantidade em estoque multiplicada pelo preço de compra "
         "da última compra e pelo preço de venda sugerido."
     )
+
+    # Indicador-resumo da idade do estoque: quantidade de produtos em cada faixa.
+    # A contagem considera os produtos distintos exibidos no estoque completo,
+    # antes dos filtros da tabela.
+    contagem_idade = {
+        "idade-verde": 0,
+        "idade-amarela": 0,
+        "idade-laranja": 0,
+        "idade-vermelha": 0,
+    }
+    for item_kpi in itens:
+        classe_kpi = _classificar_idade(item_kpi.get("idade_media"))["classe"]
+        contagem_idade[classe_kpi] = contagem_idade.get(classe_kpi, 0) + 1
+
+    total_com_idade = sum(contagem_idade.values())
+    def _pct_idade(qtd):
+        return (qtd / total_com_idade * 100) if total_com_idade else 0
+
+    st.markdown("**Idade do estoque**")
+
+    # O KPI funciona como filtro da tabela. Clicar em uma faixa aplica o filtro;
+    # clicar novamente na mesma faixa remove o filtro.
+    filtro_idade_selecionado = st.session_state.get("estoque_filtro_idade")
+    kpi_idade = st.columns(4)
+    faixas_idade = [
+        ("idade-verde", "🟢", "0-60 dias", "verde"),
+        ("idade-amarela", "🟡", ">60-120 dias", "amarela"),
+        ("idade-laranja", "🟠", ">120-180 dias", "laranja"),
+        ("idade-vermelha", "🔴", ">180 dias", "vermelha"),
+    ]
+
+    for col_kpi, (classe_faixa, emoji, rotulo_faixa, sufixo) in zip(kpi_idade, faixas_idade):
+        qtd_faixa = contagem_idade.get(classe_faixa, 0)
+        selecionado = filtro_idade_selecionado == classe_faixa
+        rotulo_kpi = (
+            f"✓ {emoji} {rotulo_faixa}: {qtd_faixa} ({_pct_idade(qtd_faixa):.1f}%)"
+            if selecionado
+            else f"{emoji} {rotulo_faixa}: {qtd_faixa} ({_pct_idade(qtd_faixa):.1f}%)"
+        )
+
+        with col_kpi:
+            if st.button(
+                rotulo_kpi,
+                key=f"filtro_idade_{sufixo}_kpi",
+                help=(
+                    f"Filtrar estoque por {rotulo_faixa}. "
+                    "Clique novamente para remover o filtro."
+                ),
+                use_container_width=True,
+            ):
+                if filtro_idade_selecionado == classe_faixa:
+                    st.session_state["estoque_filtro_idade"] = None
+                else:
+                    st.session_state["estoque_filtro_idade"] = classe_faixa
+                reset_paginacao("estoque_atual")
+                st.rerun()
+
+    if filtro_idade_selecionado:
+        rotulos_filtro = {
+            "idade-verde": "0-60 dias",
+            "idade-amarela": ">60-120 dias",
+            "idade-laranja": ">120-180 dias",
+            "idade-vermelha": ">180 dias",
+        }
+        st.caption(
+            f"Filtro de idade ativo: **{rotulos_filtro.get(filtro_idade_selecionado, filtro_idade_selecionado)}**. "
+            "Clique novamente no indicador para limpar."
+        )
+
     st.markdown("---")
 
     # Filtros e ordenação
@@ -298,6 +743,7 @@ def _secao_estoque_atual():
             {"chave": "codigo_interno", "rotulo": "Cod. Produto"},
             {"chave": "saldo", "rotulo": "Qtde. Estoque"},
             {"chave": "preco_venda", "rotulo": "Preço Venda"},
+            {"chave": "idade_media", "rotulo": "Idade Produto"},
             {"chave": "data_ultima_compra", "rotulo": "Data Ult. Compra"},
         ]
         campo_ordenacao, ordem_decrescente = ordenacao(
@@ -338,12 +784,25 @@ def _secao_estoque_atual():
     if mostrar_somente_editados:
         itens = [i for i in itens if i.get("flag_ajuste_preco_venda")]
 
+    # Filtro selecionado pelo KPI de idade.
+    filtro_idade_selecionado = st.session_state.get("estoque_filtro_idade")
+    if filtro_idade_selecionado:
+        itens = [
+            i for i in itens
+            if _classificar_idade(i.get("idade_media"))["classe"] == filtro_idade_selecionado
+        ]
+
     # Ordenação escolhida pelo usuário (crescente/decrescente pelo campo selecionado)
     if campo_ordenacao == "data_ultima_compra":
         # Itens sem data de compra sempre vão para o final, independente da direção
         def _chave_ordenacao(item):
             data = item["data_ultima_compra"]
             return (data is None, data or "")
+    elif campo_ordenacao == "idade_media":
+        def _chave_ordenacao(item):
+            # Produtos sem idade ficam no final.
+            idade = item.get("idade_media")
+            return (idade is None, idade if idade is not None else 0)
     elif campo_ordenacao == "codigo_interno":
         def _chave_ordenacao(item):
             return item["codigo_interno"].lower()
@@ -367,6 +826,7 @@ def _secao_estoque_atual():
         bool(buscar_descricao_produto),
         bool(mostrar_negativo),
         bool(mostrar_somente_editados),
+        filtro_idade_selecionado,
         campo_ordenacao,
         bool(ordem_decrescente),
     )
@@ -395,21 +855,52 @@ def _secao_estoque_atual():
     _injetar_estilo_tabela_estoque()
 
     with st.container(border=True):
-        c_cod, c_desc, c_saldo, c_compra, c_venda, c_espaco, c_data = st.columns(
-            [1.4, 2.3, 1.3, 1.5, 1.5, 0.3, 1.6]
+        c_cod, c_desc, c_saldo, c_compra, c_venda, c_idade, c_data = st.columns(
+            [1.4, 2.3, 1.3, 1.5, 1.5, 1.5, 1.6]
         )
         c_cod.markdown("**Cod. Produto**")
         c_desc.markdown("**Desc. Produto**")
         c_saldo.markdown("**Qtde. Estoque**")
         c_compra.markdown("**Preço Compra**")
         c_venda.markdown("**Preço Venda**")
+        c_idade.markdown("**Idade Produto**")
         c_data.markdown("**Data Ult. Compra**")
 
         st.divider()
 
         for item in itens_pagina:
-            col_cod, col_desc, col_saldo, col_compra, col_venda, col_espaco, col_data = st.columns(
-                [1.4, 2.3, 1.3, 1.5, 1.5, 0.3, 1.6],
+            classificacao = _classificar_idade(item.get("idade_media"))
+            idade_media = item.get("idade_media")
+            if idade_media is None:
+                idade_rotulo = "-"
+            else:
+                idade_rotulo = f"{idade_media:.0f} dias"
+
+            linhas_tooltip = []
+            compras_idade = item.get("compras_idade") or []
+            if len(compras_idade) > 1:
+                linhas_tooltip.append("Histórico de compras:")
+            elif len(compras_idade) == 1:
+                linhas_tooltip.append("Compra:")
+
+            for compra in compras_idade:
+                linhas_tooltip.append(
+                    f"NF {compra['numero_nf']} · {compra['data_fmt']} · "
+                    f"idade {compra['idade_dias']} dias · "
+                    f"qtde { _fmt_qtd(compra['quantidade']) } · "
+                    f"restante { _fmt_qtd(compra['restante']) }"
+                )
+
+            if not linhas_tooltip:
+                linhas_tooltip.append("Sem histórico de compra disponível.")
+
+            tooltip_texto = "\n".join(linhas_tooltip)
+            tooltip_idade = html.escape(tooltip_texto, quote=True)
+
+            # Cada produto continua em uma linha normal. Somente o indicador
+            # "Idade Produto" recebe a cor da faixa, evitando pintar a linha inteira.
+            col_cod, col_desc, col_saldo, col_compra, col_venda, col_idade, col_data = st.columns(
+                [1.4, 2.3, 1.3, 1.5, 1.5, 1.5, 1.6],
                 vertical_alignment="center",
             )
             col_cod.write(item["codigo_interno"])
@@ -451,17 +942,21 @@ def _secao_estoque_atual():
                     item.get("flag_ajuste_preco_venda", False),
                 )
 
-            data_compra = item["data_ultima_compra"]
-            if data_compra:
-                try:
-                    data_compra = str(data_compra)[:10]
-                    ano, mes, dia = data_compra.split("-")
-                    data_compra = f"{dia}/{mes}/{ano}"
-                except (ValueError, AttributeError):
-                    pass
-            else:
-                data_compra = "-"
-            col_data.write(data_compra)
+                # Indicador da idade média. O tooltip detalha a idade de cada
+                # compra quando houver histórico múltiplo.
+            indicador_idade = (
+                f'<span class="idade-produto" title="{tooltip_idade}">'
+                f'<span class="idade-dot {classificacao["classe"]}"></span>'
+                f'{html.escape(idade_rotulo)}'
+                f'</span>'
+            )
+            col_idade.markdown(indicador_idade, unsafe_allow_html=True)
+
+            col_data.write(_formatar_data(item["data_ultima_compra"]))
+            st.markdown(
+                '<div style="height:1px;background:rgba(128,128,128,.16);margin:4px 0;"></div>',
+                unsafe_allow_html=True,
+            )
 
     render_paginacao(
         "estoque_atual",
