@@ -1,3 +1,7 @@
+import os
+import subprocess
+from pathlib import Path
+import re
 import streamlit as st
 from datetime import datetime, timedelta
 from db import supabase
@@ -518,12 +522,99 @@ def _renderizar_log_detalhe(grupos: list[dict]):
                     st.caption(e["mensagem"])
 
 
+def _localizar_docs() -> Path:
+    candidatos = [
+        Path(__file__).resolve().parent / "docs",
+        Path(__file__).resolve().parent.parent / "docs",
+    ]
+    for caminho in candidatos:
+        if caminho.exists():
+            return caminho
+    return candidatos[0]
+
+
+def _ler_versao() -> str:
+    arquivo = _localizar_docs() / "version.py"
+    try:
+        conteudo = arquivo.read_text(encoding="utf-8")
+        match = re.search(r'APP_VERSION\s*=\s*["\\\']([^"\\\']+)["\\\']', conteudo)
+        return match.group(1) if match else "Não informada"
+    except Exception:
+        return "Não informada"
+
+
+def _ler_changelog() -> str:
+    try:
+        return (_localizar_docs() / "changelog.md").read_text(encoding="utf-8").strip()
+    except Exception:
+        return ""
+
+
+def _informacoes_git() -> tuple[str, str]:
+    try:
+        raiz = Path(__file__).resolve().parent
+        h = subprocess.run(
+            ["git", "-C", str(raiz), "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=3, check=True,
+        ).stdout.strip()
+        d = subprocess.run(
+            ["git", "-C", str(raiz), "log", "-1", "--format=%cI"],
+            capture_output=True, text=True, timeout=3, check=True,
+        ).stdout.strip()
+        data = "-"
+        if d:
+            data = datetime.fromisoformat(d.replace("Z", "+00:00")).strftime("%d/%m/%Y %H:%M")
+        return h or "-", data
+    except Exception:
+        return "-", "-"
+
+
 def _secao_info_sistema():
-    st.subheader("ℹ️ Informações Administrativas")
-    st.write(
-        "Área destinada a módulos operacionais e de manutenção avançada do sistema.  \n"
-        "Acesso restrito ao administrador (`bruno.ishikawa@gmail.com`) ou ambiente de desenvolvimento (`SKIP_AUTH=True`)."
-    )
+    st.subheader("ℹ️ Informações do Sistema")
+
+    nome_aplicacao = "Sistema ERP Light - BR"
+    ambiente = os.getenv("APP_ENV", "").strip().upper()
+    if not ambiente:
+        ambiente = "DEV" if os.getenv("SKIP_AUTH", "").strip().lower() == "true" else "NÃO INFORMADO"
+
+    versao = _ler_versao()
+    commit, ultima_atualizacao = _informacoes_git()
+    changelog = _ler_changelog()
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        with st.container(border=True):
+            st.caption("Aplicação")
+            st.markdown(f"### {nome_aplicacao}")
+            st.caption("Versão")
+            st.markdown(f"### `v{versao}`")
+
+    with col2:
+        with st.container(border=True):
+            st.caption("Ambiente")
+            icone = {"PROD": "🟢", "HOMOLOG": "🟡", "DEV": "🔵"}.get(ambiente, "⚪")
+            st.markdown(f"### {icone} {ambiente}")
+            st.caption("Última atualização")
+            st.markdown(f"### {ultima_atualizacao}")
+
+    with col3:
+        with st.container(border=True):
+            st.caption("Informações Administrativas")
+            st.markdown(
+                "Área destinada a módulos operacionais e de manutenção avançada do sistema."
+            )
+            st.caption(
+                "Acesso restrito ao administrador (`bruno.ishikawa@gmail.com`) "
+                "ou ambiente de desenvolvimento (`SKIP_AUTH=True`)."
+            )
+
+    st.caption(f"Commit: `{commit}`")
+    st.caption("A data de atualização corresponde ao último commit disponível no Git.")
+
+    if changelog:
+        with st.expander("📋 Histórico de versões"):
+            st.markdown(changelog)
 
 
 def tela_admin():
