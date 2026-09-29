@@ -44,7 +44,8 @@ def _secao_exclusao_compras():
                 "id, numero_nf, data_emissao, valor_total, chave_acesso, "
                 "compra_origem, fornecedor_id, fornecedores(razao_social, nome_fantasia)"
             )
-            .order("data_emissao", desc=True)
+            # No módulo de exclusão, a ordenação padrão é pelo ID mais recente.
+            .order("id", desc=True)
             .execute()
         )
         compras = resp_compras.data or []
@@ -63,15 +64,49 @@ def _secao_exclusao_compras():
         vt = _fmt_moeda(c.get("valor_total"))
         return f"NF {nf} | {forn} | {dt} | {vt} (ID #{c['id']})"
 
-    opcoes = {c["id"]: c for c in compras}
-    compra_id_selecionado = st.selectbox(
-        "Selecione a compra que deseja excluir",
-        options=list(opcoes.keys()),
-        format_func=lambda cid: _rotulo_compra(opcoes[cid]),
-        key="admin_select_compra_excluir",
-    )
+    # Por padrão, nenhuma compra fica selecionada.
+    # O usuário pode localizar uma NF pelo filtro e então escolher a compra no dropdown.
+    col_dropdown, col_filtro_nf = st.columns([3.2, 1.3])
 
-    if not compra_id_selecionado:
+    with col_filtro_nf:
+        filtro_nf = st.text_input(
+            "Filtrar por NF",
+            value="",
+            placeholder="Digite a NF...",
+            key="admin_filtro_nf_excluir",
+        ).strip()
+
+    compras_filtradas = compras
+    if filtro_nf:
+        termo_nf = filtro_nf.casefold()
+        compras_filtradas = [
+            c for c in compras
+            if termo_nf in str(c.get("numero_nf") or "").casefold()
+        ]
+
+    opcoes = {c["id"]: c for c in compras_filtradas}
+    opcoes_dropdown = [None] + list(opcoes.keys())
+
+    with col_dropdown:
+        compra_id_selecionado = st.selectbox(
+            "Selecione a compra que deseja excluir",
+            options=opcoes_dropdown,
+            index=0,
+            format_func=lambda cid: (
+                "Selecione uma compra..."
+                if cid is None
+                else _rotulo_compra(opcoes[cid])
+            ),
+            key="admin_select_compra_excluir",
+        )
+
+    if compra_id_selecionado is None:
+        if filtro_nf and not compras_filtradas:
+            st.info(f"Nenhuma compra encontrada para a NF **{filtro_nf}**.")
+        else:
+            st.caption(
+                "Nenhuma compra selecionada. Use o filtro de NF ou escolha uma compra no dropdown."
+            )
         return
 
     compra = opcoes[compra_id_selecionado]
