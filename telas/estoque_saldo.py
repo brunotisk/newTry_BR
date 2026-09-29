@@ -20,6 +20,39 @@ def _fmt_qtd(valor) -> str:
     return f"{valor:g}"
 
 
+def _renderizar_kpi_grupo(titulo: str, item1: tuple[str, str], item2: tuple[str, str]) -> None:
+    """Renderiza um card de KPI com dois números lado a lado sob um título
+    comum (ex.: "Quantidade de Produtos" -> Peças em estoque | Distintos).
+
+    É HTML puro via st.markdown (não usa st.container/st.columns por dentro)
+    de propósito: o padding do card fica 100% sob nosso controle, sem
+    depender de sobrescrever o CSS interno que o Streamlit gera para
+    data-testid="stVerticalBlockBorderWrapper" — essa dependência é frágil e
+    muda de comportamento entre versões do Streamlit.
+    """
+    rotulo1, valor1 = item1
+    rotulo2, valor2 = item2
+    st.markdown(
+        f"""
+        <div class="kpi-grupo-card">
+            <div class="kpi-grupo-titulo">{html.escape(titulo)}</div>
+            <div class="kpi-grupo-linha">
+                <div class="kpi-grupo-item">
+                    <div class="kpi-grupo-rotulo">{html.escape(rotulo1)}</div>
+                    <div class="kpi-grupo-valor">{html.escape(valor1)}</div>
+                </div>
+                <div class="kpi-grupo-divisor"></div>
+                <div class="kpi-grupo-item">
+                    <div class="kpi-grupo-rotulo">{html.escape(rotulo2)}</div>
+                    <div class="kpi-grupo-valor">{html.escape(valor2)}</div>
+                </div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def _injetar_estilo_tabela_estoque():
     """CSS da tabela de estoque e dos indicadores de idade."""
     st.markdown(
@@ -31,6 +64,50 @@ def _injetar_estilo_tabela_estoque():
             text-overflow: ellipsis;
             max-width: 100%;
         }
+
+        /* KPIs de estoque agrupados (quantidade / valor). Cards em HTML puro
+           (não usam st.container/st.columns internos), então o padding aqui
+           é garantido — não depende de sobrescrever CSS interno do Streamlit. */
+        .kpi-grupo-card {
+            border: 1px solid rgba(128, 128, 128, 0.35);
+            border-radius: 0.5rem;
+            padding: 1.1rem 1.1rem 1.6rem 1.1rem;
+            box-sizing: border-box;
+            min-height: 104px;
+        }
+        .kpi-grupo-titulo {
+            text-align: center;
+            font-weight: 700;
+            font-size: 0.92rem;
+            opacity: 0.9;
+            margin-bottom: 0.7rem;
+        }
+        .kpi-grupo-linha {
+            display: flex;
+            align-items: stretch;
+        }
+        .kpi-grupo-item {
+            flex: 1 1 0;
+            text-align: center;
+            min-width: 0;
+        }
+        .kpi-grupo-divisor {
+            width: 1px;
+            background: rgba(128, 128, 128, 0.25);
+            margin: 0 0.75rem;
+        }
+        .kpi-grupo-rotulo {
+            font-size: 0.8rem;
+            opacity: 0.75;
+            margin-bottom: 0.25rem;
+        }
+        .kpi-grupo-valor {
+            font-size: 1.8rem;
+            font-weight: 700;
+            line-height: 1.15;
+            white-space: nowrap;
+        }
+
         div[class*="st-key-venda_btn_wrap_"] div[data-testid="stButton"] {
             display: flex;
             justify-content: center;
@@ -626,28 +703,20 @@ def _secao_estoque_atual():
         i["saldo"] * i["preco_venda"] for i in itens
     )
 
-    col_kpi1, col_kpi2, col_kpi3, col_kpi4 = st.columns(4)
-    with col_kpi1:
-        with st.container(border=True):
-            st.caption("Qtde. Peças Estoque")
-            st.title(_fmt_qtd(qtde_pecas_estoque))
-    with col_kpi2:
-        with st.container(border=True):
-            st.caption("Qtde. Distinta Peças")
-            st.title(f"{qtde_distinta_pecas}")
-    with col_kpi3:
-        with st.container(border=True):
-            st.caption("Valor Estoque Compra")
-            st.title(_fmt_moeda(valor_estoque_compra))
-    with col_kpi4:
-        with st.container(border=True):
-            st.caption("Valor Estoque Venda")
-            st.title(_fmt_moeda(valor_estoque_venda))
+    col_kpi_qtde, col_kpi_valor = st.columns(2)
+    with col_kpi_qtde:
+        _renderizar_kpi_grupo(
+            "📦 Quantidade de Produtos",
+            ("Peças em estoque", _fmt_qtd(qtde_pecas_estoque)),
+            ("Produtos distintos", f"{qtde_distinta_pecas}"),
+        )
 
-    st.caption(
-        "Valores calculados pela quantidade em estoque multiplicada pelo preço de compra "
-        "da última compra e pelo preço de venda sugerido."
-    )
+    with col_kpi_valor:
+        _renderizar_kpi_grupo(
+            "💰 Valor de Estoque",
+            ("Preço de compra", _fmt_moeda(valor_estoque_compra)),
+            ("Preço de venda", _fmt_moeda(valor_estoque_venda)),
+        )
 
     # Indicador-resumo da idade do estoque: quantidade de produtos em cada faixa.
     # A contagem considera os produtos distintos exibidos no estoque completo,
@@ -666,6 +735,7 @@ def _secao_estoque_atual():
     def _pct_idade(qtd):
         return (qtd / total_com_idade * 100) if total_com_idade else 0
 
+    st.markdown("<div style='height:1rem;'></div>", unsafe_allow_html=True)
     st.markdown("**Idade do estoque**")
 
     # O KPI funciona como filtro da tabela. Clicar em uma faixa aplica o filtro;
