@@ -1,8 +1,10 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import tempfile
 import hashlib
 import html
 import uuid
+import pandas as pd
 from io import BytesIO
 from datetime import date, datetime, timedelta
 from typing import Optional
@@ -541,7 +543,10 @@ def _resetar_controles_venda(venda, nova_venda, produto_selecionado):
     produto_id = (produto_selecionado or {}).get("id")
     chave_produto = f"{chave_venda}:{produto_id}"
 
-    if st.session_state.get("venda_controles_chave") != chave_produto:
+    if (
+        st.session_state.get("venda_controles_chave") != chave_produto
+        or "venda_desconto_texto" not in st.session_state
+    ):
         st.session_state["venda_controles_chave"] = chave_produto
         st.session_state["venda_qtd"] = max(1.0, float(venda.get("quantidade") or 1))
         if nova_venda and produto_selecionado:
@@ -650,154 +655,579 @@ def _render_controles_valores_venda():
     )
 
 
-_PREFIXOS_ITEM_VENDA = (
-    "venda_item_produto_",
-    "venda_item_controles_chave_",
-    "venda_item_qtd_",
-    "contador_venda_item_",
-    "venda_item_valor_lista_",
-    "venda_item_valor_lista_aberto_",
-    "venda_item_valor_lista_bloqueio_",
-    "venda_item_valor_lista_input_",
-    "venda_item_desconto_texto_",
-)
-
+# ---------------------------------------------------------------------------
+# Itens da venda nova: tabela-resumo (somente leitura) + formulário único
+# ---------------------------------------------------------------------------
+# Estado guardado em st.session_state:
+#   venda_itens          lista de itens já adicionados à venda
+#   venda_item_editando  uid do item carregado no formulário (None = item novo)
+#   vitem_*              widgets e estado do formulário único de item
+#
+# Todos os botões dessa área usam callbacks (on_click). O callback roda ANTES
+# do re-render do popup, então pode alterar à vontade as chaves dos widgets do
+# formulário (limpar, carregar um item para edição etc.) e dispensa st.rerun(),
+# que fecharia o dialog.
 
 def _limpar_itens_venda_nova():
-    """Remove do session_state a lista de itens da venda nova e todas as
-    chaves de widgets de cada linha (produto, quantidade, valores). Chamado
-    ao cancelar, ao salvar com sucesso, ou ao remover uma linha — assim o
-    próximo "➕ Adicionar venda" sempre abre com uma única linha em branco."""
-    for row_uid in st.session_state.pop("venda_itens_ids", []):
-        for prefixo in _PREFIXOS_ITEM_VENDA:
-            st.session_state.pop(f"{prefixo}{row_uid}", None)
+    """Descarta todos os itens e o estado do formulário de item. Chamado ao
+    cancelar, ao salvar com sucesso e ao abrir '➕ Adicionar venda' — assim o
+    popup sempre começa sem itens e com o formulário vazio."""
+    ss = st.session_state
+    for chave in (
+        "venda_itens", "venda_item_editando", "venda_msg_falha",
+        "venda_header", "venda_header_ok", "venda_header_ref",
+        "venda_controles_chave",
+    ):
+        ss.pop(chave, None)
+    for chave in [k for k in ss.keys() if str(k).startswith(("vitem_", "contador_vitem_"))]:
+        ss.pop(chave, None)
 
 
-def _render_item_venda(row_uid: str, produtos_opcoes: dict, produtos_excluidos: set) -> dict:
-    """Renderiza uma linha 'item' do formulário de nova venda: produto +
-    quantidade + valores (mesmos controles de _render_controles_valores_venda,
-    só que indexados por `row_uid` para suportar várias linhas simultâneas).
+def _definir_form_item(produto, quantidade, valor_lista, valor_desconto, aberto=False):
+    """Carrega valores no formulário único de item. Só deve ser chamada em
+    callbacks ou antes de os widgets do formulário serem criados na execução.
 
-    Retorna sempre um dict com `remover` (bool). Quando `remover` é True, o
-    chamador deve excluir esta linha e ignorar os demais campos. Quando um
-    produto ainda não foi escolhido nesta linha, os demais campos vêm vazios
-    (`produto` é None).
-    """
-    rotulos_disponiveis = [
-        rotulo for rotulo, prod in produtos_opcoes.items()
-        if prod["id"] not in produtos_excluidos
-    ]
-    rotulo_atual = st.session_state.get(f"venda_item_produto_{row_uid}")
+    `vitem_gen` entra na key do contador de quantidade: trocar a key força o
+    componente a reiniciar com o novo valor (o componente guarda estado
+    próprio no front-end e ignoraria uma mudança só no argumento `valor`)."""
+    ss = st.session_state
+    ss["vitem_gen"] = ss.get("vitem_gen", 0) + 1
+    ss["vitem_ref"] = produto["id"] if produto else None
+    ss["vitem_qtd"] = max(1, int(quantidade))
+    ss["vitem_valor_lista"] = float(valor_lista)
+    ss["vitem_valor_lista_input"] = _fmt_valor_input(valor_lista)
+    ss["vitem_bloqueio"] = bool(aberto)
+    ss["vitem_desconto"] = _fmt_valor_input(valor_desconto)
 
-    col_produto, col_remover = st.columns([5, 1], vertical_alignment="bottom")
-    with col_produto:
-        produto_rotulo = st.selectbox(
-            "Produto",
-            rotulos_disponiveis,
-            index=rotulos_disponiveis.index(rotulo_atual) if rotulo_atual in rotulos_disponiveis else None,
-            placeholder="Selecione o produto...",
-            key=f"venda_item_produto_{row_uid}",
+
+def _cb_adicionar_item(produtos_opcoes: dict):
+    """Botão '➕ Adicionar item' / '✔️ Atualizar item'."""
+    ss = st.session_state
+    produto = produtos_opcoes.get(ss.get("vitem_produto"))
+    if not produto:
+        ss["vitem_msg"] = "Selecione o produto."
+        return
+
+    quantidade = max(1, int(ss.get("vitem_qtd", 1)))
+    valor_lista = _parse_valor_input(
+        ss.get("vitem_valor_lista_input"), ss.get("vitem_valor_lista", 0)
+    )
+    valor_desconto = _parse_valor_input(ss.get("vitem_desconto"), 0.0)
+    valor_final = quantidade * valor_lista - valor_desconto
+
+    saldo = produto.get("saldo")
+    if saldo is not None and quantidade > saldo:
+        ss["vitem_msg"] = (
+            f"Quantidade ({quantidade}) maior que o saldo em estoque ({saldo:g})."
         )
-    with col_remover:
-        remover = st.button(
-            "🗑️", key=f"venda_item_remover_{row_uid}",
-            help="Remover este item", use_container_width=True,
-        )
+        return
+    if valor_final < 0:
+        ss["vitem_msg"] = "O desconto não pode ser maior que o valor total do item."
+        return
 
-    if remover:
-        return {"remover": True, "produto": None}
-
-    produto_selecionado = produtos_opcoes.get(produto_rotulo)
-    if not produto_selecionado:
-        return {"remover": False, "produto": None}
-
-    # Reinicia os controles de quantidade/valor sempre que o produto desta
-    # linha muda — mesma lógica de _resetar_controles_venda, indexada por
-    # row_uid em vez de uma única chave global.
-    chave_item = f"{row_uid}:{produto_selecionado['id']}"
-    if st.session_state.get(f"venda_item_controles_chave_{row_uid}") != chave_item:
-        st.session_state[f"venda_item_controles_chave_{row_uid}"] = chave_item
-        st.session_state[f"venda_item_qtd_{row_uid}"] = 1
-        st.session_state[f"venda_item_valor_lista_{row_uid}"] = float(
-            produto_selecionado.get("estoque_preco_venda_sugerida") or 0
-        )
-        st.session_state[f"venda_item_desconto_texto_{row_uid}"] = _fmt_valor_input(0)
-        st.session_state[f"venda_item_valor_lista_aberto_{row_uid}"] = False
-        st.session_state[f"venda_item_valor_lista_input_{row_uid}"] = _fmt_valor_input(
-            st.session_state[f"venda_item_valor_lista_{row_uid}"]
-        )
-
-    col_qtd, col_lista, col_desc, col_final = st.columns(4)
-
-    with col_qtd:
-        st.markdown("**Quantidade**")
-        estado_qtd = contador_quantidade(
-            valor=int(max(1.0, float(st.session_state.get(f"venda_item_qtd_{row_uid}", 1)))),
-            min_valor=1,
-            bloqueado=True,
-            label="",
-            key=f"contador_venda_item_{row_uid}",
-        )
-        quantidade = max(
-            1, int(estado_qtd.get("valor", st.session_state.get(f"venda_item_qtd_{row_uid}", 1)))
-        )
-        st.session_state[f"venda_item_qtd_{row_uid}"] = quantidade
-
-    with col_lista:
-        col_rotulo, col_bloqueio = st.columns([2, 1], vertical_alignment="center")
-        with col_rotulo:
-            st.markdown("**Valor lista**")
-        with col_bloqueio:
-            aberto = st.toggle(
-                "🔓",
-                value=st.session_state.get(f"venda_item_valor_lista_aberto_{row_uid}", False),
-                key=f"venda_item_valor_lista_bloqueio_{row_uid}",
-                help=(
-                    "Travado: usa o valor sugerido do estoque. "
-                    "Ative para digitar um valor lista diferente."
-                ),
-            )
-            st.session_state[f"venda_item_valor_lista_aberto_{row_uid}"] = aberto
-
-        valor_lista_texto = st.text_input(
-            "Valor lista",
-            key=f"venda_item_valor_lista_input_{row_uid}",
-            disabled=not aberto,
-            label_visibility="collapsed",
-        )
-        valor_lista = _parse_valor_input(
-            valor_lista_texto, st.session_state.get(f"venda_item_valor_lista_{row_uid}", 0),
-        )
-        st.session_state[f"venda_item_valor_lista_{row_uid}"] = valor_lista
-
-    with col_desc:
-        st.markdown("**Desconto**")
-        desconto_texto = st.text_input(
-            "Desconto",
-            key=f"venda_item_desconto_texto_{row_uid}",
-            label_visibility="collapsed",
-        )
-        valor_desconto = _parse_valor_input(desconto_texto, 0.0)
-
-    with col_final:
-        st.markdown("**Valor final**")
-        valor_final = (float(quantidade) * float(valor_lista)) - valor_desconto
-        st.text_input(
-            "Valor final",
-            value=_fmt_valor_input(valor_final),
-            disabled=True,
-            label_visibility="collapsed",
-            key=f"venda_item_valor_final_display_{row_uid}",
-        )
-
-    return {
-        "remover": False,
-        "produto": produto_selecionado,
+    itens = ss.setdefault("venda_itens", [])
+    editando = ss.get("venda_item_editando")
+    item = {
+        "uid": editando or str(uuid.uuid4()),
+        "produto": produto,
         "quantidade": float(quantidade),
         "valor_lista": float(valor_lista),
         "valor_desconto": float(valor_desconto),
         "valor_final": float(valor_final),
     }
+    posicao = next((i for i, x in enumerate(itens) if x["uid"] == item["uid"]), None)
+    if posicao is None:
+        itens.append(item)
+        ss["vitem_pagina"] = max(1, -(-len(itens) // _ITENS_POR_PAGINA_VENDA))
+    else:
+        itens[posicao] = item
+
+    # Item gravado na tabela: volta o formulário para o estado "novo item".
+    ss["venda_item_editando"] = None
+    ss["vitem_produto"] = None
+    _definir_form_item(None, 1, 0.0, 0.0)
+
+
+def _cb_editar_item(uid: str, produtos_opcoes: dict):
+    """Ícone ✏️ da tabela: carrega o item no formulário único."""
+    ss = st.session_state
+    item = next((x for x in ss.get("venda_itens", []) if x["uid"] == uid), None)
+    if not item:
+        return
+    rotulo = next(
+        (r for r, p in produtos_opcoes.items() if p["id"] == item["produto"]["id"]),
+        None,
+    )
+    if rotulo is None:
+        ss["vitem_msg"] = "Este produto não tem mais saldo em estoque."
+        return
+
+    sugerido = float(item["produto"].get("estoque_preco_venda_sugerida") or 0)
+    _definir_form_item(
+        item["produto"],
+        item["quantidade"],
+        item["valor_lista"],
+        item["valor_desconto"],
+        # Se o valor lista do item foi alterado manualmente, já abre destravado.
+        aberto=abs(item["valor_lista"] - sugerido) > 0.004,
+    )
+    ss["vitem_produto"] = rotulo
+    ss["venda_item_editando"] = uid
+    ss.pop("vitem_msg", None)
+
+
+def _cb_cancelar_edicao():
+    ss = st.session_state
+    ss["venda_item_editando"] = None
+    ss["vitem_produto"] = None
+    ss.pop("vitem_msg", None)
+    _definir_form_item(None, 1, 0.0, 0.0)
+
+
+def _cb_remover_item(uid: str):
+    ss = st.session_state
+    ss["venda_itens"] = [x for x in ss.get("venda_itens", []) if x["uid"] != uid]
+    if ss.get("venda_item_editando") == uid:
+        _cb_cancelar_edicao()
+
+
+def _rerun_dialogo() -> bool:
+    """Reexecuta só o popup (sem fechá-lo). Retorna False quando a versão do
+    Streamlit não suporta st.rerun(scope="fragment"); quando suporta, a
+    função não retorna (o rerun interrompe a execução)."""
+    try:
+        st.rerun(scope="fragment")
+    except Exception:
+        return False
+    return False
+
+
+# Itens por página na tabela-resumo da venda.
+_ITENS_POR_PAGINA_VENDA = 5
+
+# CSS que formata SOMENTE a tabela-resumo (escopo pela key do container,
+# classe `st-key-vitem_tabela`). A formatação das células é inline, então a
+# tabela continua legível mesmo se o CSS não for aplicado.
+_CSS_TABELA_ITENS = """
+<style>
+.st-key-vitem_tabela,
+.st-key-vitem_tabela [data-testid="stVerticalBlock"] { gap: 0 !important; }
+.st-key-vitem_tabela [data-testid="stHorizontalBlock"] {
+    gap: 0.5rem !important; align-items: center !important;
+}
+.st-key-vitem_tabela [data-testid="stElementContainer"],
+.st-key-vitem_tabela [data-testid="element-container"],
+.st-key-vitem_tabela [data-testid="stMarkdownContainer"] { margin: 0 !important; }
+.st-key-vitem_tabela [data-testid="stMarkdownContainer"] p { margin: 0 !important; }
+
+/* Linha de títulos: divisória única, de ponta a ponta. */
+.st-key-vitem_cab {
+    border-bottom: 1px solid rgba(128,128,128,0.45);
+    padding: 0.1rem 0 0.35rem 0;
+    margin-bottom: 0.15rem;
+}
+/* Linhas de itens: altura uniforme e divisória suave entre elas. */
+[class*="st-key-vitem_linha_"] {
+    border-bottom: 1px solid rgba(128,128,128,0.16);
+    padding: 0.3rem 0;
+}
+[class*="st-key-vitem_linha_"]:last-of-type { border-bottom: none; }
+
+/* Botões de ação (editar / remover): compactos e centralizados. */
+.st-key-vitem_tabela button {
+    min-height: 1.9rem !important; height: 1.9rem !important;
+    padding: 0 !important; font-size: 0.85rem !important; line-height: 1 !important;
+}
+
+/* Paginação. */
+.st-key-vitem_paginacao { padding-top: 0.5rem; }
+.st-key-vitem_paginacao [data-testid="stHorizontalBlock"] { align-items: center !important; }
+</style>
+"""
+
+
+def _celula_tabela(texto, alinhar="left", cabecalho=False, negrito=False, titulo=None):
+    """Célula em uma linha só (sem quebra), com reticências se não couber.
+    Altura fixa e conteúdo centralizado na vertical, para alinhar com os
+    botões da mesma linha."""
+    justificar = {"left": "flex-start", "right": "flex-end", "center": "center"}[alinhar]
+    estilo = (
+        f"display:flex;align-items:center;justify-content:{justificar};"
+        "min-height:1.9rem;white-space:nowrap;overflow:hidden;"
+        f"text-align:{alinhar};"
+    )
+    if cabecalho:
+        estilo += (
+            "min-height:1.4rem;font-size:0.7rem;font-weight:600;opacity:0.65;"
+            "text-transform:uppercase;letter-spacing:0.03em;"
+        )
+    else:
+        estilo += "font-size:0.85rem;"
+        if negrito:
+            estilo += "font-weight:600;"
+    tip = f' title="{html.escape(titulo)}"' if titulo else ""
+    # O texto vai em um <span> para a reticência funcionar dentro do flex.
+    return (
+        f'<div style="{estilo}"{tip}><span style="overflow:hidden;'
+        f'text-overflow:ellipsis;white-space:nowrap;">{texto}</span></div>'
+    )
+
+
+def _cb_pagina_itens(delta: int):
+    ss = st.session_state
+    ss["vitem_pagina"] = max(1, ss.get("vitem_pagina", 1) + delta)
+
+
+def _container_com_key(key: str, **opcoes):
+    try:
+        return st.container(key=key, **opcoes)
+    except TypeError:  # Streamlit antigo, sem `key` no container
+        return st.container(**opcoes)
+
+
+def _render_tabela_itens(itens: list, produtos_opcoes: dict):
+    """Tabela-resumo paginada dos itens já adicionados. A edição é feita pelo
+    formulário único, acionado pelo ícone ✏️ no fim da linha."""
+    if not itens:
+        st.caption(
+            "Nenhum item adicionado ainda. Preencha o formulário acima e "
+            "clique em **Adicionar item**."
+        )
+        return
+
+    ss = st.session_state
+    editando = ss.get("venda_item_editando")
+    larguras = [4.2, 0.8, 1.5, 1.5, 1.6, 0.5, 0.5]
+    alinhamento = ["left", "right", "right", "right", "right", "left", "left"]
+    titulos = ["Produto", "Qtd", "Valor lista", "Desconto", "Valor final", "", ""]
+
+    # Paginação: ajusta a página atual se itens foram removidos.
+    total_paginas = max(1, -(-len(itens) // _ITENS_POR_PAGINA_VENDA))
+    pagina = min(max(1, ss.get("vitem_pagina", 1)), total_paginas)
+    ss["vitem_pagina"] = pagina
+    inicio = (pagina - 1) * _ITENS_POR_PAGINA_VENDA
+    itens_pagina = itens[inicio:inicio + _ITENS_POR_PAGINA_VENDA]
+
+    st.markdown(_CSS_TABELA_ITENS, unsafe_allow_html=True)
+
+    with _container_com_key("vitem_tabela", border=True):
+        with _container_com_key("vitem_cab"):
+            cabecalho = st.columns(larguras, vertical_alignment="center")
+            for coluna, titulo, alinhar in zip(cabecalho, titulos, alinhamento):
+                coluna.markdown(
+                    _celula_tabela(html.escape(titulo), alinhar, cabecalho=True),
+                    unsafe_allow_html=True,
+                )
+
+        for item in itens_pagina:
+            uid = item["uid"]
+            produto = item["produto"]
+            with _container_com_key(f"vitem_linha_{uid}"):
+                cols = st.columns(larguras, vertical_alignment="center")
+
+                nome = f"{produto.get('codigo_interno') or '-'} — {produto.get('descricao') or '-'}"
+                texto_produto = html.escape(nome)
+                if uid == editando:
+                    texto_produto += ' <span style="opacity:0.6;font-weight:400;">· em edição</span>'
+                valores = [
+                    texto_produto,
+                    f"{item['quantidade']:g}",
+                    html.escape(_fmt_moeda(item["valor_lista"])),
+                    html.escape(_fmt_moeda(item["valor_desconto"])),
+                    html.escape(_fmt_moeda(item["valor_final"])),
+                ]
+                for i, valor in enumerate(valores):
+                    cols[i].markdown(
+                        _celula_tabela(
+                            valor,
+                            alinhamento[i],
+                            negrito=(i == 4 or uid == editando),
+                            titulo=nome if i == 0 else None,
+                        ),
+                        unsafe_allow_html=True,
+                    )
+                cols[5].button(
+                    "✏️",
+                    key=f"vitem_editar_{uid}",
+                    help="Editar este item",
+                    use_container_width=True,
+                    on_click=_cb_editar_item,
+                    args=(uid, produtos_opcoes),
+                )
+                cols[6].button(
+                    "🗑️",
+                    key=f"vitem_remover_{uid}",
+                    help="Remover este item",
+                    use_container_width=True,
+                    on_click=_cb_remover_item,
+                    args=(uid,),
+                )
+
+    # Rodapé: paginação (só quando há mais de uma página) + total.
+    if total_paginas > 1:
+        with _container_com_key("vitem_paginacao"):
+            _, c_ant, c_txt, c_prox, _ = st.columns([3, 1, 2, 1, 3], vertical_alignment="center")
+            c_ant.button(
+                "◀",
+                key="vitem_pag_ant",
+                help="Página anterior",
+                disabled=pagina <= 1,
+                use_container_width=True,
+                on_click=_cb_pagina_itens,
+                args=(-1,),
+            )
+            c_txt.markdown(
+                f"<div style='text-align:center;font-size:0.85rem;'>"
+                f"Página <b>{pagina}</b> de <b>{total_paginas}</b></div>",
+                unsafe_allow_html=True,
+            )
+            c_prox.button(
+                "▶",
+                key="vitem_pag_prox",
+                help="Próxima página",
+                disabled=pagina >= total_paginas,
+                use_container_width=True,
+                on_click=_cb_pagina_itens,
+                args=(1,),
+            )
+
+    total = sum(i["valor_final"] for i in itens)
+    st.markdown(
+        '<div style="text-align:right;font-size:0.85rem;padding-top:0.4rem;">'
+        f"<b>{len(itens)} item(ns)</b> nesta venda · Valor total: "
+        f"<b>{html.escape(_fmt_moeda(total))}</b></div>",
+        unsafe_allow_html=True,
+    )
+
+
+def _selectbox_cadastro(rotulo, opcoes, tabela, index=0, key=None, placeholder=None):
+    """Selectbox de cadastro que nunca some em silêncio: se não há registros
+    ativos, mostra o campo desabilitado com um aviso. Não inclui opção vazia
+    (quando o campo é obrigatório e não tem padrão, use index=None)."""
+    if not opcoes:
+        st.selectbox(
+            rotulo,
+            ["Nenhum registro ativo"],
+            disabled=True,
+            key=f"{key}_vazio" if key else None,
+        )
+        st.caption(f"⚠️ Sem registros ativos em `{tabela}`.")
+        return None
+    extras = {"placeholder": placeholder} if placeholder else {}
+    return st.selectbox(rotulo, opcoes, index=index, key=key, **extras)
+
+
+def _render_form_item(produtos_opcoes: dict, itens: list):
+    """Formulário único de item: serve tanto para adicionar um item novo
+    quanto para editar um item que veio da tabela-resumo."""
+    ss = st.session_state
+    editando = ss.get("venda_item_editando")
+
+    # Um produto já usado em outro item não pode ser escolhido de novo
+    # (o item em edição não conta, para poder manter o próprio produto).
+    usados = {i["produto"]["id"] for i in itens if i["uid"] != editando}
+    rotulos = [r for r, p in produtos_opcoes.items() if p["id"] not in usados]
+
+    # Evita erro do selectbox se o rótulo guardado deixou de existir.
+    if ss.get("vitem_produto") not in rotulos:
+        ss["vitem_produto"] = None
+
+    with st.container(border=True):
+        st.markdown("**✏️ Editando item**" if editando else "**➕ Novo item**")
+
+        produto_rotulo = st.selectbox(
+            "Produto",
+            rotulos,
+            index=None,
+            placeholder="Selecione o produto...",
+            key="vitem_produto",
+        )
+        produto = produtos_opcoes.get(produto_rotulo)
+
+        if not produto:
+            # Sem produto, os campos abaixo não são desenhados (e o Streamlit
+            # descarta o estado deles): na próxima escolha, recomeça do zero.
+            ss["vitem_ref"] = None
+        else:
+            if ss.get("vitem_ref") != produto["id"]:
+                _definir_form_item(
+                    produto, 1, produto.get("estoque_preco_venda_sugerida") or 0, 0.0
+                )
+
+            col_qtd, col_lista, col_desc, col_final = st.columns(4)
+
+            with col_qtd:
+                st.markdown("**Quantidade**")
+                estado_qtd = contador_quantidade(
+                    valor=max(1, int(ss.get("vitem_qtd", 1))),
+                    min_valor=1,
+                    bloqueado=True,
+                    label="",
+                    key=f"contador_vitem_{ss.get('vitem_gen', 0)}",
+                )
+                quantidade = max(1, int(estado_qtd.get("valor", ss.get("vitem_qtd", 1))))
+                ss["vitem_qtd"] = quantidade
+
+            with col_lista:
+                col_rotulo, col_bloqueio = st.columns([2, 1], vertical_alignment="center")
+                with col_rotulo:
+                    st.markdown("**Valor lista**")
+                with col_bloqueio:
+                    aberto = st.toggle(
+                        "🔓",
+                        key="vitem_bloqueio",
+                        help=(
+                            "Travado: usa o valor sugerido do estoque. "
+                            "Ative para digitar um valor lista diferente."
+                        ),
+                    )
+                valor_lista_texto = st.text_input(
+                    "Valor lista",
+                    key="vitem_valor_lista_input",
+                    disabled=not aberto,
+                    label_visibility="collapsed",
+                )
+                valor_lista = _parse_valor_input(
+                    valor_lista_texto, ss.get("vitem_valor_lista", 0)
+                )
+                ss["vitem_valor_lista"] = valor_lista
+
+            with col_desc:
+                st.markdown("**Desconto**")
+                desconto_texto = st.text_input(
+                    "Desconto",
+                    key="vitem_desconto",
+                    label_visibility="collapsed",
+                )
+                valor_desconto = _parse_valor_input(desconto_texto, 0.0)
+
+            with col_final:
+                st.markdown("**Valor final**")
+                valor_final = quantidade * valor_lista - valor_desconto
+                # Widget com `key`: o valor exibido vem do session_state e o
+                # parâmetro `value` seria ignorado após a 1ª execução. Por
+                # isso o cálculo é gravado no session_state antes de criar o
+                # widget.
+                ss["vitem_valor_final"] = _fmt_valor_input(valor_final)
+                st.text_input(
+                    "Valor final",
+                    key="vitem_valor_final",
+                    disabled=True,
+                    label_visibility="collapsed",
+                )
+
+        if editando:
+            col_ok, col_cancelar = st.columns(2)
+            col_ok.button(
+                "✔️ Atualizar item",
+                key="vitem_btn_atualizar",
+                use_container_width=True,
+                disabled=produto is None,
+                on_click=_cb_adicionar_item,
+                args=(produtos_opcoes,),
+            )
+            col_cancelar.button(
+                "Cancelar edição",
+                key="vitem_btn_cancelar_edicao",
+                use_container_width=True,
+                on_click=_cb_cancelar_edicao,
+            )
+        else:
+            st.button(
+                "➕ Adicionar item",
+                key="vitem_btn_adicionar",
+                use_container_width=True,
+                disabled=produto is None,
+                on_click=_cb_adicionar_item,
+                args=(produtos_opcoes,),
+            )
+
+        mensagem = ss.pop("vitem_msg", None)
+        if mensagem:
+            st.error(mensagem)
+
+
+def _cb_editar_header():
+    """Botão ✏️ do resumo: reabre o cabeçalho para edição (itens são mantidos)."""
+    st.session_state["venda_header_ok"] = False
+
+
+def _injetar_estilo_dialogo() -> None:
+    """Faz o popup abrir ao lado do menu lateral, em vez de por cima dele.
+
+    O Streamlit desenha o dialog em tela cheia (inclusive sobre a sidebar).
+    Medimos a largura atual da sidebar (que muda se for recolhida ou
+    redimensionada) e deslocamos o popup por essa largura via CSS."""
+    st.markdown(
+        """
+        <style>
+        :root { --menu-lateral-w: 0px; }
+        div[data-testid="stDialog"],
+        div[data-testid="stDialog"] div[data-baseweb="modal"] {
+            left: var(--menu-lateral-w) !important;
+            width: calc(100vw - var(--menu-lateral-w)) !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    components.html(
+        """
+        <script>
+        (function () {
+            const doc = window.parent.document;
+            function medir() {
+                const sb = doc.querySelector('section[data-testid="stSidebar"]');
+                let w = 0;
+                if (sb) { w = Math.max(0, sb.getBoundingClientRect().right); }
+                doc.documentElement.style.setProperty('--menu-lateral-w', w + 'px');
+            }
+            medir();
+            const sb = doc.querySelector('section[data-testid="stSidebar"]');
+            if (sb && window.ResizeObserver) { new ResizeObserver(medir).observe(sb); }
+            window.parent.addEventListener('resize', medir);
+            setInterval(medir, 500);
+        })();
+        </script>
+        """,
+        height=0,
+    )
+
+
+def _render_resumo_header(h: dict) -> None:
+    """Cabeçalho da venda em uma única linha + botão de editar."""
+    partes = [("Canal", h["canal_nome"])]
+    if h.get("feira_nome"):
+        partes.append(("Feira", h["feira_nome"]))
+    partes += [
+        ("Cliente", h["cliente"]),
+        ("Data", h["data_venda_texto"]),
+        ("Pagamento", h["forma_pagamento_nome"]),
+        ("Status", h["status_nome"]),
+    ]
+    texto = " &nbsp;·&nbsp; ".join(
+        f"<span style='opacity:0.65;'>{r}:</span> <b>{html.escape(str(v))}</b>"
+        for r, v in partes
+    )
+    with st.container(border=True):
+        try:
+            col_txt, col_btn = st.columns([14, 1], vertical_alignment="center")
+        except TypeError:
+            col_txt, col_btn = st.columns([14, 1])
+        with col_txt:
+            st.markdown(
+                "<div style='font-size:0.92rem; white-space:nowrap; overflow:hidden; "
+                f"text-overflow:ellipsis;'>{texto}</div>",
+                unsafe_allow_html=True,
+            )
+        with col_btn:
+            st.button(
+                "✏️",
+                key="venda_header_editar",
+                help="Editar cabeçalho",
+                on_click=_cb_editar_header,
+                use_container_width=True,
+            )
 
 
 @_dialog("💰 Venda", width="large")
@@ -862,6 +1292,7 @@ def _dialog_editar_venda(
                         "estoque_preco_venda_sugerida": float(
                             linha.get("estoque_preco_venda_sugerida") or 0
                         ),
+                        "saldo": float(linha.get("quantidade_atual") or 0),
                     }
         except Exception as e:
             st.error(f"Erro ao carregar produtos em estoque: {e}")
@@ -869,253 +1300,267 @@ def _dialog_editar_venda(
     data_atual = _parse_data_segura(venda.get("data_venda")) or date.today()
 
     st.caption("Nova venda" if nova_venda else f"Venda #{venda['id']}")
+    _injetar_estilo_dialogo()
 
-    form_key = f"form_venda_{'nova' if nova_venda else venda['id']}"
+    sufixo = "nova" if nova_venda else str(venda.get("id"))
+    form_key = f"form_venda_{sufixo}"
+
+    ss = st.session_state
+    # O estado do cabeçalho pertence a UMA venda (a nova ou uma já existente);
+    # se o popup foi aberto para outra, começa do zero.
+    if ss.get("venda_header_ref") != sufixo:
+        ss.pop("venda_header", None)
+        ss.pop("venda_header_ok", None)
+        ss["venda_header_ref"] = sufixo
+
+    header_salvo = ss.get("venda_header") or {}
+    # Duas etapas (nova venda e edição): 1) cabeçalho, 2) item(ns), com o
+    # cabeçalho recolhido em uma linha.
+    header_fechado = bool(ss.get("venda_header_ok")) and bool(header_salvo)
+
+    feira_atual_nome = feira_atual.get("nome_feira") or ""
+    if nova_venda:
+        header_base = header_salvo
+        produto_selecionado = None
+    else:
+        # Valores iniciais do cabeçalho vêm da própria venda.
+        header_base = header_salvo or {
+            "canal_nome": canal_atual_nome,
+            "feira_nome": feira_atual_nome or None,
+            "cliente": venda.get("cliente") or "",
+            "data_venda_texto": data_atual.strftime("%d/%m/%Y"),
+            "forma_pagamento_nome": forma_atual_desc,
+            "status_nome": status_atual_nome,
+        }
+        produto_selecionado = {
+            "id": venda.get("produto_id"),
+            "codigo_interno": codigo_atual,
+        }
+
+    salvar = cancelar = excluir = False
+    salvar_header = False
+    itens_validos: list[dict] = []
+    nomes_clientes = [c.get("nome") for c in clientes_disponiveis if c.get("nome")]
+    nomes_feiras = [f["nome_feira"] for f in feiras_disponiveis]
 
     # Todos os campos do popup ficam dentro de uma única borda.
-    # A primeira linha permanece fora do st.form para permitir que o canal
-    # habilite/desabilite a Feira imediatamente.
     with st.container(border=True):
-    # Linha 1 fica fora do formulário para que a escolha do canal provoque
-    # atualização imediata e habilite/desabilite o campo Feira.
-    # Na edição, Produto também fica aqui (1/2) já que é uma única linha.
-    # Na inclusão, o produto virou "item" (ver abaixo) — cada venda nova
-    # pode ter vários produtos, então a linha 1 fica só com Canal | Feira.
-        if nova_venda:
-            col_canal, col_feira = st.columns([1, 1])
-            produto_selecionado = None  # não se aplica mais nesta posição
-        else:
-            col_produto, col_canal, col_feira = st.columns([2, 1, 1])
-            with col_produto:
-                st.text_input(
-                    "Código interno do produto",
-                    value=codigo_atual,
-                    disabled=True,
-                )
-                produto_selecionado = {
-                    "id": venda.get("produto_id"),
-                    "codigo_interno": codigo_atual,
-                }
+        if header_fechado:
+            # ------------------------------------------------------------
+            # Etapa 2: cabeçalho recolhido em uma linha + item(ns).
+            # ------------------------------------------------------------
+            canal_nome = header_salvo["canal_nome"]
+            feira_nome = header_salvo.get("feira_nome")
+            cliente = header_salvo["cliente"]
+            data_venda_texto = header_salvo["data_venda_texto"]
+            forma_pagamento_nome = header_salvo["forma_pagamento_nome"]
+            status_nome = header_salvo["status_nome"]
+            _render_resumo_header(header_salvo)
 
-        with col_canal:
             if nova_venda:
-                canal_nome = st.selectbox(
-                    "Canal de venda",
-                    nomes_canais,
-                    index=None,
-                    placeholder="Selecione o canal...",
-                    key="venda_canal_nome_nova",
-                ) if nomes_canais else None
+                st.markdown("##### Itens da venda")
+
+                if not produtos_opcoes:
+                    st.warning("Nenhum produto com saldo em estoque.")
+
+                # Mesma lista usada pelos callbacks; é ela que será gravada.
+                itens_validos = st.session_state.setdefault("venda_itens", [])
+
+                # 1) Formulário único (adicionar / editar item) · 2) tabela-resumo
+                # (somente leitura) logo abaixo.
+                _render_form_item(produtos_opcoes, itens_validos)
+
+                # Resultado de um salvamento parcial (ver mais abaixo).
+                msg_falha = st.session_state.pop("venda_msg_falha", None)
+                if msg_falha:
+                    st.warning(msg_falha)
+
+                _render_tabela_itens(itens_validos, produtos_opcoes)
+
+                st.markdown("<div style='height: 1.25rem;'></div>", unsafe_allow_html=True)
+
+                with st.form(form_key, border=False):
+                    col_salvar, col_cancelar = st.columns(2)
+                    salvar = col_salvar.form_submit_button(
+                        "💾 Salvar", type="secondary", use_container_width=True
+                    )
+                    cancelar = col_cancelar.form_submit_button(
+                        "Cancelar", use_container_width=True
+                    )
             else:
-                st.text_input("Canal de venda", value=canal_atual_nome, disabled=True)
-                canal_nome = canal_atual_nome
+                # Edição: sempre há um único item, já carregado (sem tabela).
+                # Produto e canal continuam bloqueados para preservar o
+                # ajuste de estoque.
+                st.markdown("##### Item da venda")
 
-        # A feira fica sempre na primeira linha e só é habilitada quando
-        # o canal selecionado for exatamente "Feira".
-        canal_eh_feira = (canal_nome or "").strip().casefold() == "feira"
-        nomes_feiras = [f["nome_feira"] for f in feiras_disponiveis]
-        feira_atual_nome = feira_atual.get("nome_feira") or ""
+                with st.container(border=True):
+                    st.markdown("**✏️ Editando item**")
+                    st.text_input(
+                        "Produto",
+                        value=" — ".join(
+                            filter(None, [codigo_atual, produto_atual.get("descricao") or ""])
+                        ),
+                        disabled=True,
+                    )
+                    _resetar_controles_venda(venda, nova_venda, produto_selecionado)
+                    quantidade, valor_lista, valor_desconto, valor_final = (
+                        _render_controles_valores_venda()
+                    )
 
-        with col_feira:
-            if nova_venda and not canal_eh_feira:
-                st.selectbox(
-                    "Feira",
-                    ["Selecione o canal Feira"],
-                    index=0,
-                    disabled=True,
-                    key="venda_feira_desabilitada_nova",
-                )
-                feira_nome = None
-            elif not nova_venda and not canal_eh_feira:
-                st.selectbox(
-                    "Feira",
-                    ["Não se aplica"],
-                    index=0,
-                    disabled=True,
-                    key=f"venda_feira_desabilitada_{venda.get('id')}",
-                )
-                feira_nome = None
-            else:
-                nomes_feiras_com_vazio = [""] + nomes_feiras
-                indice_feira = (
-                    nomes_feiras_com_vazio.index(feira_atual_nome)
-                    if feira_atual_nome in nomes_feiras_com_vazio else 0
-                )
-                feira_nome = st.selectbox(
-                    "Feira",
-                    nomes_feiras_com_vazio,
-                    index=indice_feira,
-                    placeholder="Selecione a feira...",
-                    key=f"venda_feira_{'nova' if nova_venda else venda.get('id')}",
-                )
+                st.markdown("<div style='height: 1.25rem;'></div>", unsafe_allow_html=True)
 
-        itens_validos: list[dict] = []
-        nomes_clientes = [c.get("nome") for c in clientes_disponiveis if c.get("nome")]
+                with st.form(form_key, border=False):
+                    col_salvar, col_cancelar, col_excluir = st.columns(3)
+                    salvar = col_salvar.form_submit_button(
+                        "💾 Salvar", type="secondary", use_container_width=True
+                    )
+                    cancelar = col_cancelar.form_submit_button(
+                        "Cancelar", use_container_width=True
+                    )
+                    excluir = col_excluir.form_submit_button(
+                        "🗑️ Excluir", use_container_width=True
+                    )
 
-        if nova_venda:
+        else:
             # ------------------------------------------------------------
-            # Header (Cliente | Data | Forma de pagamento | Status) numa
-            # única linha, acima dos itens — vale igualmente para todos os
-            # produtos desta venda. Fica fora do st.form (assim como
-            # canal/feira/itens) porque o form, aqui, carrega só os botões.
+            # Etapa 1: cabeçalho. Os widgets ficam fora do st.form (o form
+            # carrega só os botões), assim a escolha do canal habilita/
+            # desabilita a Feira na hora; voltam preenchidos se o cabeçalho
+            # for reaberto.
             # ------------------------------------------------------------
+            col_canal, col_feira = st.columns([1, 1])
+
+            with col_canal:
+                if nova_venda:
+                    canal_salvo = header_base.get("canal_nome")
+                    canal_nome = st.selectbox(
+                        "Canal de venda",
+                        nomes_canais,
+                        index=(
+                            nomes_canais.index(canal_salvo)
+                            if canal_salvo in nomes_canais else None
+                        ),
+                        placeholder="Selecione o canal...",
+                        key=f"venda_canal_nome_{sufixo}",
+                    ) if nomes_canais else None
+                else:
+                    st.text_input("Canal de venda", value=canal_atual_nome, disabled=True)
+                    canal_nome = canal_atual_nome
+
+            # A feira só é habilitada quando o canal selecionado for "Feira".
+            canal_eh_feira = (canal_nome or "").strip().casefold() == "feira"
+            feira_padrao = header_base.get("feira_nome") or ""
+
+            with col_feira:
+                if not canal_eh_feira:
+                    st.selectbox(
+                        "Feira",
+                        ["Selecione o canal Feira" if nova_venda else "Não se aplica"],
+                        index=0,
+                        disabled=True,
+                        key=f"venda_feira_desabilitada_{sufixo}",
+                    )
+                    feira_nome = None
+                else:
+                    feira_nome = st.selectbox(
+                        "Feira",
+                        nomes_feiras,
+                        index=(
+                            nomes_feiras.index(feira_padrao)
+                            if feira_padrao in nomes_feiras else None
+                        ),
+                        placeholder="Selecione a feira...",
+                        key=f"venda_feira_{sufixo}",
+                    )
+
             col_cliente, col_data, col_forma, col_status = st.columns(4)
 
             with col_cliente:
                 cliente = campo_cliente(
                     "Cliente",
-                    value="",
+                    value=header_base.get("cliente", ""),
                     opcoes=nomes_clientes,
                     placeholder="Digite ou selecione o cliente...",
-                    key="venda_cliente_nova",
+                    key=f"venda_cliente_{sufixo}",
                 )
 
             with col_data:
                 data_venda_texto = campo_mascarado(
                     "Data da venda",
-                    value=data_atual.strftime("%d/%m/%Y"),
+                    value=header_base.get("data_venda_texto")
+                    or data_atual.strftime("%d/%m/%Y"),
                     tipo="data",
                     placeholder="DD/MM/YYYY",
-                    key="venda_data_mask_nova",
+                    key=f"venda_data_mask_{sufixo}",
                 )
 
             with col_forma:
-                forma_pagamento_nome = st.selectbox(
+                forma_base = header_base.get("forma_pagamento_nome")
+                forma_pagamento_nome = _selectbox_cadastro(
                     "Forma de pagamento",
-                    [""] + nomes_formas,
-                    index=0,
+                    nomes_formas,
+                    "formas_pagamento",
+                    index=nomes_formas.index(forma_base) if forma_base in nomes_formas else None,
                     placeholder="Selecione...",
-                    key="venda_forma_pagamento_nova",
-                ) if nomes_formas else None
+                    key=f"venda_forma_pagamento_{sufixo}",
+                )
 
             with col_status:
-                status_nome = st.selectbox(
+                status_base = header_base.get("status_nome")
+                status_nome = _selectbox_cadastro(
                     "Status",
                     nomes_status,
-                    index=0,
-                    key="venda_status_nova",
-                ) if nomes_status else None
-
-            st.markdown("##### Itens da venda")
-
-            if not produtos_opcoes:
-                st.warning("Nenhum produto com saldo em estoque.")
-
-            ids_itens = st.session_state.setdefault("venda_itens_ids", [str(uuid.uuid4())])
-
-            produtos_ja_usados: set = set()
-            ids_para_remover = []
-
-            for row_uid in list(ids_itens):
-                item = _render_item_venda(row_uid, produtos_opcoes, produtos_ja_usados)
-                if item.get("remover"):
-                    ids_para_remover.append(row_uid)
-                    continue
-                if item.get("produto"):
-                    produtos_ja_usados.add(item["produto"]["id"])
-                    itens_validos.append(item)
-                st.markdown("<hr style='margin:0.4rem 0;'>", unsafe_allow_html=True)
-
-            # Importante: NÃO chamar st.rerun() aqui. Um clique de botão já
-            # dispara sozinho um novo rerun do script (comportamento padrão
-            # do Streamlit); st.rerun() explícito dentro de um @st.dialog
-            # fecha o popup (é assim que Salvar/Cancelar fecham de propósito
-            # mais abaixo) — foi isso que fazia a tela "fechar" ao clicar em
-            # Adicionar produto e, ao reabrir, mostrar linhas em branco
-            # sobrando do session_state.
-            if ids_para_remover:
-                for row_uid in ids_para_remover:
-                    ids_itens.remove(row_uid)
-                    for prefixo in _PREFIXOS_ITEM_VENDA:
-                        st.session_state.pop(f"{prefixo}{row_uid}", None)
-                if not ids_itens:
-                    ids_itens.append(str(uuid.uuid4()))
-
-            if st.button("➕ Adicionar produto", key="venda_btn_add_item"):
-                ids_itens.append(str(uuid.uuid4()))
-
-            if itens_validos:
-                valor_total_itens = sum(i["valor_final"] for i in itens_validos)
-                st.caption(
-                    f"**{len(itens_validos)} item(ns)** nesta venda · "
-                    f"Valor total: **{_fmt_moeda(valor_total_itens)}**"
+                    "status_venda",
+                    index=nomes_status.index(status_base) if status_base in nomes_status else 0,
+                    key=f"venda_status_{sufixo}",
                 )
 
-            st.markdown("<div style='height: 1.25rem;'></div>", unsafe_allow_html=True)
+            st.markdown("<div style='height: 0.5rem;'></div>", unsafe_allow_html=True)
 
-            with st.form(form_key, border=False):
-                col_salvar, col_cancelar = st.columns(2)
-                salvar = col_salvar.form_submit_button(
-                    "💾 Salvar", type="secondary", use_container_width=True
+            with st.form(f"{form_key}_header", border=False):
+                col_sh, col_ch = st.columns(2)
+                salvar_header = col_sh.form_submit_button(
+                    "💾 Salvar cabeçalho", type="secondary", use_container_width=True
                 )
-                cancelar = col_cancelar.form_submit_button(
+                cancelar = col_ch.form_submit_button(
                     "Cancelar", use_container_width=True
                 )
-                excluir = False
 
-        else:
-            _resetar_controles_venda(venda, nova_venda, produto_selecionado)
-            quantidade, valor_lista, valor_desconto, valor_final = _render_controles_valores_venda()
+            if salvar_header:
+                erro = None
+                if not canal_nome:
+                    erro = "Selecione o canal de venda."
+                elif canal_eh_feira and not feira_nome:
+                    erro = "Selecione a feira."
+                elif not (cliente or "").strip():
+                    erro = "Informe o cliente."
+                elif not forma_pagamento_nome:
+                    erro = "Selecione a forma de pagamento."
+                elif not status_nome:
+                    erro = "Selecione o status."
+                else:
+                    try:
+                        datetime.strptime((data_venda_texto or "").strip(), "%d/%m/%Y")
+                    except ValueError:
+                        erro = "Data da venda inválida. Use o formato DD/MM/YYYY."
 
-            with st.form(form_key, border=False):
-                # Linha 3: Cliente (1/2) | Data da venda (1/4) | Forma de pagamento (1/4)
-                col_cliente, col_data, col_forma = st.columns([2, 1, 1])
-
-                with col_cliente:
-                    cliente = campo_cliente(
-                        "Cliente",
-                        value=venda.get("cliente") or "",
-                        opcoes=nomes_clientes,
-                        placeholder="Digite ou selecione o cliente...",
-                        key=f"venda_cliente_{venda.get('id')}",
-                    )
-
-                with col_data:
-                    data_venda_texto = campo_mascarado(
-                        "Data da venda",
-                        value=data_atual.strftime("%d/%m/%Y"),
-                        tipo="data",
-                        placeholder="DD/MM/YYYY",
-                        key=f"venda_data_mask_{venda.get('id')}",
-                    )
-
-                with col_forma:
-                    forma_pagamento_nome = st.selectbox(
-                        "Forma de pagamento",
-                        [""] + nomes_formas,
-                        index=(
-                            (nomes_formas.index(forma_atual_desc) + 1)
-                            if forma_atual_desc in nomes_formas else 0
-                        ),
-                        placeholder="Selecione...",
-                    ) if nomes_formas else None
-
-                # Status continua obrigatório, mas foi deslocado para uma linha
-                # própria para preservar exatamente a distribuição solicitada.
-                status_nome = st.selectbox(
-                    "Status",
-                    nomes_status,
-                    index=nomes_status.index(status_atual_nome)
-                    if status_atual_nome in nomes_status else 0,
-                ) if nomes_status else None
-
-                # Espaçamento proposital entre a última linha e os botões.
-                st.markdown("<div style='height: 1.25rem;'></div>", unsafe_allow_html=True)
-
-                col_salvar, col_cancelar, col_excluir = st.columns(3)
-                salvar = col_salvar.form_submit_button(
-                    "💾 Salvar", type="secondary", use_container_width=True
-                )
-                cancelar = col_cancelar.form_submit_button(
-                    "Cancelar", use_container_width=True
-                )
-                excluir = col_excluir.form_submit_button(
-                    "🗑️ Excluir", use_container_width=True
-                )
+                if erro:
+                    st.error(erro)
+                else:
+                    ss["venda_header"] = {
+                        "canal_nome": canal_nome,
+                        "feira_nome": feira_nome if canal_eh_feira else None,
+                        "cliente": cliente.strip(),
+                        "data_venda_texto": data_venda_texto.strip(),
+                        "forma_pagamento_nome": forma_pagamento_nome,
+                        "status_nome": status_nome,
+                    }
+                    ss["venda_header_ok"] = True
+                    if not _rerun_dialogo():
+                        st.info("Cabeçalho salvo. Interaja com a tela para continuar.")
 
     if cancelar:
-        if nova_venda:
-            _limpar_itens_venda_nova()
+        _limpar_itens_venda_nova()
         st.rerun()
 
     if excluir:
@@ -1123,6 +1568,7 @@ def _dialog_editar_venda(
             sb = get_client()
             excluir_venda(sb, venda)
             st.success("Venda excluída e estoque ajustado com sucesso!")
+            _limpar_itens_venda_nova()
             st.rerun()
         except Exception as e:
             st.error(f"Erro ao excluir venda: {e}")
@@ -1134,6 +1580,13 @@ def _dialog_editar_venda(
         sb = get_client()
 
         if nova_venda:
+            if st.session_state.get("vitem_produto"):
+                st.error(
+                    "Há um item em preenchimento que ainda não foi gravado na tabela. "
+                    "Clique em \"Adicionar item\" (ou \"Atualizar item\"), ou limpe o "
+                    "produto, antes de salvar a venda."
+                )
+                return
             if not itens_validos:
                 st.error("Adicione ao menos um produto à venda.")
                 return
@@ -1226,6 +1679,7 @@ def _dialog_editar_venda(
             # repetidos em várias linhas, só que feito pela tela.
             sucesso = 0
             falhas = []
+            itens_falhos = []
             for item in itens_validos:
                 try:
                     comissao_percentual, comissao_valor = calcular_comissao_venda(
@@ -1249,19 +1703,31 @@ def _dialog_editar_venda(
                     )
                     sucesso += 1
                 except Exception as exc:
+                    itens_falhos.append(item)
                     falhas.append(
                         f"{item['produto'].get('codigo_interno') or item['produto']['id']}: {exc}"
                     )
 
             if falhas:
-                st.warning(
+                # Os itens já gravados saem da lista; só os que falharam
+                # permanecem na tabela para o usuário corrigir e salvar de novo
+                # (sem duplicar o que já foi registrado).
+                st.session_state["venda_itens"] = itens_falhos
+                if st.session_state.get("venda_item_editando") not in {
+                    i["uid"] for i in itens_falhos
+                }:
+                    st.session_state["venda_item_editando"] = None
+                mensagem = (
                     f"⚠️ {sucesso} de {len(itens_validos)} item(ns) registrados com sucesso "
-                    f"(estoque já atualizado para esses). {len(falhas)} falharam:"
+                    f"(estoque já atualizado e removidos da lista). "
+                    f"{len(falhas)} falharam e continuam na tabela para nova tentativa:\n\n"
+                    + "\n".join(f"- {f}" for f in falhas)
                 )
-                for falha in falhas:
-                    st.caption(f"• {falha}")
-                # Mantém no popup só os itens que falharam, para o usuário
-                # corrigir e tentar salvar novamente sem perder tudo.
+                st.session_state["venda_msg_falha"] = mensagem
+                if not _rerun_dialogo():
+                    # Versão do Streamlit sem rerun de fragmento: mostra aqui.
+                    st.session_state.pop("venda_msg_falha", None)
+                    st.warning(mensagem)
             else:
                 st.success(
                     f"{sucesso} venda(s) registrada(s) com sucesso e estoque atualizado!"
@@ -1285,6 +1751,7 @@ def _dialog_editar_venda(
 
             editar_venda(sb, venda, dados_novos)
             st.success("Venda atualizada e estoque ajustado com sucesso!")
+            _limpar_itens_venda_nova()
             st.rerun()
 
     except Exception as e:
@@ -1449,10 +1916,33 @@ def _abrir_venda_pendente():
             st.warning(f"Venda #{venda_id} não encontrada.")
             return
 
+        _limpar_itens_venda_nova()
         canais, status, formas, feiras, clientes = _carregar_cadastros_popup()
         _dialog_editar_venda(venda, canais, status, formas, feiras, clientes)
     except Exception as e:
         st.error(f"Erro ao abrir a venda #{venda_id}: {e}")
+
+
+def _botao_adicionar_venda():
+    """Botão '➕ Adicionar venda' (abre o popup de nova venda)."""
+    if st.button(
+        "➕ Adicionar venda",
+        type="secondary",
+        use_container_width=True,
+        key="vendas_btn_adicionar",
+    ):
+        # Garante que nada de uma venda anterior (ex.: popup fechado pelo X
+        # em vez de Cancelar) sobre para esta abertura.
+        _limpar_itens_venda_nova()
+        canais_popup, status_popup, formas_popup, feiras_popup, clientes_popup = _carregar_cadastros_popup()
+        _dialog_editar_venda(
+            None,
+            canais_popup,
+            status_popup,
+            formas_popup,
+            feiras_popup,
+            clientes_popup,
+        )
 
 
 def _secao_listagem():
@@ -1577,6 +2067,11 @@ def _secao_listagem():
 
     if not vendas_kpi:
         st.info("Nenhuma venda registrada.")
+        # O botão precisa existir mesmo sem registros, senão não há como
+        # cadastrar a primeira venda.
+        col_primeira, _ = st.columns([1, 3])
+        with col_primeira:
+            _botao_adicionar_venda()
         return
 
     # ------------------------------------------------------------------
@@ -1599,25 +2094,7 @@ def _secao_listagem():
                 on_click=_resetar_filtros_vendas,
             )
         with btn_adicionar:
-            if st.button(
-                "➕ Adicionar venda",
-                type="secondary",
-                use_container_width=True,
-                key="vendas_btn_adicionar",
-            ):
-                # Garante que nenhum item de uma venda nova anterior (ex.:
-                # popup fechado pelo X em vez de Cancelar) sobre para esta
-                # abertura — sempre começa com uma única linha em branco.
-                _limpar_itens_venda_nova()
-                canais_popup, status_popup, formas_popup, feiras_popup, clientes_popup = _carregar_cadastros_popup()
-                _dialog_editar_venda(
-                    None,
-                    canais_popup,
-                    status_popup,
-                    formas_popup,
-                    feiras_popup,
-                    clientes_popup,
-                )
+            _botao_adicionar_venda()
 
     # Reseta a página para 1 sempre que algum filtro mudar
     assinatura_filtros = f"{mes_selecionado}|{canal_selecionado}"
@@ -1741,6 +2218,7 @@ def _secao_listagem():
                 help="Editar ou excluir venda",
                 use_container_width=True,
             ):
+                _limpar_itens_venda_nova()
                 (
                     canais_popup,
                     status_popup,
@@ -2008,11 +2486,6 @@ def _secao_parceiro_fechamento(parceiro: dict) -> None:
                 st.error(f"Não foi possível alterar o início do ciclo: {e}")
                 return
 
-        st.info(
-            f"Ciclo **#{ciclo_aberto['numero_ciclo']}** aberto desde "
-            f"**{data_inicio_ciclo.strftime('%d/%m/%Y')}**."
-        )
-
         if data_inicio_ciclo and data_fim_ciclo < data_inicio_ciclo:
             st.error("A data final não pode ser antes do início do ciclo.")
             return
@@ -2037,7 +2510,7 @@ def _secao_parceiro_fechamento(parceiro: dict) -> None:
                 .select(
                     "id, data_venda, cliente, valor_final, "
                     "comissao_percentual, comissao_valor, "
-                    "produtos(descricao)"
+                    "produtos(descricao), status_venda(nome)"
                 )
                 .eq("canal_venda_id", canal_id)
                 .gte("data_venda", data_inicio_ciclo.isoformat())
@@ -2054,12 +2527,11 @@ def _secao_parceiro_fechamento(parceiro: dict) -> None:
 
         if not candidatas:
             st.info("Nenhuma venda pendente neste período para incluir no fechamento.")
-            return
 
-        st.caption(
-            "Desmarque alguma venda para deixá-la de fora deste ciclo — ela "
-            "continua disponível para um fechamento futuro."
-        )
+        # A tabela-resumo fica visualmente acima da tabela de vendas.
+        # Usamos um placeholder para preencher o resumo depois de calcular as
+        # vendas selecionadas, mantendo a ordem visual desejada.
+        resumo_container = st.container()
 
         linhas_editor = [
             {
@@ -2069,31 +2541,95 @@ def _secao_parceiro_fechamento(parceiro: dict) -> None:
                 "Cliente": v.get("cliente") or "-",
                 "Produto": (v.get("produtos") or {}).get("descricao") or "-",
                 "Valor": float(v.get("valor_final") or 0),
-                "Comissão %": v.get("comissao_percentual"),
                 "Comissão R$": float(v.get("comissao_valor") or 0),
             }
             for v in candidatas
         ]
 
-        editado = st.data_editor(
-            linhas_editor,
-            key="parceiros_fechamento_editor",
-            use_container_width=True,
-            hide_index=True,
-            disabled=["id", "Data", "Cliente", "Produto", "Valor", "Comissão %", "Comissão R$"],
-            column_order=["Incluir", "Data", "Cliente", "Produto", "Valor", "Comissão %", "Comissão R$"],
-        )
+        if candidatas:
+            editado = st.data_editor(
+                linhas_editor,
+                key=f"parceiros_fechamento_editor_{ciclo_aberto['id']}",
+                use_container_width=True,
+                hide_index=True,
+                disabled=["id", "Data", "Cliente", "Produto", "Valor", "Comissão R$"],
+                column_order=["Incluir", "Data", "Cliente", "Produto", "Valor", "Comissão R$"],
+                column_config={
+                    "Incluir": st.column_config.CheckboxColumn("Incluir", width="small"),
+                    "Data": st.column_config.TextColumn("Data", width="small"),
+                    "Cliente": st.column_config.TextColumn("Cliente"),
+                    "Produto": st.column_config.TextColumn("Produto"),
+                    "Valor": st.column_config.NumberColumn("Valor", format="R$ %.2f", disabled=True),
+                    "Comissão R$": st.column_config.NumberColumn("Comissão R$", format="R$ %.2f", disabled=True),
+                },
+            )
+        else:
+            editado = []
 
         selecionadas = [linha for linha in editado if linha["Incluir"]]
-        valor_total = sum(l["Valor"] for l in selecionadas)
-        comissao_total = sum(l["Comissão R$"] for l in selecionadas)
+        valor_total = sum(float(l.get("Valor") or 0) for l in selecionadas)
 
-        col_t1, col_t2 = st.columns(2)
-        col_t1.metric("Selecionadas", f"{len(selecionadas)} de {len(editado)}")
-        col_t2.metric(
-            "Total a fechar",
-            f"{_fmt_moeda(valor_total)}  ·  comissão {_fmt_moeda(comissao_total)}",
+        venda_por_id = {v["id"]: v for v in candidatas}
+        comissao_total = sum(
+            float(linha.get("Comissão R$") or 0)
+            for linha in selecionadas
+            if (venda_por_id.get(linha["id"], {}).get("status_venda") or {}).get("nome") != "Retirada - Parceiros"
         )
+
+        retiradas_parceiros = [
+            venda_por_id[linha["id"]]
+            for linha in selecionadas
+            if (venda_por_id.get(linha["id"], {}).get("status_venda") or {}).get("nome") == "Retirada - Parceiros"
+        ]
+        retirada_automatica = sum(float(v.get("valor_final") or 0) for v in retiradas_parceiros)
+
+        # A seção de ajustes foi removida. A linha permanece no resumo para
+        # deixar explícita a composição do fechamento, atualmente sem ajustes.
+        ajustes_total = 0.0
+        observacoes_ajustes = []
+        valor_final_fechamento = comissao_total - retirada_automatica
+
+        obs_auto_key = f"retirada_auto_obs_{ciclo_aberto['id']}"
+        if obs_auto_key not in st.session_state:
+            st.session_state[obs_auto_key] = "Retirada - Parceiros"
+
+        # Preenche o resumo antes da tabela de produtos/vendas.
+        with resumo_container:
+            st.markdown(
+                f"##### Resumo do fechamento - de {data_inicio_ciclo.strftime('%d/%m/%Y')} até {data_fim_ciclo.strftime('%d/%m/%Y')}"
+            )
+            resumo_df = pd.DataFrame([
+                {"Descrição": "Vendas no período", "Valor": _fmt_moeda(valor_total), "Observação": ""},
+                {"Descrição": "Comissão Total (+)", "Valor": _fmt_moeda(comissao_total), "Observação": ""},
+                {"Descrição": "Retirada Peças (-)", "Valor": _fmt_moeda(-retirada_automatica), "Observação": st.session_state.get(obs_auto_key, "")},
+                {"Descrição": "Ajustes", "Valor": _fmt_moeda(ajustes_total), "Observação": ""},
+                {"Descrição": "Valor Final", "Valor": _fmt_moeda(valor_final_fechamento), "Observação": ""},
+            ])
+            styled_resumo = resumo_df.style.apply(
+                lambda row: [
+                    "font-weight: 700; background-color: rgba(0, 123, 255, 0.16);"
+                    if row["Descrição"] == "Valor Final" else ""
+                    for _ in row
+                ],
+                axis=1,
+            )
+            st.dataframe(styled_resumo, use_container_width=True, hide_index=True)
+
+        if candidatas:
+            st.caption(
+                "Desmarque alguma venda para deixá-la de fora deste ciclo — ela "
+                "continua disponível para um fechamento futuro."
+            )
+
+        # Informações/KPIs do ciclo aberto ficam abaixo da tabela de vendas.
+        st.info(
+            f"Ciclo **#{ciclo_aberto['numero_ciclo']}** aberto desde "
+            f"**{data_inicio_ciclo.strftime('%d/%m/%Y')}**."
+        )
+
+        # Os componentes visuais de retirada de peças e os KPIs
+        # foram removidos. Os valores continuam sendo calculados acima
+        # porque são utilizados no fechamento do ciclo.
 
         if st.button(
             f"✅ Fechar ciclo #{ciclo_aberto['numero_ciclo']}",
@@ -2106,12 +2642,20 @@ def _secao_parceiro_fechamento(parceiro: dict) -> None:
                 registros = []
                 for linha in selecionadas:
                     venda = venda_por_id[linha["id"]]
+                    eh_retirada_parceiro = (
+                        (venda.get("status_venda") or {}).get("nome")
+                        == "Retirada - Parceiros"
+                    )
                     registros.append({
                         "fechamento_id": ciclo_aberto["id"],
                         "venda_id": venda["id"],
                         "valor_venda": float(venda.get("valor_final") or 0),
-                        "percentual_comissao": float(venda.get("comissao_percentual") or 0),
-                        "valor_comissao": float(venda.get("comissao_valor") or 0),
+                        "percentual_comissao": 0
+                        if eh_retirada_parceiro
+                        else float(venda.get("comissao_percentual") or 0),
+                        "valor_comissao": 0
+                        if eh_retirada_parceiro
+                        else float(venda.get("comissao_valor") or 0),
                     })
                 if registros:
                     supabase.table("parcerias_fechamento_vendas").insert(registros).execute()
@@ -2138,6 +2682,54 @@ def _secao_parceiro_fechamento(parceiro: dict) -> None:
         st.caption("Nenhum ciclo de fechamento registrado ainda para este parceiro.")
         return
 
+    # Calcula o valor final de cada ciclo histórico usando a mesma regra
+    # da visualização do fechamento: comissão menos retiradas de peças.
+    valor_final_por_fechamento = {}
+    try:
+        ids_fechamentos = [f["id"] for f in fechamentos if f.get("id") is not None]
+        vinculos_historico = []
+        if ids_fechamentos:
+            vinculos_historico = (
+                supabase.table("parcerias_fechamento_vendas")
+                .select("fechamento_id, venda_id, valor_comissao")
+                .in_("fechamento_id", ids_fechamentos)
+                .execute()
+                .data
+                or []
+            )
+
+        ids_vendas_historico = [v["venda_id"] for v in vinculos_historico if v.get("venda_id") is not None]
+        status_por_venda = {}
+        if ids_vendas_historico:
+            vendas_historico = (
+                supabase.table("vendas")
+                .select("id, status_venda(nome), valor_final")
+                .in_("id", ids_vendas_historico)
+                .execute()
+                .data
+                or []
+            )
+            status_por_venda = {v["id"]: v for v in vendas_historico}
+
+        for fechamento in fechamentos:
+            fechamento_id = fechamento.get("id")
+            comissao = float(fechamento.get("valor_total_comissao") or 0)
+            retirada = 0.0
+            for vinculo in vinculos_historico:
+                if vinculo.get("fechamento_id") != fechamento_id:
+                    continue
+                venda = status_por_venda.get(vinculo.get("venda_id"), {})
+                if (venda.get("status_venda") or {}).get("nome") == "Retirada - Parceiros":
+                    retirada += float(venda.get("valor_final") or 0)
+            valor_final_por_fechamento[fechamento_id] = comissao - retirada
+    except Exception:
+        # Se não for possível carregar os vínculos históricos, mantém a
+        # comissão como fallback para não impedir a visualização do histórico.
+        for fechamento in fechamentos:
+            valor_final_por_fechamento[fechamento.get("id")] = float(
+                fechamento.get("valor_total_comissao") or 0
+            )
+
     linhas_fechamento = [
         {
             "Ciclo": f["numero_ciclo"],
@@ -2147,15 +2739,138 @@ def _secao_parceiro_fechamento(parceiro: dict) -> None:
             "Comissão %": f.get("percentual_comissao"),
             "Valor vendas": _fmt_moeda(f.get("valor_total_vendas")),
             "Valor comissão": _fmt_moeda(f.get("valor_total_comissao")),
+            "Valor final": _fmt_moeda(valor_final_por_fechamento.get(f.get("id"), 0)),
         }
         for f in fechamentos
     ]
-    st.dataframe(linhas_fechamento, use_container_width=True, hide_index=True)
+
+    selecao_historico = st.dataframe(
+        linhas_fechamento,
+        use_container_width=True,
+        hide_index=True,
+        on_select="rerun",
+        selection_mode="single-row",
+        key=f"historico_ciclos_{parceiro_id}",
+    )
+
+    # Ao clicar em um ciclo finalizado, abre a mesma visão do fechamento,
+    # porém somente para consulta: sem campos editáveis e sem botão de fechar.
+    linhas_selecionadas = selecao_historico.selection.rows
+    if linhas_selecionadas:
+        ciclo_visualizado = fechamentos[linhas_selecionadas[0]]
+
+        try:
+            vinculos = (
+                supabase.table("parcerias_fechamento_vendas")
+                .select("venda_id, valor_venda, percentual_comissao, valor_comissao")
+                .eq("fechamento_id", ciclo_visualizado["id"])
+                .execute()
+                .data
+                or []
+            )
+            ids_vendas = [v["venda_id"] for v in vinculos]
+
+            vendas_fechamento = []
+            if ids_vendas:
+                vendas_fechamento = (
+                    supabase.table("vendas")
+                    .select(
+                        "id, data_venda, cliente, valor_final, quantidade, "
+                        "produtos(descricao, codigo_interno), status_venda(nome)"
+                    )
+                    .in_("id", ids_vendas)
+                    .order("data_venda")
+                    .execute()
+                    .data
+                    or []
+                )
+        except Exception as e:
+            st.error(f"Não foi possível carregar os detalhes do ciclo: {e}")
+            return
+
+        vinculo_por_venda = {v["venda_id"]: v for v in vinculos}
+        retirada_visualizacao = sum(
+            float(v.get("valor_final") or 0)
+            for v in vendas_fechamento
+            if (v.get("status_venda") or {}).get("nome") == "Retirada - Parceiros"
+        )
+        comissao_visualizacao = sum(
+            float(vinculo_por_venda.get(v["id"], {}).get("valor_comissao") or 0)
+            for v in vendas_fechamento
+            if (v.get("status_venda") or {}).get("nome") != "Retirada - Parceiros"
+        )
+        valor_vendas_visualizacao = sum(
+            float(v.get("valor_final") or 0) for v in vendas_fechamento
+        )
+        ajustes_visualizacao = 0.0
+        valor_final_visualizacao = comissao_visualizacao - retirada_visualizacao
+
+        st.divider()
+        inicio_visualizacao = _parse_data_segura(ciclo_visualizado.get("data_inicio"))
+        fim_visualizacao = _parse_data_segura(ciclo_visualizado.get("data_fim"))
+        inicio_txt = inicio_visualizacao.strftime("%d/%m/%Y") if inicio_visualizacao else str(ciclo_visualizado.get("data_inicio") or "-")
+        fim_txt = fim_visualizacao.strftime("%d/%m/%Y") if fim_visualizacao else str(ciclo_visualizado.get("data_fim") or "-")
+
+        st.markdown(
+            f"##### Visualização do ciclo #{ciclo_visualizado['numero_ciclo']} - "
+            f"de {inicio_txt} até {fim_txt}"
+        )
+
+        resumo_visualizacao = pd.DataFrame([
+            {"Descrição": "Vendas no período", "Valor": _fmt_moeda(valor_vendas_visualizacao), "Observação": ""},
+            {"Descrição": "Comissão Total (+)", "Valor": _fmt_moeda(comissao_visualizacao), "Observação": ""},
+            {"Descrição": "Retirada Peças (-)", "Valor": _fmt_moeda(-retirada_visualizacao), "Observação": "Retirada - Parceiros" if retirada_visualizacao else ""},
+            {"Descrição": "Ajustes", "Valor": _fmt_moeda(ajustes_visualizacao), "Observação": ""},
+            {"Descrição": "Valor Final", "Valor": _fmt_moeda(valor_final_visualizacao), "Observação": ""},
+        ])
+        styled_visualizacao = resumo_visualizacao.style.apply(
+            lambda row: [
+                "font-weight: 700; background-color: rgba(0, 123, 255, 0.16);"
+                if row["Descrição"] == "Valor Final" else ""
+                for _ in row
+            ],
+            axis=1,
+        )
+        st.dataframe(styled_visualizacao, use_container_width=True, hide_index=True)
+
+        linhas_vendas_visualizacao = [
+            {
+                "Data": v.get("data_venda"),
+                "Cliente": v.get("cliente") or "-",
+                "Produto": (v.get("produtos") or {}).get("descricao") or "-",
+                "Código": (v.get("produtos") or {}).get("codigo_interno") or "-",
+                "Qtd": v.get("quantidade"),
+                "Valor": float(v.get("valor_final") or 0),
+                "Comissão R$": float(vinculo_por_venda.get(v["id"], {}).get("valor_comissao") or 0),
+                "Status": (v.get("status_venda") or {}).get("nome") or "-",
+            }
+            for v in vendas_fechamento
+        ]
+
+        if linhas_vendas_visualizacao:
+            st.dataframe(
+                linhas_vendas_visualizacao,
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.info("Este ciclo não possui vendas vinculadas.")
+
+
+def _limpar_estado_parceiro() -> None:
+    """Remove do session_state tudo que pertence ao parceiro atualmente selecionado."""
+    prefixos = ("parceiros_", "historico_ciclos_", "retirada_auto_obs_")
+    for chave in list(st.session_state.keys()):
+        if isinstance(chave, str) and chave.startswith(prefixos):
+            del st.session_state[chave]
+
+
+def _desmarcar_parceiro() -> None:
+    _limpar_estado_parceiro()
+    st.session_state.pop("parceiros_selecionado", None)
 
 
 def _secao_parceiros():
-    st.markdown("### 🤝 Parceiros")
-
     try:
         resp = (
             supabase.table("parceiros")
@@ -2169,32 +2884,120 @@ def _secao_parceiros():
         )
         parceiros = resp.data or []
     except Exception as e:
+        st.markdown("### 🤝 Parceiros")
         st.error(f"Não foi possível carregar os parceiros: {e}")
         return
 
     if not parceiros:
+        st.markdown("### 🤝 Parceiros")
         st.info(
             "Nenhum parceiro cadastrado ainda. Cadastre um parceiro na aba "
             "**Cadastros Auxiliares** para começar."
         )
         return
 
-    nomes_parceiros = [p["nome"] for p in parceiros]
-    nome_selecionado = st.selectbox(
-        "Selecione um parceiro",
-        options=nomes_parceiros,
-        index=None,
-        placeholder="Escolha um parceiro...",
-        key="parceiros_selecao",
-    )
+    nome_selecionado = st.session_state.get("parceiros_selecionado")
+    parceiro = next((p for p in parceiros if p["nome"] == nome_selecionado), None)
 
-    if not nome_selecionado:
+    # Parceiro salvo não existe mais (ou nada selecionado): mostra o dropdown.
+    if parceiro is None:
+        if nome_selecionado:
+            _limpar_estado_parceiro()
+
+        st.markdown("### 🤝 Parceiros")
+        escolhido = st.selectbox(
+            "Selecione um parceiro",
+            options=[p["nome"] for p in parceiros],
+            index=None,
+            placeholder="Escolha um parceiro...",
+            key="parceiros_selecao_dropdown",
+        )
+        if escolhido:
+            # Primeira seleção: guarda o parceiro e recarrega sem o dropdown.
+            st.session_state["parceiros_selecionado"] = escolhido
+            st.rerun()
+
         st.caption("Selecione um parceiro acima para ver o fechamento e os produtos enviados.")
         return
 
-    parceiro = next(p for p in parceiros if p["nome"] == nome_selecionado)
+    # Parceiro selecionado: título com nome, comissão e botão para desmarcar.
+    comissao = parceiro.get("percentual_comissao")
+    comissao_fmt = f"{float(comissao):g}%" if comissao is not None else "-"
+    titulo = f"Parceiros: {parceiro['nome']} (Comissão: {comissao_fmt})"
 
-    _render_cabecalho_parceiro(parceiro)
+    st.markdown(
+        """
+        <style>
+        .st-key-parceiros_desmarcar button {
+            min-height: 2rem;
+            height: 2rem;
+            width: 2rem;
+            min-width: 2rem;
+            padding: 0;
+            border-radius: 50%;
+            border: 1px solid rgba(220, 53, 69, 0.55);
+            color: #dc3545;
+            background: transparent;
+            font-size: 1rem;
+            font-weight: 700;
+            line-height: 1;
+        }
+        .st-key-parceiros_desmarcar button:hover {
+            background: #dc3545;
+            border-color: #dc3545;
+            color: #ffffff;
+        }
+        .st-key-parceiros_desmarcar button p { margin: 0; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # Título em uma linha só: as colunas desta linha se ajustam ao conteúdo
+    # (largura automática), então o ✕ fica colado ao texto, qualquer que seja
+    # o tamanho do nome do parceiro.
+    st.markdown(
+        """
+        <style>
+        .st-key-parceiros_titulo [data-testid="stHorizontalBlock"] {
+            flex-wrap: nowrap !important;
+            align-items: center !important;
+            gap: 0.75rem !important;
+        }
+        .st-key-parceiros_titulo [data-testid="stColumn"] {
+            width: auto !important;
+            flex: 0 0 auto !important;
+            min-width: 0 !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # Larguras proporcionais só como reserva, caso o CSS acima não se aplique.
+    largura_titulo = max(len(titulo) * 1.5, 30)
+    espaco = max(100 - largura_titulo - 4, 1)
+    with _container_com_key("parceiros_titulo"):
+        try:
+            col_titulo, col_x, _ = st.columns(
+                [largura_titulo, 4, espaco], vertical_alignment="center", gap="small"
+            )
+        except TypeError:  # Streamlit mais antigo, sem vertical_alignment
+            col_titulo, col_x, _ = st.columns([largura_titulo, 4, espaco], gap="small")
+
+        with col_titulo:
+            st.markdown(
+                "<div style='font-size:1.65rem; font-weight:700; line-height:1.3; "
+                f"white-space:nowrap;'>🤝 {html.escape(titulo)}</div>",
+                unsafe_allow_html=True,
+            )
+        with col_x:
+            st.button(
+                "✕",
+                key="parceiros_desmarcar",
+                help="Desmarcar parceiro",
+                on_click=_desmarcar_parceiro,
+            )
 
     sub_fechamento, sub_produtos = st.tabs(["📑 Fechamento", "📦 Produtos Enviados"])
 

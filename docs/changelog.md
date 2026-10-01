@@ -8,3 +8,6 @@ Implementação da telas parcerias
 
 ## 1.6.0 - 01/10/2026
 Melhoria tela de Vendas - MultiVendas
+
+## 1.6.1 - 01/10/2026
+Melhoria tela de Vendas - MultiVendas + fechamento
