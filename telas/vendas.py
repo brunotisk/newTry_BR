@@ -1,8 +1,9 @@
 import streamlit as st
 import tempfile
 import hashlib
+import html
 from io import BytesIO
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Optional
 
 from db import supabase
@@ -18,6 +19,7 @@ from servicos.vendas_import import (
     validar_planilha_vendas,
     importar_linhas_validadas,
     PlanilhaJaImportadaError,
+    calcular_comissao_venda,
     _normalizar_nome,
 )
 from telas.cadastros_gerais import tela_cadastros_gerais
@@ -966,6 +968,9 @@ def _dialog_editar_venda(
             st.error("Data da venda inválida. Use o formato DD/MM/YYYY.")
             return
 
+        comissao_percentual, comissao_valor = calcular_comissao_venda(
+            sb, canal_id, valor_final
+        )
         dados_novos = {
             "produto_id": produto_selecionado["id"],
             "canal_venda_id": canal_id,
@@ -978,6 +983,8 @@ def _dialog_editar_venda(
             "cliente": cliente.strip(),
             "forma_pagamento_id": forma_pagamento_id,
             "detalhe_feira_id": detalhe_feira_id,
+            "comissao_percentual": comissao_percentual,
+            "comissao_valor": comissao_valor,
         }
 
         if nova_venda:
@@ -1471,11 +1478,397 @@ def _secao_listagem():
     )
 
 
+def _render_cabecalho_parceiro(parceiro: dict) -> None:
+    canal_nome = (parceiro.get("canais_venda") or {}).get("nome") or "-"
+    telefone = parceiro.get("telefone") or "-"
+    email = parceiro.get("email") or "-"
+    comissao = parceiro.get("percentual_comissao")
+    comissao_fmt = f"{float(comissao):g}%" if comissao is not None else "-"
+    observacao = (parceiro.get("observacao") or "").strip()
+
+    observacao_html = (
+        f'<div style="margin-top:0.5rem; font-size:0.85rem; opacity:0.75;">'
+        f'{html.escape(observacao)}</div>'
+        if observacao else ""
+    )
+
+    st.markdown(
+        f"""
+        <div style="border:1px solid rgba(128,128,128,0.35); border-radius:0.5rem;
+                     padding:1rem 1.2rem; margin-bottom:1rem;">
+            <div style="font-size:1.1rem; font-weight:700; margin-bottom:0.5rem;">
+                {html.escape(parceiro.get('nome') or '')}
+            </div>
+            <div style="display:flex; gap:2rem; flex-wrap:wrap; font-size:0.9rem;">
+                <div><span style="opacity:0.7;">Canal:</span> {html.escape(canal_nome)}</div>
+                <div><span style="opacity:0.7;">Comissão padrão:</span> {comissao_fmt}</div>
+                <div><span style="opacity:0.7;">Telefone:</span> {html.escape(telefone)}</div>
+                <div><span style="opacity:0.7;">E-mail:</span> {html.escape(email)}</div>
+            </div>
+            {observacao_html}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _secao_parceiro_produtos_enviados(parceiro: dict) -> None:
+    """Lista as vendas (= produtos enviados) feitas através do canal deste
+    parceiro, em um período selecionável. Puramente de leitura — não depende
+    de nenhuma regra de fechamento."""
+    canal_id = parceiro.get("canal_id")
+    if not canal_id:
+        st.warning("Este parceiro não possui um canal de venda vinculado.")
+        return
+
+    col_ini, col_fim = st.columns(2)
+    with col_ini:
+        data_ini = st.date_input(
+            "De", value=date.today().replace(day=1), key="parceiros_produtos_data_ini"
+        )
+    with col_fim:
+        data_fim = st.date_input("Até", value=date.today(), key="parceiros_produtos_data_fim")
+
+    if data_ini > data_fim:
+        st.error("A data inicial não pode ser depois da data final.")
+        return
+
+    try:
+        resp = (
+            supabase.table("vendas")
+            .select(
+                "id, data_venda, cliente, quantidade, valor_final, "
+                "comissao_percentual, comissao_valor, "
+                "produtos(codigo_interno, descricao), status_venda(nome)"
+            )
+            .eq("canal_venda_id", canal_id)
+            .gte("data_venda", data_ini.isoformat())
+            .lte("data_venda", data_fim.isoformat())
+            .order("data_venda", desc=True)
+            .limit(1000)
+            .execute()
+        )
+        vendas = resp.data or []
+    except Exception as e:
+        st.error(f"Não foi possível carregar os produtos enviados: {e}")
+        return
+
+    if not vendas:
+        st.info("Nenhuma venda deste canal no período selecionado.")
+        return
+
+    linhas = []
+    total_valor = 0.0
+    total_comissao = 0.0
+    for v in vendas:
+        produto = v.get("produtos") or {}
+        valor_final = float(v.get("valor_final") or 0)
+        comissao_valor = float(v.get("comissao_valor") or 0)
+        total_valor += valor_final
+        total_comissao += comissao_valor
+        linhas.append({
+            "Data": v.get("data_venda"),
+            "Cliente": v.get("cliente") or "-",
+            "Produto": produto.get("descricao") or "-",
+            "Código": produto.get("codigo_interno") or "-",
+            "Qtd": v.get("quantidade"),
+            "Valor": valor_final,
+            "Comissão %": v.get("comissao_percentual"),
+            "Comissão R$": comissao_valor,
+            "Status": (v.get("status_venda") or {}).get("nome") or "-",
+        })
+
+    col_m1, col_m2, col_m3 = st.columns(3)
+    col_m1.metric("Produtos enviados", len(linhas))
+    col_m2.metric("Valor total", _fmt_moeda(total_valor))
+    col_m3.metric("Comissão total", _fmt_moeda(total_comissao))
+
+    st.dataframe(linhas, use_container_width=True, hide_index=True)
+
+
+def _secao_parceiro_fechamento(parceiro: dict) -> None:
+    """Fluxo de fechamento do parceiro:
+
+    - Sem ciclo aberto: botão para iniciar um novo ciclo. `data_inicio` é
+      automática (dia seguinte ao `data_fim` do último ciclo fechado); no
+      primeiro ciclo do parceiro, pede a data manualmente.
+    - Com ciclo aberto: o usuário escolhe a data final, vê as vendas do
+      canal do parceiro nesse período que ainda não entraram em nenhum
+      fechamento, pode desmarcar alguma (ela fica disponível para o próximo
+      ciclo) e fecha o ciclo. A comissão de cada venda vem do que já está
+      gravado nela (`comissao_percentual`/`comissao_valor`), não é
+      recalculada aqui.
+    """
+    parceiro_id = parceiro["id"]
+    canal_id = parceiro.get("canal_id")
+
+    try:
+        fechamentos = (
+            supabase.table("parcerias_fechamentos")
+            .select(
+                "id, numero_ciclo, data_inicio, data_fim, percentual_comissao, "
+                "valor_total_vendas, valor_total_comissao, status"
+            )
+            .eq("parceiro_id", parceiro_id)
+            .order("numero_ciclo", desc=True)
+            .execute()
+            .data
+            or []
+        )
+    except Exception as e:
+        st.error(f"Não foi possível carregar os fechamentos: {e}")
+        return
+
+    ciclo_aberto = next((f for f in fechamentos if f.get("status") == "Aberto"), None)
+    ultimo_fechamento = fechamentos[0] if fechamentos else None
+
+    if not canal_id:
+        st.warning("Este parceiro não possui um canal de venda vinculado.")
+        return
+
+    if not ciclo_aberto:
+        proximo_numero = (ultimo_fechamento["numero_ciclo"] + 1) if ultimo_fechamento else 1
+
+        if ultimo_fechamento and ultimo_fechamento.get("data_fim"):
+            data_inicio_sugerida = (
+                _parse_data_segura(ultimo_fechamento["data_fim"]) + timedelta(days=1)
+            )
+            st.info(
+                f"Próximo ciclo: **#{proximo_numero}**, a partir de "
+                f"**{data_inicio_sugerida.strftime('%d/%m/%Y')}** "
+                "(dia seguinte ao fim do último ciclo)."
+            )
+        else:
+            data_inicio_sugerida = st.date_input(
+                "Data de início do 1º ciclo",
+                value=date.today().replace(day=1),
+                key="parceiros_fechamento_data_inicio_manual",
+            )
+
+        if st.button("▶️ Iniciar novo ciclo", key="parceiros_iniciar_ciclo"):
+            try:
+                supabase.table("parcerias_fechamentos").insert({
+                    "parceiro_id": parceiro_id,
+                    "numero_ciclo": proximo_numero,
+                    "data_inicio": data_inicio_sugerida.isoformat(),
+                    "percentual_comissao": parceiro.get("percentual_comissao") or 0,
+                    "status": "Aberto",
+                }).execute()
+                st.success(f"Ciclo #{proximo_numero} iniciado.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Não foi possível iniciar o ciclo: {e}")
+
+    else:
+        data_inicio_ciclo = _parse_data_segura(ciclo_aberto["data_inicio"])
+        st.success(
+            f"Ciclo **#{ciclo_aberto['numero_ciclo']}** aberto desde "
+            f"{data_inicio_ciclo.strftime('%d/%m/%Y') if data_inicio_ciclo else ciclo_aberto['data_inicio']}."
+        )
+
+        data_fim_ciclo = st.date_input(
+            "Fechar com vendas até",
+            value=date.today(),
+            min_value=data_inicio_ciclo,
+            key="parceiros_fechamento_data_fim",
+        )
+        if data_inicio_ciclo and data_fim_ciclo < data_inicio_ciclo:
+            st.error("A data final não pode ser antes do início do ciclo.")
+            return
+
+        try:
+            ids_ja_incluidos = {
+                v["venda_id"]
+                for v in (
+                    supabase.table("parcerias_fechamento_vendas")
+                    .select("venda_id")
+                    .in_(
+                        "fechamento_id",
+                        [f["id"] for f in fechamentos],
+                    )
+                    .execute()
+                    .data
+                    or []
+                )
+            }
+            vendas_periodo = (
+                supabase.table("vendas")
+                .select(
+                    "id, data_venda, cliente, valor_final, "
+                    "comissao_percentual, comissao_valor, "
+                    "produtos(descricao)"
+                )
+                .eq("canal_venda_id", canal_id)
+                .gte("data_venda", data_inicio_ciclo.isoformat())
+                .lte("data_venda", data_fim_ciclo.isoformat())
+                .order("data_venda")
+                .execute()
+                .data
+                or []
+            )
+            candidatas = [v for v in vendas_periodo if v["id"] not in ids_ja_incluidos]
+        except Exception as e:
+            st.error(f"Não foi possível carregar as vendas do período: {e}")
+            return
+
+        if not candidatas:
+            st.info("Nenhuma venda pendente neste período para incluir no fechamento.")
+            return
+
+        st.caption(
+            "Desmarque alguma venda para deixá-la de fora deste ciclo — ela "
+            "continua disponível para um fechamento futuro."
+        )
+
+        linhas_editor = [
+            {
+                "Incluir": True,
+                "id": v["id"],
+                "Data": v.get("data_venda"),
+                "Cliente": v.get("cliente") or "-",
+                "Produto": (v.get("produtos") or {}).get("descricao") or "-",
+                "Valor": float(v.get("valor_final") or 0),
+                "Comissão %": v.get("comissao_percentual"),
+                "Comissão R$": float(v.get("comissao_valor") or 0),
+            }
+            for v in candidatas
+        ]
+
+        editado = st.data_editor(
+            linhas_editor,
+            key="parceiros_fechamento_editor",
+            use_container_width=True,
+            hide_index=True,
+            disabled=["id", "Data", "Cliente", "Produto", "Valor", "Comissão %", "Comissão R$"],
+            column_order=["Incluir", "Data", "Cliente", "Produto", "Valor", "Comissão %", "Comissão R$"],
+        )
+
+        selecionadas = [linha for linha in editado if linha["Incluir"]]
+        valor_total = sum(l["Valor"] for l in selecionadas)
+        comissao_total = sum(l["Comissão R$"] for l in selecionadas)
+
+        col_t1, col_t2 = st.columns(2)
+        col_t1.metric("Selecionadas", f"{len(selecionadas)} de {len(editado)}")
+        col_t2.metric(
+            "Total a fechar",
+            f"{_fmt_moeda(valor_total)}  ·  comissão {_fmt_moeda(comissao_total)}",
+        )
+
+        if st.button(
+            f"✅ Fechar ciclo #{ciclo_aberto['numero_ciclo']}",
+            type="primary",
+            disabled=not selecionadas,
+            key="parceiros_fechar_ciclo",
+        ):
+            try:
+                venda_por_id = {v["id"]: v for v in candidatas}
+                registros = []
+                for linha in selecionadas:
+                    venda = venda_por_id[linha["id"]]
+                    registros.append({
+                        "fechamento_id": ciclo_aberto["id"],
+                        "venda_id": venda["id"],
+                        "valor_venda": float(venda.get("valor_final") or 0),
+                        "percentual_comissao": float(venda.get("comissao_percentual") or 0),
+                        "valor_comissao": float(venda.get("comissao_valor") or 0),
+                    })
+                if registros:
+                    supabase.table("parcerias_fechamento_vendas").insert(registros).execute()
+
+                supabase.table("parcerias_fechamentos").update({
+                    "data_fim": data_fim_ciclo.isoformat(),
+                    "valor_total_vendas": valor_total,
+                    "valor_total_comissao": comissao_total,
+                    "status": "Finalizado",
+                    "fechado_em": datetime.now().isoformat(),
+                }).eq("id", ciclo_aberto["id"]).execute()
+
+                st.success(
+                    f"Ciclo #{ciclo_aberto['numero_ciclo']} fechado com "
+                    f"{len(registros)} venda(s)."
+                )
+                st.rerun()
+            except Exception as e:
+                st.error(f"Não foi possível fechar o ciclo: {e}")
+
+    st.divider()
+    st.markdown("##### Histórico de ciclos")
+    if not fechamentos:
+        st.caption("Nenhum ciclo de fechamento registrado ainda para este parceiro.")
+        return
+
+    linhas_fechamento = [
+        {
+            "Ciclo": f["numero_ciclo"],
+            "Início": f.get("data_inicio"),
+            "Fim": f.get("data_fim") or "-",
+            "Status": f.get("status"),
+            "Comissão %": f.get("percentual_comissao"),
+            "Valor vendas": _fmt_moeda(f.get("valor_total_vendas")),
+            "Valor comissão": _fmt_moeda(f.get("valor_total_comissao")),
+        }
+        for f in fechamentos
+    ]
+    st.dataframe(linhas_fechamento, use_container_width=True, hide_index=True)
+
+
+def _secao_parceiros():
+    st.markdown("### 🤝 Parceiros")
+
+    try:
+        resp = (
+            supabase.table("parceiros")
+            .select(
+                "id, nome, canal_id, telefone, email, percentual_comissao, "
+                "observacao, ativo, canais_venda(nome)"
+            )
+            .eq("ativo", True)
+            .order("nome")
+            .execute()
+        )
+        parceiros = resp.data or []
+    except Exception as e:
+        st.error(f"Não foi possível carregar os parceiros: {e}")
+        return
+
+    if not parceiros:
+        st.info(
+            "Nenhum parceiro cadastrado ainda. Cadastre um parceiro na aba "
+            "**Cadastros Auxiliares** para começar."
+        )
+        return
+
+    nomes_parceiros = [p["nome"] for p in parceiros]
+    nome_selecionado = st.selectbox(
+        "Selecione um parceiro",
+        options=nomes_parceiros,
+        index=None,
+        placeholder="Escolha um parceiro...",
+        key="parceiros_selecao",
+    )
+
+    if not nome_selecionado:
+        st.caption("Selecione um parceiro acima para ver o fechamento e os produtos enviados.")
+        return
+
+    parceiro = next(p for p in parceiros if p["nome"] == nome_selecionado)
+
+    _render_cabecalho_parceiro(parceiro)
+
+    sub_fechamento, sub_produtos = st.tabs(["📑 Fechamento", "📦 Produtos Enviados"])
+
+    with sub_fechamento:
+        _secao_parceiro_fechamento(parceiro)
+
+    with sub_produtos:
+        _secao_parceiro_produtos_enviados(parceiro)
+
+
 def tela_vendas():
     st.header("💰 Gestão de Vendas")
 
-    aba_listagem, aba_importar, aba_auxiliares = st.tabs(
-        ["Vendas registradas", "Importar planilha", "Cadastros Auxiliares"]
+    aba_listagem, aba_importar, aba_parceiros, aba_auxiliares = st.tabs(
+        ["Vendas registradas", "Importar planilha", "Parceiros", "Cadastros Auxiliares"]
     )
 
     with aba_listagem:
@@ -1483,6 +1876,9 @@ def tela_vendas():
 
     with aba_importar:
         _secao_importar()
+
+    with aba_parceiros:
+        _secao_parceiros()
 
     with aba_auxiliares:
         tela_cadastros_gerais()

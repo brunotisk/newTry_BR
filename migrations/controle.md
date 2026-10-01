@@ -16,6 +16,8 @@ Projeto: **Projeto AC**
 | 008    | Alterar unicidade clientes nome canal | ✅ Aplicada     | ✅ Aplicada  |
 | 009    | Adicionar campos - des e valor unit.  | ✅ Aplicada     | ✅ Aplicada  |
 | 010    | Criar logs de automação               | ✅ Aplicada     | ✅ Aplicada  |
+| 011    | Criar estrutura de parc. e comissoes  | ✅ Aplicada     | ✅ Aplicada  |
+| 012    | Adicao_preenchimento_comissao         | ✅ Aplicada     | ✅ Aplicada  |
 ------------------------------------------------------------------------------------
 
 
@@ -59,3 +61,11 @@ Descrição: inclusão dos campos pct_desconto_item na tabela public.compras, va
 **Arquivo**: migrations/010_criar_logs_automacao.sql
 Data: 28/09/2026
 Descrição: criação da tabela public.logs_automacao para registrar as inserções e ajustes automáticos realizados pelo sistema, agrupados por operacao_id e identificados por fluxo e etapa. Foram adicionados os relacionamentos com produtos, compras e vendas, índices para consulta dos logs e RLS com policies de leitura e inserção para usuários autenticados.
+
+**Arquivo**: migrations/011_Criar_estrutura_parcerias_comissoes.sql
+Data: 01/10/2026
+Descrição: criação da estrutura de parceiros comerciais, comissões e fechamentos de parceria, incluindo a tabela public.parceiros, os campos de comissão em public.vendas, as tabelas public.parcerias_fechamentos e public.parcerias_fechamento_vendas, além dos respectivos índices, constraints e relacionamentos.
+
+**Arquivo**: migrations/012_Adicao_preenchimento_comissao.sql
+Data: 01/10/2026
+Descrição: criação da função e trigger para aplicação automática da comissão nas vendas de canais vinculados a parceiros, além do preenchimento da comissão nas vendas existentes que ainda não possuem essa informação.

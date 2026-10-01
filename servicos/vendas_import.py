@@ -590,6 +590,41 @@ def extrair_id_planilha(caminho_arquivo) -> str | None:
     return valor or None
 
 
+def calcular_comissao_venda(
+    sb: Client, canal_id: int | None, valor_final
+) -> tuple[float | None, float | None]:
+    """Se o canal da venda tiver um parceiro ativo vinculado, retorna
+    (percentual, valor) de comissão para gravar na venda, usando o
+    `percentual_comissao` padrão do parceiro no momento da venda. Canais sem
+    parceiro ativo retornam (None, None) — essas vendas não entram em
+    nenhum fechamento de parceria.
+
+    Usado tanto na venda manual (telas/vendas.py) quanto na importação por
+    planilha (`importar_linhas_validadas` abaixo), para que o
+    `comissao_percentual`/`comissao_valor` gravado na venda seja sempre a
+    mesma regra, não importa o caminho de entrada.
+    """
+    if not canal_id:
+        return None, None
+    try:
+        resp = (
+            sb.table("parceiros")
+            .select("percentual_comissao")
+            .eq("canal_id", canal_id)
+            .eq("ativo", True)
+            .limit(1)
+            .execute()
+        )
+        parceiro = (resp.data or [None])[0]
+    except Exception:
+        return None, None
+    if not parceiro:
+        return None, None
+    percentual = float(parceiro["percentual_comissao"] or 0)
+    valor = round(float(valor_final or 0) * percentual / 100, 2)
+    return percentual, valor
+
+
 def buscar_produto_id(sb: Client, codigo_interno: str) -> int | None:
     resp = (
         sb.table("produtos")
@@ -1133,6 +1168,9 @@ def importar_linhas_validadas(
                         clientes_cache[chave] = criado.data[0]["id"]
                         clientes_criados += 1
 
+            comissao_percentual, comissao_valor = calcular_comissao_venda(
+                sb, item["canal_id"], item["valor_final"]
+            )
             linha = {
                 "canal_venda_id": item["canal_id"],
                 "status_id": item["status_id"],
@@ -1145,6 +1183,8 @@ def importar_linhas_validadas(
                 "data_venda": item["data_venda"],
                 "cliente": cliente,
                 "observacao": item.get("observacao") or "",
+                "comissao_percentual": comissao_percentual,
+                "comissao_valor": comissao_valor,
             }
             inserir_venda_e_baixar_estoque(
                 sb, linha, item["produto_id"], motivo_saida="Importação XLSX"
