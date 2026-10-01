@@ -2,6 +2,7 @@ import streamlit as st
 import tempfile
 import hashlib
 import html
+import uuid
 from io import BytesIO
 from datetime import date, datetime, timedelta
 from typing import Optional
@@ -649,6 +650,156 @@ def _render_controles_valores_venda():
     )
 
 
+_PREFIXOS_ITEM_VENDA = (
+    "venda_item_produto_",
+    "venda_item_controles_chave_",
+    "venda_item_qtd_",
+    "contador_venda_item_",
+    "venda_item_valor_lista_",
+    "venda_item_valor_lista_aberto_",
+    "venda_item_valor_lista_bloqueio_",
+    "venda_item_valor_lista_input_",
+    "venda_item_desconto_texto_",
+)
+
+
+def _limpar_itens_venda_nova():
+    """Remove do session_state a lista de itens da venda nova e todas as
+    chaves de widgets de cada linha (produto, quantidade, valores). Chamado
+    ao cancelar, ao salvar com sucesso, ou ao remover uma linha — assim o
+    próximo "➕ Adicionar venda" sempre abre com uma única linha em branco."""
+    for row_uid in st.session_state.pop("venda_itens_ids", []):
+        for prefixo in _PREFIXOS_ITEM_VENDA:
+            st.session_state.pop(f"{prefixo}{row_uid}", None)
+
+
+def _render_item_venda(row_uid: str, produtos_opcoes: dict, produtos_excluidos: set) -> dict:
+    """Renderiza uma linha 'item' do formulário de nova venda: produto +
+    quantidade + valores (mesmos controles de _render_controles_valores_venda,
+    só que indexados por `row_uid` para suportar várias linhas simultâneas).
+
+    Retorna sempre um dict com `remover` (bool). Quando `remover` é True, o
+    chamador deve excluir esta linha e ignorar os demais campos. Quando um
+    produto ainda não foi escolhido nesta linha, os demais campos vêm vazios
+    (`produto` é None).
+    """
+    rotulos_disponiveis = [
+        rotulo for rotulo, prod in produtos_opcoes.items()
+        if prod["id"] not in produtos_excluidos
+    ]
+    rotulo_atual = st.session_state.get(f"venda_item_produto_{row_uid}")
+
+    col_produto, col_remover = st.columns([5, 1], vertical_alignment="bottom")
+    with col_produto:
+        produto_rotulo = st.selectbox(
+            "Produto",
+            rotulos_disponiveis,
+            index=rotulos_disponiveis.index(rotulo_atual) if rotulo_atual in rotulos_disponiveis else None,
+            placeholder="Selecione o produto...",
+            key=f"venda_item_produto_{row_uid}",
+        )
+    with col_remover:
+        remover = st.button(
+            "🗑️", key=f"venda_item_remover_{row_uid}",
+            help="Remover este item", use_container_width=True,
+        )
+
+    if remover:
+        return {"remover": True, "produto": None}
+
+    produto_selecionado = produtos_opcoes.get(produto_rotulo)
+    if not produto_selecionado:
+        return {"remover": False, "produto": None}
+
+    # Reinicia os controles de quantidade/valor sempre que o produto desta
+    # linha muda — mesma lógica de _resetar_controles_venda, indexada por
+    # row_uid em vez de uma única chave global.
+    chave_item = f"{row_uid}:{produto_selecionado['id']}"
+    if st.session_state.get(f"venda_item_controles_chave_{row_uid}") != chave_item:
+        st.session_state[f"venda_item_controles_chave_{row_uid}"] = chave_item
+        st.session_state[f"venda_item_qtd_{row_uid}"] = 1
+        st.session_state[f"venda_item_valor_lista_{row_uid}"] = float(
+            produto_selecionado.get("estoque_preco_venda_sugerida") or 0
+        )
+        st.session_state[f"venda_item_desconto_texto_{row_uid}"] = _fmt_valor_input(0)
+        st.session_state[f"venda_item_valor_lista_aberto_{row_uid}"] = False
+        st.session_state[f"venda_item_valor_lista_input_{row_uid}"] = _fmt_valor_input(
+            st.session_state[f"venda_item_valor_lista_{row_uid}"]
+        )
+
+    col_qtd, col_lista, col_desc, col_final = st.columns(4)
+
+    with col_qtd:
+        st.markdown("**Quantidade**")
+        estado_qtd = contador_quantidade(
+            valor=int(max(1.0, float(st.session_state.get(f"venda_item_qtd_{row_uid}", 1)))),
+            min_valor=1,
+            bloqueado=True,
+            label="",
+            key=f"contador_venda_item_{row_uid}",
+        )
+        quantidade = max(
+            1, int(estado_qtd.get("valor", st.session_state.get(f"venda_item_qtd_{row_uid}", 1)))
+        )
+        st.session_state[f"venda_item_qtd_{row_uid}"] = quantidade
+
+    with col_lista:
+        col_rotulo, col_bloqueio = st.columns([2, 1], vertical_alignment="center")
+        with col_rotulo:
+            st.markdown("**Valor lista**")
+        with col_bloqueio:
+            aberto = st.toggle(
+                "🔓",
+                value=st.session_state.get(f"venda_item_valor_lista_aberto_{row_uid}", False),
+                key=f"venda_item_valor_lista_bloqueio_{row_uid}",
+                help=(
+                    "Travado: usa o valor sugerido do estoque. "
+                    "Ative para digitar um valor lista diferente."
+                ),
+            )
+            st.session_state[f"venda_item_valor_lista_aberto_{row_uid}"] = aberto
+
+        valor_lista_texto = st.text_input(
+            "Valor lista",
+            key=f"venda_item_valor_lista_input_{row_uid}",
+            disabled=not aberto,
+            label_visibility="collapsed",
+        )
+        valor_lista = _parse_valor_input(
+            valor_lista_texto, st.session_state.get(f"venda_item_valor_lista_{row_uid}", 0),
+        )
+        st.session_state[f"venda_item_valor_lista_{row_uid}"] = valor_lista
+
+    with col_desc:
+        st.markdown("**Desconto**")
+        desconto_texto = st.text_input(
+            "Desconto",
+            key=f"venda_item_desconto_texto_{row_uid}",
+            label_visibility="collapsed",
+        )
+        valor_desconto = _parse_valor_input(desconto_texto, 0.0)
+
+    with col_final:
+        st.markdown("**Valor final**")
+        valor_final = (float(quantidade) * float(valor_lista)) - valor_desconto
+        st.text_input(
+            "Valor final",
+            value=_fmt_valor_input(valor_final),
+            disabled=True,
+            label_visibility="collapsed",
+            key=f"venda_item_valor_final_display_{row_uid}",
+        )
+
+    return {
+        "remover": False,
+        "produto": produto_selecionado,
+        "quantidade": float(quantidade),
+        "valor_lista": float(valor_lista),
+        "valor_desconto": float(valor_desconto),
+        "valor_final": float(valor_final),
+    }
+
+
 @_dialog("💰 Venda", width="large")
 def _dialog_editar_venda(
     venda: dict | None,
@@ -727,25 +878,15 @@ def _dialog_editar_venda(
     with st.container(border=True):
     # Linha 1 fica fora do formulário para que a escolha do canal provoque
     # atualização imediata e habilite/desabilite o campo Feira.
-    # Linha 1: Produto (1/2) | Canal de venda (1/4) | Feira (1/4)
-        col_produto, col_canal, col_feira = st.columns([2, 1, 1])
-
-        with col_produto:
-            if nova_venda:
-                if produtos_opcoes:
-                    rotulos_produtos = list(produtos_opcoes.keys())
-                    produto_rotulo = st.selectbox(
-                        "Produto",
-                        rotulos_produtos,
-                        index=None,
-                        placeholder="Selecione o produto...",
-                        key="venda_produto_nova",
-                    )
-                    produto_selecionado = produtos_opcoes.get(produto_rotulo)
-                else:
-                    st.warning("Nenhum produto com saldo em estoque.")
-                    produto_selecionado = None
-            else:
+    # Na edição, Produto também fica aqui (1/2) já que é uma única linha.
+    # Na inclusão, o produto virou "item" (ver abaixo) — cada venda nova
+    # pode ter vários produtos, então a linha 1 fica só com Canal | Feira.
+        if nova_venda:
+            col_canal, col_feira = st.columns([1, 1])
+            produto_selecionado = None  # não se aplica mais nesta posição
+        else:
+            col_produto, col_canal, col_feira = st.columns([2, 1, 1])
+            with col_produto:
                 st.text_input(
                     "Código interno do produto",
                     value=codigo_atual,
@@ -808,22 +949,25 @@ def _dialog_editar_venda(
                     key=f"venda_feira_{'nova' if nova_venda else venda.get('id')}",
                 )
 
+        itens_validos: list[dict] = []
+        nomes_clientes = [c.get("nome") for c in clientes_disponiveis if c.get("nome")]
 
-        _resetar_controles_venda(venda, nova_venda, produto_selecionado)
-        quantidade, valor_lista, valor_desconto, valor_final = _render_controles_valores_venda()
-
-        with st.form(form_key, border=False):
-            # Linha 3: Cliente (1/2) | Data da venda (1/4) | Forma de pagamento (1/4)
-            col_cliente, col_data, col_forma = st.columns([2, 1, 1])
+        if nova_venda:
+            # ------------------------------------------------------------
+            # Header (Cliente | Data | Forma de pagamento | Status) numa
+            # única linha, acima dos itens — vale igualmente para todos os
+            # produtos desta venda. Fica fora do st.form (assim como
+            # canal/feira/itens) porque o form, aqui, carrega só os botões.
+            # ------------------------------------------------------------
+            col_cliente, col_data, col_forma, col_status = st.columns(4)
 
             with col_cliente:
-                nomes_clientes = [c.get("nome") for c in clientes_disponiveis if c.get("nome")]
                 cliente = campo_cliente(
                     "Cliente",
-                    value=venda.get("cliente") or "",
+                    value="",
                     opcoes=nomes_clientes,
                     placeholder="Digite ou selecione o cliente...",
-                    key=f"venda_cliente_{'nova' if nova_venda else venda.get('id')}",
+                    key="venda_cliente_nova",
                 )
 
             with col_data:
@@ -832,33 +976,74 @@ def _dialog_editar_venda(
                     value=data_atual.strftime("%d/%m/%Y"),
                     tipo="data",
                     placeholder="DD/MM/YYYY",
-                    key=f"venda_data_mask_{'nova' if nova_venda else venda.get('id')}",
+                    key="venda_data_mask_nova",
                 )
 
             with col_forma:
                 forma_pagamento_nome = st.selectbox(
                     "Forma de pagamento",
                     [""] + nomes_formas,
-                    index=(
-                        (nomes_formas.index(forma_atual_desc) + 1)
-                        if forma_atual_desc in nomes_formas else 0
-                    ),
+                    index=0,
                     placeholder="Selecione...",
+                    key="venda_forma_pagamento_nova",
                 ) if nomes_formas else None
 
-            # Status continua obrigatório, mas foi deslocado para uma linha
-            # própria para preservar exatamente a distribuição solicitada.
-            status_nome = st.selectbox(
-                "Status",
-                nomes_status,
-                index=nomes_status.index(status_atual_nome)
-                if status_atual_nome in nomes_status else 0,
-            ) if nomes_status else None
+            with col_status:
+                status_nome = st.selectbox(
+                    "Status",
+                    nomes_status,
+                    index=0,
+                    key="venda_status_nova",
+                ) if nomes_status else None
 
-            # Espaçamento proposital entre a última linha e os botões.
+            st.markdown("##### Itens da venda")
+
+            if not produtos_opcoes:
+                st.warning("Nenhum produto com saldo em estoque.")
+
+            ids_itens = st.session_state.setdefault("venda_itens_ids", [str(uuid.uuid4())])
+
+            produtos_ja_usados: set = set()
+            ids_para_remover = []
+
+            for row_uid in list(ids_itens):
+                item = _render_item_venda(row_uid, produtos_opcoes, produtos_ja_usados)
+                if item.get("remover"):
+                    ids_para_remover.append(row_uid)
+                    continue
+                if item.get("produto"):
+                    produtos_ja_usados.add(item["produto"]["id"])
+                    itens_validos.append(item)
+                st.markdown("<hr style='margin:0.4rem 0;'>", unsafe_allow_html=True)
+
+            # Importante: NÃO chamar st.rerun() aqui. Um clique de botão já
+            # dispara sozinho um novo rerun do script (comportamento padrão
+            # do Streamlit); st.rerun() explícito dentro de um @st.dialog
+            # fecha o popup (é assim que Salvar/Cancelar fecham de propósito
+            # mais abaixo) — foi isso que fazia a tela "fechar" ao clicar em
+            # Adicionar produto e, ao reabrir, mostrar linhas em branco
+            # sobrando do session_state.
+            if ids_para_remover:
+                for row_uid in ids_para_remover:
+                    ids_itens.remove(row_uid)
+                    for prefixo in _PREFIXOS_ITEM_VENDA:
+                        st.session_state.pop(f"{prefixo}{row_uid}", None)
+                if not ids_itens:
+                    ids_itens.append(str(uuid.uuid4()))
+
+            if st.button("➕ Adicionar produto", key="venda_btn_add_item"):
+                ids_itens.append(str(uuid.uuid4()))
+
+            if itens_validos:
+                valor_total_itens = sum(i["valor_final"] for i in itens_validos)
+                st.caption(
+                    f"**{len(itens_validos)} item(ns)** nesta venda · "
+                    f"Valor total: **{_fmt_moeda(valor_total_itens)}**"
+                )
+
             st.markdown("<div style='height: 1.25rem;'></div>", unsafe_allow_html=True)
 
-            if nova_venda:
+            with st.form(form_key, border=False):
                 col_salvar, col_cancelar = st.columns(2)
                 salvar = col_salvar.form_submit_button(
                     "💾 Salvar", type="secondary", use_container_width=True
@@ -867,7 +1052,56 @@ def _dialog_editar_venda(
                     "Cancelar", use_container_width=True
                 )
                 excluir = False
-            else:
+
+        else:
+            _resetar_controles_venda(venda, nova_venda, produto_selecionado)
+            quantidade, valor_lista, valor_desconto, valor_final = _render_controles_valores_venda()
+
+            with st.form(form_key, border=False):
+                # Linha 3: Cliente (1/2) | Data da venda (1/4) | Forma de pagamento (1/4)
+                col_cliente, col_data, col_forma = st.columns([2, 1, 1])
+
+                with col_cliente:
+                    cliente = campo_cliente(
+                        "Cliente",
+                        value=venda.get("cliente") or "",
+                        opcoes=nomes_clientes,
+                        placeholder="Digite ou selecione o cliente...",
+                        key=f"venda_cliente_{venda.get('id')}",
+                    )
+
+                with col_data:
+                    data_venda_texto = campo_mascarado(
+                        "Data da venda",
+                        value=data_atual.strftime("%d/%m/%Y"),
+                        tipo="data",
+                        placeholder="DD/MM/YYYY",
+                        key=f"venda_data_mask_{venda.get('id')}",
+                    )
+
+                with col_forma:
+                    forma_pagamento_nome = st.selectbox(
+                        "Forma de pagamento",
+                        [""] + nomes_formas,
+                        index=(
+                            (nomes_formas.index(forma_atual_desc) + 1)
+                            if forma_atual_desc in nomes_formas else 0
+                        ),
+                        placeholder="Selecione...",
+                    ) if nomes_formas else None
+
+                # Status continua obrigatório, mas foi deslocado para uma linha
+                # própria para preservar exatamente a distribuição solicitada.
+                status_nome = st.selectbox(
+                    "Status",
+                    nomes_status,
+                    index=nomes_status.index(status_atual_nome)
+                    if status_atual_nome in nomes_status else 0,
+                ) if nomes_status else None
+
+                # Espaçamento proposital entre a última linha e os botões.
+                st.markdown("<div style='height: 1.25rem;'></div>", unsafe_allow_html=True)
+
                 col_salvar, col_cancelar, col_excluir = st.columns(3)
                 salvar = col_salvar.form_submit_button(
                     "💾 Salvar", type="secondary", use_container_width=True
@@ -880,6 +1114,8 @@ def _dialog_editar_venda(
                 )
 
     if cancelar:
+        if nova_venda:
+            _limpar_itens_venda_nova()
         st.rerun()
 
     if excluir:
@@ -897,7 +1133,11 @@ def _dialog_editar_venda(
     try:
         sb = get_client()
 
-        if not produto_selecionado:
+        if nova_venda:
+            if not itens_validos:
+                st.error("Adicione ao menos um produto à venda.")
+                return
+        elif not produto_selecionado:
             st.error("Selecione um produto.")
             return
         if not canal_nome:
@@ -968,38 +1208,84 @@ def _dialog_editar_venda(
             st.error("Data da venda inválida. Use o formato DD/MM/YYYY.")
             return
 
-        comissao_percentual, comissao_valor = calcular_comissao_venda(
-            sb, canal_id, valor_final
-        )
-        dados_novos = {
-            "produto_id": produto_selecionado["id"],
+        # Campos de "header", compartilhados por todas as linhas/itens desta
+        # venda (iguais para todo mundo, independente de quantos produtos).
+        dados_header = {
             "canal_venda_id": canal_id,
             "status_id": status_id,
-            "quantidade": float(quantidade),
-            "valor_lista": float(valor_lista),
-            "valor_desconto": float(valor_desconto),
-            "valor_final": float(valor_final),
             "data_venda": data_venda.isoformat(),
             "cliente": cliente.strip(),
             "forma_pagamento_id": forma_pagamento_id,
             "detalhe_feira_id": detalhe_feira_id,
-            "comissao_percentual": comissao_percentual,
-            "comissao_valor": comissao_valor,
         }
 
         if nova_venda:
-            inserir_venda_e_baixar_estoque(
-                sb,
-                dados_novos,
-                produto_selecionado["id"],
-                motivo_saida="Venda Manual",
-            )
-            st.success("Venda registrada com sucesso e estoque atualizado!")
+            # Cada item vira uma venda isolada na tabela `vendas`, com os
+            # mesmos dados de header e seus próprios produto/quantidade/
+            # valores — equivalente a duplicar manualmente os campos
+            # repetidos em várias linhas, só que feito pela tela.
+            sucesso = 0
+            falhas = []
+            for item in itens_validos:
+                try:
+                    comissao_percentual, comissao_valor = calcular_comissao_venda(
+                        sb, canal_id, item["valor_final"]
+                    )
+                    dados_item = {
+                        **dados_header,
+                        "produto_id": item["produto"]["id"],
+                        "quantidade": float(item["quantidade"]),
+                        "valor_lista": float(item["valor_lista"]),
+                        "valor_desconto": float(item["valor_desconto"]),
+                        "valor_final": float(item["valor_final"]),
+                        "comissao_percentual": comissao_percentual,
+                        "comissao_valor": comissao_valor,
+                    }
+                    inserir_venda_e_baixar_estoque(
+                        sb,
+                        dados_item,
+                        item["produto"]["id"],
+                        motivo_saida="Venda Manual",
+                    )
+                    sucesso += 1
+                except Exception as exc:
+                    falhas.append(
+                        f"{item['produto'].get('codigo_interno') or item['produto']['id']}: {exc}"
+                    )
+
+            if falhas:
+                st.warning(
+                    f"⚠️ {sucesso} de {len(itens_validos)} item(ns) registrados com sucesso "
+                    f"(estoque já atualizado para esses). {len(falhas)} falharam:"
+                )
+                for falha in falhas:
+                    st.caption(f"• {falha}")
+                # Mantém no popup só os itens que falharam, para o usuário
+                # corrigir e tentar salvar novamente sem perder tudo.
+            else:
+                st.success(
+                    f"{sucesso} venda(s) registrada(s) com sucesso e estoque atualizado!"
+                )
+                _limpar_itens_venda_nova()
+                st.rerun()
         else:
+            dados_novos = {
+                **dados_header,
+                "produto_id": produto_selecionado["id"],
+                "quantidade": float(quantidade),
+                "valor_lista": float(valor_lista),
+                "valor_desconto": float(valor_desconto),
+                "valor_final": float(valor_final),
+            }
+            comissao_percentual, comissao_valor = calcular_comissao_venda(
+                sb, canal_id, valor_final
+            )
+            dados_novos["comissao_percentual"] = comissao_percentual
+            dados_novos["comissao_valor"] = comissao_valor
+
             editar_venda(sb, venda, dados_novos)
             st.success("Venda atualizada e estoque ajustado com sucesso!")
-
-        st.rerun()
+            st.rerun()
 
     except Exception as e:
         acao = "registrar" if nova_venda else "salvar alterações"
@@ -1319,6 +1605,10 @@ def _secao_listagem():
                 use_container_width=True,
                 key="vendas_btn_adicionar",
             ):
+                # Garante que nenhum item de uma venda nova anterior (ex.:
+                # popup fechado pelo X em vez de Cancelar) sobre para esta
+                # abertura — sempre começa com uma única linha em branco.
+                _limpar_itens_venda_nova()
                 canais_popup, status_popup, formas_popup, feiras_popup, clientes_popup = _carregar_cadastros_popup()
                 _dialog_editar_venda(
                     None,
@@ -1661,17 +1951,68 @@ def _secao_parceiro_fechamento(parceiro: dict) -> None:
 
     else:
         data_inicio_ciclo = _parse_data_segura(ciclo_aberto["data_inicio"])
-        st.success(
+
+        # Permite ajustar o início do ciclo enquanto ele estiver aberto.
+        # Evita sobreposição com o ciclo finalizado anterior.
+        anteriores = [
+            f for f in fechamentos
+            if f.get("id") != ciclo_aberto.get("id")
+            and f.get("status") == "Finalizado"
+            and f.get("data_fim")
+        ]
+        ultimo_anterior = max(
+            anteriores,
+            key=lambda f: f.get("numero_ciclo", 0),
+            default=None,
+        )
+        data_min_inicio = None
+        if ultimo_anterior:
+            fim_anterior = _parse_data_segura(ultimo_anterior.get("data_fim"))
+            if fim_anterior:
+                data_min_inicio = fim_anterior + timedelta(days=1)
+
+        if data_inicio_ciclo is None:
+            data_inicio_ciclo = data_min_inicio or date.today()
+        if data_min_inicio and data_inicio_ciclo < data_min_inicio:
+            data_inicio_ciclo = data_min_inicio
+
+        col_inicio, col_fim = st.columns(2)
+        with col_inicio:
+            novo_inicio_ciclo = st.date_input(
+                "Início do ciclo",
+                value=data_inicio_ciclo,
+                min_value=data_min_inicio,
+                key=f"parceiros_fechamento_data_inicio_{ciclo_aberto['id']}",
+                help="A data inicial pode ser ajustada enquanto o ciclo estiver aberto.",
+            )
+
+        with col_fim:
+            data_fim_ciclo = st.date_input(
+                "Fechar com vendas até",
+                value=max(date.today(), novo_inicio_ciclo),
+                min_value=novo_inicio_ciclo,
+                key=f"parceiros_fechamento_data_fim_{ciclo_aberto['id']}",
+            )
+
+        if novo_inicio_ciclo != data_inicio_ciclo:
+            try:
+                supabase.table("parcerias_fechamentos").update({
+                    "data_inicio": novo_inicio_ciclo.isoformat(),
+                }).eq("id", ciclo_aberto["id"]).execute()
+                st.success(
+                    f"Início do ciclo #{ciclo_aberto['numero_ciclo']} alterado para "
+                    f"{novo_inicio_ciclo.strftime('%d/%m/%Y')}."
+                )
+                st.rerun()
+            except Exception as e:
+                st.error(f"Não foi possível alterar o início do ciclo: {e}")
+                return
+
+        st.info(
             f"Ciclo **#{ciclo_aberto['numero_ciclo']}** aberto desde "
-            f"{data_inicio_ciclo.strftime('%d/%m/%Y') if data_inicio_ciclo else ciclo_aberto['data_inicio']}."
+            f"**{data_inicio_ciclo.strftime('%d/%m/%Y')}**."
         )
 
-        data_fim_ciclo = st.date_input(
-            "Fechar com vendas até",
-            value=date.today(),
-            min_value=data_inicio_ciclo,
-            key="parceiros_fechamento_data_fim",
-        )
         if data_inicio_ciclo and data_fim_ciclo < data_inicio_ciclo:
             st.error("A data final não pode ser antes do início do ciclo.")
             return

@@ -878,6 +878,34 @@ def excluir_venda(sb: Client, venda: dict) -> None:
     sb.table("vendas").delete().eq("id", venda_id).execute()
 
 
+def excluir_vendas_em_massa(sb: Client, vendas: list[dict]) -> dict:
+    """Exclui várias vendas de uma vez (por período, ou todas), reaproveitando
+    `excluir_venda` para cada registro — mesmo estorno de estoque, mesmo
+    ledger e mesmo log de automações (cada venda gera sua própria entrada
+    "venda_exclusao" em `logs_automacao`, exatamente como uma exclusão
+    individual feita pela tela de vendas).
+
+    Não interrompe no primeiro erro: continua tentando as demais vendas e
+    devolve um resumo com o total, quantas tiveram sucesso e os detalhes de
+    cada falha, para que a tela de administração possa reportar com precisão
+    o que foi (e o que não foi) excluído.
+
+    `vendas` é a lista de dicts com pelo menos `id`, `produto_id` e
+    `quantidade` — o mesmo formato aceito por `excluir_venda`.
+    """
+    total = len(vendas)
+    sucesso = 0
+    falhas: list[dict] = []
+
+    for venda in vendas:
+        try:
+            excluir_venda(sb, venda)
+            sucesso += 1
+        except Exception as exc:
+            falhas.append({"venda_id": venda.get("id"), "erro": str(exc)})
+
+    return {"total": total, "sucesso": sucesso, "falhas": falhas}
+
 
 def _texto_limpo(valor) -> str:
     if valor is None or (isinstance(valor, float) and pd.isna(valor)):

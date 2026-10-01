@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from db import supabase
 from auth import usuario_e_admin
 from servicos.compras_import import excluir_compra
+from servicos.vendas_import import excluir_vendas_em_massa
 from servicos.log_automacao import FLUXOS, ETAPAS
 
 
@@ -259,6 +260,137 @@ def _secao_exclusao_compras():
                     st.rerun()
                 except Exception as e:
                     st.error(f"Erro ao excluir compra: {e}")
+
+
+def _secao_exclusao_vendas_massa():
+    st.subheader("🗑️ Exclusão de Vendas em Massa")
+    st.caption(
+        "Exclui várias vendas de uma vez — por período ou todas — devolvendo "
+        "a quantidade de cada uma ao estoque do produto correspondente e "
+        "registrando o estorno no ledger. É a mesma rotina usada na exclusão "
+        "individual de uma venda, repetida para cada registro selecionado; "
+        "cada venda excluída gera sua própria linha no Log de Automações."
+    )
+
+    todas = st.toggle(
+        "Selecionar todas as vendas do sistema (ignora o período abaixo)",
+        value=False,
+        key="admin_massa_todas",
+    )
+
+    data_ini = data_fim = None
+    if not todas:
+        col_di, col_df = st.columns(2)
+        with col_di:
+            data_ini = st.date_input("Data inicial", value=None, key="admin_massa_data_ini")
+        with col_df:
+            data_fim = st.date_input("Data final", value=None, key="admin_massa_data_fim")
+
+        if not data_ini or not data_fim:
+            st.caption(
+                "Selecione a data inicial e final, ou marque "
+                "\"Selecionar todas as vendas do sistema\" acima."
+            )
+            return
+        if data_ini > data_fim:
+            st.error("A data inicial não pode ser depois da data final.")
+            return
+
+    try:
+        query = (
+            supabase.table("vendas")
+            .select(
+                "id, produto_id, quantidade, data_venda, valor_final, cliente, "
+                "produtos(codigo_interno, descricao)"
+            )
+            .order("data_venda", desc=True)
+        )
+        if not todas:
+            query = query.gte("data_venda", data_ini.isoformat()).lte(
+                "data_venda", data_fim.isoformat()
+            )
+        vendas = query.execute().data or []
+    except Exception as e:
+        st.error(f"Erro ao consultar vendas: {e}")
+        return
+
+    if not vendas:
+        st.info("Nenhuma venda encontrada para os critérios selecionados.")
+        return
+
+    total_vendas = len(vendas)
+    valor_total = sum(float(v.get("valor_final") or 0) for v in vendas)
+    produtos_distintos = len({v["produto_id"] for v in vendas})
+
+    col_k1, col_k2, col_k3 = st.columns(3)
+    with col_k1:
+        with st.container(border=True):
+            st.caption("Vendas selecionadas")
+            st.title(f"{total_vendas}")
+    with col_k2:
+        with st.container(border=True):
+            st.caption("Valor total")
+            st.title(_fmt_moeda(valor_total))
+    with col_k3:
+        with st.container(border=True):
+            st.caption("Produtos distintos afetados")
+            st.title(f"{produtos_distintos}")
+
+    rotulo_periodo = (
+        "TODAS AS VENDAS DO SISTEMA" if todas
+        else f"{_fmt_data(data_ini.isoformat())} até {_fmt_data(data_fim.isoformat())}"
+    )
+    st.warning(
+        f"⚠️ Você está prestes a excluir **{total_vendas} venda(s)** ({rotulo_periodo}). "
+        "O estoque de cada produto será estornado e esta ação não pode ser desfeita."
+    )
+
+    with st.expander(f"Ver as {total_vendas} venda(s) que serão excluídas"):
+        dados_tabela = [
+            {
+                "ID": v["id"],
+                "Data": _fmt_data(v.get("data_venda")),
+                "Produto": (v.get("produtos") or {}).get("descricao") or "-",
+                "Qtd": v.get("quantidade"),
+                "Valor": _fmt_moeda(v.get("valor_final")),
+                "Cliente": v.get("cliente") or "-",
+            }
+            for v in vendas
+        ]
+        st.dataframe(dados_tabela, use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.markdown("#### Confirmar Exclusão em Massa")
+
+    confirmacao = st.text_input(
+        f"Digite {total_vendas} (a quantidade de vendas acima) para habilitar o botão de exclusão:",
+        key="admin_massa_confirmacao",
+    )
+    pode_excluir = confirmacao.strip() == str(total_vendas)
+
+    if st.button(
+        f"🗑️ Excluir {total_vendas} Venda(s) e Estornar Estoque",
+        type="primary",
+        disabled=not pode_excluir,
+        use_container_width=True,
+        key="btn_admin_excluir_vendas_massa",
+    ):
+        with st.spinner(f"Excluindo {total_vendas} venda(s) e ajustando estoque..."):
+            resultado = excluir_vendas_em_massa(supabase, vendas)
+
+        if resultado["falhas"]:
+            st.warning(
+                f"⚠️ {resultado['sucesso']} de {resultado['total']} venda(s) excluída(s) com "
+                f"sucesso. {len(resultado['falhas'])} falharam — veja o detalhe abaixo. As que "
+                "falharam continuam no sistema e podem ser tentadas novamente."
+            )
+            st.dataframe(resultado["falhas"], use_container_width=True, hide_index=True)
+        else:
+            st.success(
+                f"✅ {resultado['sucesso']} venda(s) excluída(s) com sucesso! "
+                "Estoque estornado para cada produto afetado."
+            )
+            st.caption("Recarregue a aba (ou troque de filtro) para atualizar a lista.")
 
 
 _ICONE_ETAPA = {
@@ -624,14 +756,18 @@ def tela_admin():
 
     st.header("⚙️ Painel de Administração")
 
-    aba_compras, aba_log, aba_info = st.tabs([
+    aba_compras, aba_vendas, aba_log, aba_info = st.tabs([
         "🗑️ Exclusão de Compras (XML)",
+        "🗑️ Exclusão de Vendas em Massa",
         "📋 Log de Automações",
         "ℹ️ Informações do Sistema",
     ])
 
     with aba_compras:
         _secao_exclusao_compras()
+
+    with aba_vendas:
+        _secao_exclusao_vendas_massa()
 
     with aba_log:
         _secao_log_automacoes()
