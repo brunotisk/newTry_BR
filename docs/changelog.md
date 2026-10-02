@@ -14,3 +14,6 @@ Melhoria tela de Vendas - MultiVendas + fechamento
 
 ## 1.6.2 - 01/10/2026
 Melhoria tela de Vendas - MultiVendas + fechamento
+
+## 1.6.3 - 01/10/2026
+Ajuste do numero de linhhas buscadas no supabase

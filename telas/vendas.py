@@ -9,7 +9,7 @@ from io import BytesIO
 from datetime import date, datetime, timedelta
 from typing import Optional
 
-from db import supabase
+from db import supabase, buscar_todos
 from servicos.vendas_import import (
     ler_planilha,
     importar_vendas_excel,
@@ -1268,17 +1268,17 @@ def _dialog_editar_venda(
     produtos_opcoes = {}
     if nova_venda:
         try:
-            resp_produtos = (
-                supabase
+            linhas_estoque = buscar_todos(
+                lambda: supabase
                 .table("estoque")
                 .select(
                     "quantidade_atual, estoque_preco_venda_sugerida, "
                     "produtos(id, codigo_interno, descricao)"
                 )
                 .gt("quantidade_atual", 0)
-                .execute()
+                .order("produto_id")
             )
-            for linha in resp_produtos.data or []:
+            for linha in linhas_estoque:
                 produto = linha.get("produtos")
                 if produto:
                     rotulo = (
@@ -1801,11 +1801,9 @@ def _obter_ou_criar_cliente(
         return None
 
     try:
-        existentes = (
-            sb.table("clientes")
-            .select("id, nome")
-            .execute()
-        ).data or []
+        existentes = buscar_todos(
+            lambda: sb.table("clientes").select("id, nome").order("id")
+        )
     except Exception as e:
         raise RuntimeError(f"Não foi possível consultar os clientes: {e}") from e
 
@@ -1827,11 +1825,9 @@ def _obter_ou_criar_cliente(
         # O índice único lower(trim(nome)) também protege contra corrida
         # entre duas inclusões simultâneas. Se já existir, recupera o registro.
         try:
-            existentes = (
-                sb.table("clientes")
-                .select("id, nome")
-                .execute()
-            ).data or []
+            existentes = buscar_todos(
+                lambda: sb.table("clientes").select("id, nome").order("id")
+            )
             for cliente in existentes:
                 if (cliente.get("nome") or "").strip().casefold() == normalizado:
                     return cliente["id"]
@@ -1891,12 +1887,12 @@ def _carregar_cadastros_popup():
         feiras = []
 
     try:
-        clientes = (
-            supabase.table("clientes")
+        clientes = buscar_todos(
+            lambda: supabase.table("clientes")
             .select("id, nome")
             .order("nome")
-            .execute()
-        ).data or []
+            .order("id")
+        )
     except Exception:
         clientes = []
 
@@ -1963,13 +1959,12 @@ def _secao_listagem():
     #    KPI "Filtros" e para montar as opções do filtro de mês/ano.
     # ------------------------------------------------------------------
     try:
-        response_kpi = (
-            supabase
+        vendas_kpi = buscar_todos(
+            lambda: supabase
             .table("vendas")
             .select("valor_final, data_venda, canais_venda(nome)")
-            .execute()
+            .order("id")
         )
-        vendas_kpi = response_kpi.data or []
     except Exception as e:
         st.error(f"Erro ao carregar vendas: {e}")
         return
@@ -2312,8 +2307,8 @@ def _secao_parceiro_produtos_enviados(parceiro: dict) -> None:
         return
 
     try:
-        resp = (
-            supabase.table("vendas")
+        vendas = buscar_todos(
+            lambda: supabase.table("vendas")
             .select(
                 "id, data_venda, cliente, quantidade, valor_final, "
                 "comissao_percentual, comissao_valor, "
@@ -2323,10 +2318,8 @@ def _secao_parceiro_produtos_enviados(parceiro: dict) -> None:
             .gte("data_venda", data_ini.isoformat())
             .lte("data_venda", data_fim.isoformat())
             .order("data_venda", desc=True)
-            .limit(1000)
-            .execute()
+            .order("id", desc=True)
         )
-        vendas = resp.data or []
     except Exception as e:
         st.error(f"Não foi possível carregar os produtos enviados: {e}")
         return

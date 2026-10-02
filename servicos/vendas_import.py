@@ -34,6 +34,7 @@ from openpyxl.worksheet.datavalidation import DataValidation
 import pandas as pd
 from supabase import Client
 
+from db import buscar_todos
 from .estoque import registrar_ajuste, registrar_movimento
 from .supabase_admin import get_client  # noqa: F401  (re-exportado por conveniência)
 
@@ -193,25 +194,24 @@ def _consultar_dados_modelo_vendas(sb: Client) -> dict:
         .execute()
     ).data or []
 
-    clientes = (
-        sb.table("clientes")
-        .select("id, nome")
-        .order("nome")
-        .execute()
-    ).data or []
+    # Tabelas que podem passar de 1000 linhas: paginadas (limite do Supabase).
+    # O desempate por id mantém a ordem estável entre as páginas.
+    clientes = buscar_todos(
+        lambda: sb.table("clientes").select("id, nome").order("nome").order("id")
+    )
 
-    produtos = (
-        sb.table("produtos")
+    produtos = buscar_todos(
+        lambda: sb.table("produtos")
         .select("id, codigo_interno, descricao")
         .order("codigo_interno")
-        .execute()
-    ).data or []
+        .order("id")
+    )
 
-    estoques = (
-        sb.table("estoque")
+    estoques = buscar_todos(
+        lambda: sb.table("estoque")
         .select("produto_id, quantidade_atual")
-        .execute()
-    ).data or []
+        .order("produto_id")
+    )
     estoque_por_produto = {
         item["produto_id"]: item.get("quantidade_atual") or 0
         for item in estoques
@@ -923,9 +923,12 @@ def consultar_dados_validacao_vendas(sb: Client) -> dict:
     formas = (sb.table("formas_pagamento").select("id, descricao").eq("ativo", True).order("descricao").execute()).data or []
     status = (sb.table("status_venda").select("id, nome").eq("ativo", True).order("nome").execute()).data or []
     feiras = (sb.table("detalhes_feira").select("id, nome_feira").eq("ativo", True).order("nome_feira").execute()).data or []
-    clientes = (sb.table("clientes").select("id, nome").order("nome").execute()).data or []
-    produtos = (sb.table("produtos").select("id, codigo_interno, descricao").order("codigo_interno").execute()).data or []
-    estoques = (sb.table("estoque").select("produto_id, quantidade_atual").execute()).data or []
+    # Paginadas: o Supabase limita cada resposta a 1000 linhas.
+    clientes = buscar_todos(lambda: sb.table("clientes").select("id, nome").order("nome").order("id"))
+    produtos = buscar_todos(
+        lambda: sb.table("produtos").select("id, codigo_interno, descricao").order("codigo_interno").order("id")
+    )
+    estoques = buscar_todos(lambda: sb.table("estoque").select("produto_id, quantidade_atual").order("produto_id"))
 
     estoque_por_produto = {x["produto_id"]: x.get("quantidade_atual") or 0 for x in estoques}
     produtos_por_codigo = {}
