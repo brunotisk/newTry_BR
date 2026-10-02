@@ -1929,6 +1929,149 @@ def _abrir_venda_pendente():
         st.error(f"Erro ao abrir a venda #{venda_id}: {e}")
 
 
+def _gerar_excel_vendas(vendas: list[dict]) -> bytes:
+    """Planilha com as vendas recebidas (uma linha por venda), com valores
+    numéricos reais (somáveis no Excel), filtro, cabeçalho fixo e linha de total."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Vendas"
+
+    cabecalhos = [
+        "Data", "Canal", "Feira", "Cód. Produto", "Produto", "Qtd",
+        "Valor Lista", "Desconto", "Valor Final", "Forma Pgto", "Status", "Cliente",
+    ]
+    fill = PatternFill(fill_type="solid", fgColor="1F4E78")
+    fonte = Font(color="FFFFFF", bold=True)
+    for col, titulo in enumerate(cabecalhos, 1):
+        c = ws.cell(1, col, titulo)
+        c.fill = fill
+        c.font = fonte
+        c.alignment = Alignment(horizontal="center", vertical="center")
+
+    linha = 2
+    for v in vendas:
+        produto = v.get("produtos") or {}
+        valores = [
+            _parse_data_segura(v.get("data_venda")),
+            (v.get("canais_venda") or {}).get("nome") or "",
+            (v.get("detalhes_feira") or {}).get("nome_feira") or "",
+            produto.get("codigo_interno") or "",
+            produto.get("descricao") or "",
+            float(v.get("quantidade") or 0),
+            float(v.get("valor_lista") or 0),
+            float(v.get("valor_desconto") or 0),
+            float(v.get("valor_final") or 0),
+            (v.get("formas_pagamento") or {}).get("descricao") or "",
+            (v.get("status_venda") or {}).get("nome") or "",
+            v.get("cliente") or "",
+        ]
+        for col, valor in enumerate(valores, 1):
+            ws.cell(linha, col, valor)
+        ws.cell(linha, 1).number_format = "DD/MM/YYYY"
+        ws.cell(linha, 1).alignment = Alignment(horizontal="center")
+        ws.cell(linha, 4).number_format = "@"  # código como texto (preserva zeros à esquerda)
+        ws.cell(linha, 6).number_format = "0.##"
+        for col in (7, 8, 9):
+            ws.cell(linha, col).number_format = "R$ #,##0.00"
+        linha += 1
+
+    ultima_dados = linha - 1
+
+    # Linha de total com SUBTOTAL: acompanha os filtros aplicados na própria planilha.
+    linha_total = linha
+    ws.cell(linha_total, 5, "TOTAL").font = Font(bold=True)
+    ws.cell(linha_total, 5).alignment = Alignment(horizontal="right")
+    borda = Border(top=Side(style="thin"))
+    for col in range(1, len(cabecalhos) + 1):
+        ws.cell(linha_total, col).border = borda
+    for col in (6, 7, 8, 9):
+        letra = get_column_letter(col)
+        c = ws.cell(linha_total, col, f"=SUBTOTAL(109,{letra}2:{letra}{ultima_dados})")
+        c.font = Font(bold=True)
+        c.number_format = "0.##" if col == 6 else "R$ #,##0.00"
+
+    larguras = [12, 18, 22, 16, 45, 8, 14, 14, 14, 20, 14, 30]
+    for i, largura in enumerate(larguras, 1):
+        ws.column_dimensions[get_column_letter(i)].width = largura
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(cabecalhos))}{ultima_dados}"
+
+    buffer = BytesIO()
+    wb.save(buffer)
+    return buffer.getvalue()
+
+
+def _nome_arquivo_vendas(mes: str, canal: str) -> str:
+    """vendas_<mes>_<canal>_<data>.xlsx, sem acentos nem caracteres inválidos."""
+    import re
+    import unicodedata
+
+    def limpo(texto: str) -> str:
+        sem_acento = unicodedata.normalize("NFKD", texto).encode("ascii", "ignore").decode()
+        return re.sub(r"[^A-Za-z0-9]+", "-", sem_acento).strip("-") or "todos"
+
+    return f"vendas_{limpo(mes)}_{limpo(canal)}_{date.today():%Y%m%d}.xlsx"
+
+
+@_dialog("📥 Exportar vendas", width="small")
+def _dialog_exportar_vendas(inicio: Optional[str], fim: Optional[str], canal: str, mes_rotulo: str):
+    """Busca TODAS as vendas dos filtros atuais (não só a página visível) e
+    oferece o download em Excel. A planilha só é gerada quando o popup abre."""
+    st.caption(
+        f"Período: **{mes_rotulo if mes_rotulo != 'Todos' else 'Todo período'}** · "
+        f"Canal: **{canal if canal != 'Todos' else 'Todos os canais'}**"
+    )
+
+    canal_embed = "canais_venda!inner(nome)" if canal != "Todos" else "canais_venda(nome)"
+
+    def _query():
+        q = (
+            supabase
+            .table("vendas")
+            .select(
+                "id, quantidade, valor_lista, valor_desconto, valor_final,"
+                " data_venda, cliente,"
+                f" produtos(descricao, codigo_interno), {canal_embed},"
+                " status_venda(nome), formas_pagamento(descricao),"
+                " detalhes_feira(nome_feira)"
+            )
+        )
+        if inicio:
+            q = q.gte("data_venda", inicio)
+        if fim:
+            q = q.lt("data_venda", fim)
+        if canal != "Todos":
+            q = q.eq("canais_venda.nome", canal)
+        # Ordem estável (data + id) para a paginação interna não repetir/perder linhas.
+        return q.order("data_venda", desc=True).order("id", desc=True)
+
+    try:
+        with st.spinner("Gerando planilha..."):
+            vendas = buscar_todos(_query)
+            dados = _gerar_excel_vendas(vendas) if vendas else None
+    except Exception as e:
+        st.error(f"Não foi possível gerar a planilha: {e}")
+        return
+
+    if not vendas:
+        st.info("Nenhuma venda para exportar com os filtros atuais.")
+        return
+
+    st.success(f"{len(vendas)} venda(s) prontas para exportar.")
+    st.download_button(
+        "⬇️ Baixar Excel",
+        data=dados,
+        file_name=_nome_arquivo_vendas(mes_rotulo, canal),
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+        key="vendas_download_excel",
+    )
+
+
 def _botao_adicionar_venda():
     """Botão '➕ Adicionar venda' (abre o popup de nova venda)."""
     if st.button(
@@ -2083,14 +2226,14 @@ def _secao_listagem():
     # 4) Widgets de filtro (Mês/Ano da venda e Canal de venda) + botão
     #    para limpar os filtros
     # ------------------------------------------------------------------
-    col_filtro_mes, col_filtro_canal, col_acoes = st.columns([2, 2, 2])
+    col_filtro_mes, col_filtro_canal, col_acoes = st.columns([2, 2, 2.4])
     with col_filtro_mes:
         mes_selecionado = st.selectbox("Mês da venda", opcoes_mes, key="vendas_filtro_mes")
     with col_filtro_canal:
         canal_selecionado = st.selectbox("Canal", opcoes_canal, key="vendas_filtro_canal")
     with col_acoes:
         st.markdown("<div style='margin-top:1.85rem;'></div>", unsafe_allow_html=True)
-        btn_limpar, btn_adicionar = st.columns(2)
+        btn_limpar, btn_adicionar, btn_exportar = st.columns([3, 3, 1.1])
         with btn_limpar:
             st.button(
                 "🔄 Limpar filtros",
@@ -2100,6 +2243,21 @@ def _secao_listagem():
             )
         with btn_adicionar:
             _botao_adicionar_venda()
+        with btn_exportar:
+            if st.button(
+                "📥",
+                key="vendas_btn_exportar",
+                help="Exportar para Excel (respeita os filtros de Mês e Canal)",
+                use_container_width=True,
+            ):
+                exp_inicio = exp_fim = None
+                if mes_selecionado != "Todos":
+                    ano_f, mes_f = meses_disponiveis[opcoes_mes.index(mes_selecionado) - 1]
+                    exp_inicio = date(ano_f, mes_f, 1).isoformat()
+                    exp_fim = (
+                        date(ano_f + 1, 1, 1) if mes_f == 12 else date(ano_f, mes_f + 1, 1)
+                    ).isoformat()
+                _dialog_exportar_vendas(exp_inicio, exp_fim, canal_selecionado, mes_selecionado)
 
     # Reseta a página para 1 sempre que algum filtro mudar
     assinatura_filtros = f"{mes_selecionado}|{canal_selecionado}"
