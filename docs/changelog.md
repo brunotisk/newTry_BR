@@ -11,3 +11,6 @@ Melhoria tela de Vendas - MultiVendas
 
 ## 1.6.1 - 01/10/2026
 Melhoria tela de Vendas - MultiVendas + fechamento
+
+## 1.6.2 - 01/10/2026
+Melhoria tela de Vendas - MultiVendas + fechamento

@@ -1306,25 +1306,12 @@ def _dialog_editar_venda(
     form_key = f"form_venda_{sufixo}"
 
     ss = st.session_state
-    # O estado do cabeçalho pertence a UMA venda (a nova ou uma já existente);
-    # se o popup foi aberto para outra, começa do zero.
-    if ss.get("venda_header_ref") != sufixo:
-        ss.pop("venda_header", None)
-        ss.pop("venda_header_ok", None)
-        ss["venda_header_ref"] = sufixo
-
-    header_salvo = ss.get("venda_header") or {}
-    # Duas etapas (nova venda e edição): 1) cabeçalho, 2) item(ns), com o
-    # cabeçalho recolhido em uma linha.
-    header_fechado = bool(ss.get("venda_header_ok")) and bool(header_salvo)
-
     feira_atual_nome = feira_atual.get("nome_feira") or ""
-    if nova_venda:
-        header_base = header_salvo
-        produto_selecionado = None
-    else:
-        # Valores iniciais do cabeçalho vêm da própria venda.
-        header_base = header_salvo or {
+
+    # Valores iniciais do cabeçalho de uma venda existente.
+    header_da_venda = None
+    if not nova_venda:
+        header_da_venda = {
             "canal_nome": canal_atual_nome,
             "feira_nome": feira_atual_nome or None,
             "cliente": venda.get("cliente") or "",
@@ -1332,6 +1319,29 @@ def _dialog_editar_venda(
             "forma_pagamento_nome": forma_atual_desc,
             "status_nome": status_atual_nome,
         }
+
+    # O estado do cabeçalho pertence a UMA venda (a nova ou uma já existente);
+    # se o popup foi aberto para outra, começa do zero.
+    if ss.get("venda_header_ref") != sufixo:
+        ss.pop("venda_header", None)
+        ss.pop("venda_header_ok", None)
+        ss["venda_header_ref"] = sufixo
+        if header_da_venda:
+            # Edição: já abre com o cabeçalho recolhido (dados da venda) e o
+            # item carregado; o ✏️ do resumo reabre o cabeçalho.
+            ss["venda_header"] = header_da_venda
+            ss["venda_header_ok"] = True
+
+    header_salvo = ss.get("venda_header") or {}
+    # Duas etapas (nova venda e edição): 1) cabeçalho, 2) item(ns), com o
+    # cabeçalho recolhido em uma linha.
+    header_fechado = bool(ss.get("venda_header_ok")) and bool(header_salvo)
+
+    if nova_venda:
+        header_base = header_salvo
+        produto_selecionado = None
+    else:
+        header_base = header_salvo or header_da_venda
         produto_selecionado = {
             "id": venda.get("produto_id"),
             "codigo_interno": codigo_atual,
