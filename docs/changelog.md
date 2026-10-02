@@ -20,3 +20,6 @@ Ajuste do numero de linhhas buscadas no supabase
 
 ## 1.6.4 - 01/10/2026
 Baixa vendas em Excel
+
+## 1.6.5 - 02/10/2026
+Ajustes valores KPI vendas (desconsidera comissão)

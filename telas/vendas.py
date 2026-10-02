@@ -29,6 +29,7 @@ from telas.cadastros_gerais import tela_cadastros_gerais
 from componentes.campo_cliente import campo_cliente
 from componentes.campo_mascarado import campo_mascarado
 from componentes.contador_quantidade import contador_quantidade
+from componentes.busca_produto import busca_produto
 from componentes.paginacao import render_paginacao, get_itens_por_pagina, reset_paginacao
 
 # Compatibilidade: st.dialog é o nome estável (Streamlit >= 1.31); versões
@@ -63,11 +64,10 @@ def _parse_data_segura(valor):
 
 
 def _injetar_estilo_kpi():
-    """Garante altura idêntica para todos os cards de KPI fixando a altura do subtítulo."""
+    """Estilos dos KPIs e do tooltip customizado, seguindo o padrão visual do app."""
     st.markdown(
         """
         <style>
-        /* Desativa corte de texto nos valores dos KPIs */
         div[data-testid="stMetricValue"] {
             overflow: visible;
             white-space: normal;
@@ -75,12 +75,11 @@ def _injetar_estilo_kpi():
             font-size: 1.35rem;
             line-height: 1.2;
         }
-        
-        /* Container do subtítulo com altura fixa para padronização */
+
         .kpi-subtitulo {
             text-align: center;
             font-size: 0.75rem;
-            color: #9aa0ab;
+            color: #8B8D98;
             height: 18px;
             line-height: 18px;
             margin-bottom: 0.3rem;
@@ -88,31 +87,86 @@ def _injetar_estilo_kpi():
             text-overflow: ellipsis;
             white-space: nowrap;
         }
+
+        .kpi-help {
+            position: relative;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 17px;
+            height: 17px;
+            margin-left: 5px;
+            border: 1px solid #5C5F69;
+            border-radius: 50%;
+            color: #8B8D98;
+            font-size: 11px;
+            font-weight: 700;
+            cursor: help;
+            vertical-align: 1px;
+        }
+        .kpi-help .kpi-tooltip {
+            visibility: hidden;
+            opacity: 0;
+            position: absolute;
+            z-index: 1000;
+            left: 50%;
+            bottom: calc(100% + 8px);
+            transform: translateX(-50%);
+            min-width: 190px;
+            padding: 9px 11px;
+            border: 1px solid #3A3D46;
+            border-radius: 7px;
+            background: #262730;
+            color: #FAFAFA;
+            box-shadow: 0 4px 14px rgba(0,0,0,.28);
+            font-size: 0.78rem;
+            font-weight: 400;
+            line-height: 1.45;
+            text-align: left;
+            white-space: nowrap;
+            transition: opacity .12s ease;
+            pointer-events: none;
+        }
+        .kpi-help:hover .kpi-tooltip {
+            visibility: visible;
+            opacity: 1;
+        }
+        .kpi-help .kpi-tooltip strong {
+            color: #FAFAFA;
+        }
         </style>
         """,
         unsafe_allow_html=True,
     )
 
 
-def _kpi_card(titulo: str, qtd: int, valor: float, subtitulo: Optional[str] = None):
+def _kpi_card(
+    titulo: str,
+    qtd: int,
+    valor_final: float,
+    comissao: float = 0.0,
+    subtitulo: Optional[str] = None,
+):
+    """Card de KPI. Exibe o líquido e mostra valor bruto/comissão no tooltip."""
     with st.container(border=True):
+        tooltip = (
+            f"<strong>Valor final:</strong> {html.escape(_fmt_moeda(valor_final))}<br>"
+            f"<strong>Comissão:</strong> {html.escape(_fmt_moeda(comissao))}"
+        )
         st.markdown(
-            f"<div style='text-align:center; font-weight:700; margin-bottom:0.1rem;'>{titulo}</div>",
+            f'<div style="text-align:center;font-weight:700;margin-bottom:0.1rem;">'
+            f'{html.escape(titulo)}<span class="kpi-help" aria-label="Detalhes da comissão">i'
+            f'<span class="kpi-tooltip">{tooltip}</span></span></div>',
             unsafe_allow_html=True,
         )
-        
-        # Garante que sempre haverá a linha do subtítulo para manter a mesma altura em todos os cards
-        sub_texto = subtitulo if subtitulo else "&nbsp;"
-        st.markdown(
-            f"<div class='kpi-subtitulo'>{sub_texto}</div>",
-            unsafe_allow_html=True,
-        )
+        sub_texto = html.escape(subtitulo) if subtitulo else "&nbsp;"
+        st.markdown(f"<div class='kpi-subtitulo'>{sub_texto}</div>", unsafe_allow_html=True)
 
         col_qtd, col_valor = st.columns(2)
         with col_qtd:
             st.metric("Qtd. Vendas", qtd)
         with col_valor:
-            st.metric("Valor", _fmt_moeda(valor))
+            st.metric("Valor", _fmt_moeda(valor_final - comissao))
 
 
 def _gerar_excel_linhas_nao_importadas(linhas: list[dict]) -> bytes:
@@ -703,7 +757,10 @@ def _definir_form_item(produto, quantidade, valor_lista, valor_desconto, aberto=
 def _cb_adicionar_item(produtos_opcoes: dict):
     """Botão '➕ Adicionar item' / '✔️ Atualizar item'."""
     ss = st.session_state
-    produto = produtos_opcoes.get(ss.get("vitem_produto"))
+    produto = next(
+        (p for p in produtos_opcoes.values() if p.get("id") == ss.get("vitem_ref")),
+        None,
+    )
     if not produto:
         ss["vitem_msg"] = "Selecione o produto."
         return
@@ -744,7 +801,8 @@ def _cb_adicionar_item(produtos_opcoes: dict):
 
     # Item gravado na tabela: volta o formulário para o estado "novo item".
     ss["venda_item_editando"] = None
-    ss["vitem_produto"] = None
+    ss["vitem_ref"] = None
+    ss["vitem_busca_produto"] = {"id": None, "termo": "", "buscar_descricao": False, "aberto": False}
     _definir_form_item(None, 1, 0.0, 0.0)
 
 
@@ -754,11 +812,7 @@ def _cb_editar_item(uid: str, produtos_opcoes: dict):
     item = next((x for x in ss.get("venda_itens", []) if x["uid"] == uid), None)
     if not item:
         return
-    rotulo = next(
-        (r for r, p in produtos_opcoes.items() if p["id"] == item["produto"]["id"]),
-        None,
-    )
-    if rotulo is None:
+    if not any(p.get("id") == item["produto"]["id"] for p in produtos_opcoes.values()):
         ss["vitem_msg"] = "Este produto não tem mais saldo em estoque."
         return
 
@@ -771,7 +825,7 @@ def _cb_editar_item(uid: str, produtos_opcoes: dict):
         # Se o valor lista do item foi alterado manualmente, já abre destravado.
         aberto=abs(item["valor_lista"] - sugerido) > 0.004,
     )
-    ss["vitem_produto"] = rotulo
+    ss["vitem_ref"] = item["produto"]["id"]
     ss["venda_item_editando"] = uid
     ss.pop("vitem_msg", None)
 
@@ -779,7 +833,8 @@ def _cb_editar_item(uid: str, produtos_opcoes: dict):
 def _cb_cancelar_edicao():
     ss = st.session_state
     ss["venda_item_editando"] = None
-    ss["vitem_produto"] = None
+    ss["vitem_ref"] = None
+    ss["vitem_busca_produto"] = {"id": None, "termo": "", "buscar_descricao": False, "aberto": False}
     ss.pop("vitem_msg", None)
     _definir_form_item(None, 1, 0.0, 0.0)
 
@@ -937,12 +992,20 @@ def _render_tabela_itens(itens: list, produtos_opcoes: dict):
                     html.escape(_fmt_moeda(item["valor_final"])),
                 ]
                 for i, valor in enumerate(valores):
+                    titulo_celula = None
+                    if i == 0:
+                        titulo_celula = nome
+                    elif i == 4:
+                        titulo_celula = (
+                            f"Valor final: {_fmt_moeda(item['valor_final'])}\n"
+                            f"Comissão: {_fmt_moeda(item.get('comissao_valor', 0))}"
+                        )
                     cols[i].markdown(
                         _celula_tabela(
                             valor,
                             alinhamento[i],
                             negrito=(i == 4 or uid == editando),
-                            titulo=nome if i == 0 else None,
+                            titulo=titulo_celula,
                         ),
                         unsafe_allow_html=True,
                     )
@@ -1028,21 +1091,36 @@ def _render_form_item(produtos_opcoes: dict, itens: list):
     usados = {i["produto"]["id"] for i in itens if i["uid"] != editando}
     rotulos = [r for r, p in produtos_opcoes.items() if p["id"] not in usados]
 
-    # Evita erro do selectbox se o rótulo guardado deixou de existir.
-    if ss.get("vitem_produto") not in rotulos:
-        ss["vitem_produto"] = None
+    # O componente reutilizável busca_produto concentra a pesquisa por código
+    # ou descrição e mantém o mesmo padrão visual das demais telas.
+    produtos_disponiveis = [p for p in produtos_opcoes.values() if p["id"] not in usados]
+    produto_id_atual = ss.get("vitem_ref")
 
     with st.container(border=True):
         st.markdown("**✏️ Editando item**" if editando else "**➕ Novo item**")
 
-        produto_rotulo = st.selectbox(
-            "Produto",
-            rotulos,
-            index=None,
-            placeholder="Selecione o produto...",
-            key="vitem_produto",
+        produto_id_selecionado = busca_produto(
+            produtos_disponiveis,
+            label="Produto",
+            placeholder="Digite o código ou pesquise pela descrição...",
+            key="vitem_busca_produto",
+            mostrar_saldo=True,
+            valor_selecionado=produto_id_atual,
         )
-        produto = produtos_opcoes.get(produto_rotulo)
+        produto = next(
+            (p for p in produtos_disponiveis if p.get("id") == produto_id_selecionado),
+            None,
+        )
+
+        # O retorno do componente é a fonte única da seleção.
+        if produto_id_selecionado != produto_id_atual:
+            ss["vitem_ref"] = produto_id_selecionado
+            if produto:
+                _definir_form_item(
+                    produto, 1, produto.get("estoque_preco_venda_sugerida") or 0, 0.0
+                )
+            else:
+                ss["vitem_ref"] = None
 
         if not produto:
             # Sem produto, os campos abaixo não são desenhados (e o Streamlit
@@ -1590,7 +1668,7 @@ def _dialog_editar_venda(
         sb = get_client()
 
         if nova_venda:
-            if st.session_state.get("vitem_produto"):
+            if st.session_state.get("vitem_ref"):
                 st.error(
                     "Há um item em preenchimento que ainda não foi gravado na tabela. "
                     "Clique em \"Adicionar item\" (ou \"Atualizar item\"), ou limpe o "
@@ -1777,6 +1855,7 @@ def _resetar_filtros_vendas():
     callback roda ANTES do script ser reexecutado do zero, então é seguro."""
     st.session_state["vendas_filtro_mes"] = "Todos"
     st.session_state["vendas_filtro_canal"] = "Todos"
+    st.session_state["vendas_filtro_codigo"] = ""
     st.session_state["pagina_atual_vendas"] = 1
 
 
@@ -1942,7 +2021,7 @@ def _gerar_excel_vendas(vendas: list[dict]) -> bytes:
 
     cabecalhos = [
         "Data", "Canal", "Feira", "Cód. Produto", "Produto", "Qtd",
-        "Valor Lista", "Desconto", "Valor Final", "Forma Pgto", "Status", "Cliente",
+        "Valor Lista", "Desconto", "Valor Final", "Comissão", "Forma Pgto", "Status", "Cliente",
     ]
     fill = PatternFill(fill_type="solid", fgColor="1F4E78")
     fonte = Font(color="FFFFFF", bold=True)
@@ -1965,6 +2044,7 @@ def _gerar_excel_vendas(vendas: list[dict]) -> bytes:
             float(v.get("valor_lista") or 0),
             float(v.get("valor_desconto") or 0),
             float(v.get("valor_final") or 0),
+            float(v.get("comissao_valor") or 0),
             (v.get("formas_pagamento") or {}).get("descricao") or "",
             (v.get("status_venda") or {}).get("nome") or "",
             v.get("cliente") or "",
@@ -1975,7 +2055,7 @@ def _gerar_excel_vendas(vendas: list[dict]) -> bytes:
         ws.cell(linha, 1).alignment = Alignment(horizontal="center")
         ws.cell(linha, 4).number_format = "@"  # código como texto (preserva zeros à esquerda)
         ws.cell(linha, 6).number_format = "0.##"
-        for col in (7, 8, 9):
+        for col in (7, 8, 9, 10):
             ws.cell(linha, col).number_format = "R$ #,##0.00"
         linha += 1
 
@@ -1988,13 +2068,13 @@ def _gerar_excel_vendas(vendas: list[dict]) -> bytes:
     borda = Border(top=Side(style="thin"))
     for col in range(1, len(cabecalhos) + 1):
         ws.cell(linha_total, col).border = borda
-    for col in (6, 7, 8, 9):
+    for col in (6, 7, 8, 9, 10):
         letra = get_column_letter(col)
         c = ws.cell(linha_total, col, f"=SUBTOTAL(109,{letra}2:{letra}{ultima_dados})")
         c.font = Font(bold=True)
         c.number_format = "0.##" if col == 6 else "R$ #,##0.00"
 
-    larguras = [12, 18, 22, 16, 45, 8, 14, 14, 14, 20, 14, 30]
+    larguras = [12, 18, 22, 16, 45, 8, 14, 14, 14, 14, 20, 14, 30]
     for i, largura in enumerate(larguras, 1):
         ws.column_dimensions[get_column_letter(i)].width = largura
     ws.freeze_panes = "A2"
@@ -2005,7 +2085,7 @@ def _gerar_excel_vendas(vendas: list[dict]) -> bytes:
     return buffer.getvalue()
 
 
-def _nome_arquivo_vendas(mes: str, canal: str) -> str:
+def _nome_arquivo_vendas(mes: str, canal: str, codigo: str = "") -> str:
     """vendas_<mes>_<canal>_<data>.xlsx, sem acentos nem caracteres inválidos."""
     import re
     import unicodedata
@@ -2014,28 +2094,36 @@ def _nome_arquivo_vendas(mes: str, canal: str) -> str:
         sem_acento = unicodedata.normalize("NFKD", texto).encode("ascii", "ignore").decode()
         return re.sub(r"[^A-Za-z0-9]+", "-", sem_acento).strip("-") or "todos"
 
-    return f"vendas_{limpo(mes)}_{limpo(canal)}_{date.today():%Y%m%d}.xlsx"
+    sufixo_codigo = f"_cod-{limpo(codigo)}" if codigo else ""
+    return f"vendas_{limpo(mes)}_{limpo(canal)}{sufixo_codigo}_{date.today():%Y%m%d}.xlsx"
 
 
 @_dialog("📥 Exportar vendas", width="small")
-def _dialog_exportar_vendas(inicio: Optional[str], fim: Optional[str], canal: str, mes_rotulo: str):
+def _dialog_exportar_vendas(
+    inicio: Optional[str], fim: Optional[str], canal: str, mes_rotulo: str, codigo: str = ""
+):
     """Busca TODAS as vendas dos filtros atuais (não só a página visível) e
     oferece o download em Excel. A planilha só é gerada quando o popup abre."""
     st.caption(
         f"Período: **{mes_rotulo if mes_rotulo != 'Todos' else 'Todo período'}** · "
         f"Canal: **{canal if canal != 'Todos' else 'Todos os canais'}**"
+        + (f" · Código do produto: **{codigo}**" if codigo else "")
     )
 
     canal_embed = "canais_venda!inner(nome)" if canal != "Todos" else "canais_venda(nome)"
+    # inner join só quando há filtro de código, para não excluir vendas sem produto
+    produto_embed = (
+        "produtos!inner(descricao, codigo_interno)" if codigo else "produtos(descricao, codigo_interno)"
+    )
 
     def _query():
         q = (
             supabase
             .table("vendas")
             .select(
-                "id, quantidade, valor_lista, valor_desconto, valor_final,"
+                "id, quantidade, valor_lista, valor_desconto, valor_final, comissao_valor,"
                 " data_venda, cliente,"
-                f" produtos(descricao, codigo_interno), {canal_embed},"
+                f" {produto_embed}, {canal_embed},"
                 " status_venda(nome), formas_pagamento(descricao),"
                 " detalhes_feira(nome_feira)"
             )
@@ -2046,6 +2134,8 @@ def _dialog_exportar_vendas(inicio: Optional[str], fim: Optional[str], canal: st
             q = q.lt("data_venda", fim)
         if canal != "Todos":
             q = q.eq("canais_venda.nome", canal)
+        if codigo:
+            q = q.ilike("produtos.codigo_interno", f"%{codigo}%")
         # Ordem estável (data + id) para a paginação interna não repetir/perder linhas.
         return q.order("data_venda", desc=True).order("id", desc=True)
 
@@ -2065,7 +2155,7 @@ def _dialog_exportar_vendas(inicio: Optional[str], fim: Optional[str], canal: st
     st.download_button(
         "⬇️ Baixar Excel",
         data=dados,
-        file_name=_nome_arquivo_vendas(mes_rotulo, canal),
+        file_name=_nome_arquivo_vendas(mes_rotulo, canal, codigo),
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
         key="vendas_download_excel",
@@ -2105,7 +2195,10 @@ def _secao_listagem():
         vendas_kpi = buscar_todos(
             lambda: supabase
             .table("vendas")
-            .select("valor_final, data_venda, canais_venda(nome)")
+            .select(
+                "valor_final, comissao_valor, data_venda,"
+                " canais_venda(nome), produtos(codigo_interno)"
+            )
             .order("id")
         )
     except Exception as e:
@@ -2116,19 +2209,23 @@ def _secao_listagem():
     ano_atual, mes_atual = hoje.year, hoje.month
 
     def _acumula(filtro):
-        qtd, soma = 0, 0.0
+        qtd, soma, comissao = 0, 0.0, 0.0
         for v in vendas_kpi:
             dt = _parse_data_segura(v.get("data_venda"))
             if dt is None or not filtro(v, dt):
                 continue
             qtd += 1
             soma += float(v.get("valor_final") or 0)
-        return qtd, soma
+            comissao += float(v.get("comissao_valor") or 0)
+        return qtd, soma, comissao
 
     qtd_total = len(vendas_kpi)
     soma_total = sum(float(v.get("valor_final") or 0) for v in vendas_kpi)
-    qtd_ano, soma_ano = _acumula(lambda v, dt: dt.year == ano_atual)
-    qtd_mes_atual, soma_mes_atual = _acumula(lambda v, dt: dt.year == ano_atual and dt.month == mes_atual)
+    comissao_total = sum(float(v.get("comissao_valor") or 0) for v in vendas_kpi)
+    qtd_ano, soma_ano, comissao_ano = _acumula(lambda v, dt: dt.year == ano_atual)
+    qtd_mes_atual, soma_mes_atual, comissao_mes_atual = _acumula(
+        lambda v, dt: dt.year == ano_atual and dt.month == mes_atual
+    )
 
     # ------------------------------------------------------------------
     # 2) Opções de filtro (mês/ano e canal), calculadas antes dos cards
@@ -2177,6 +2274,8 @@ def _secao_listagem():
     if canal_selecionado_atual not in opcoes_canal:
         canal_selecionado_atual = "Todos"
 
+    codigo_atual = (st.session_state.get("vendas_filtro_codigo") or "").strip()
+
     def _bate_filtro_atual(v, dt):
         if mes_selecionado_atual != "Todos":
             ano_f, mes_f = meses_disponiveis[opcoes_mes.index(mes_selecionado_atual) - 1]
@@ -2185,12 +2284,17 @@ def _secao_listagem():
         if canal_selecionado_atual != "Todos":
             if ((v.get("canais_venda") or {}).get("nome")) != canal_selecionado_atual:
                 return False
+        if codigo_atual:
+            codigo_venda = str((v.get("produtos") or {}).get("codigo_interno") or "")
+            if codigo_atual.lower() not in codigo_venda.lower():
+                return False
         return True
 
-    qtd_filtro, soma_filtro = _acumula(_bate_filtro_atual)
+    qtd_filtro, soma_filtro, comissao_filtro = _acumula(_bate_filtro_atual)
     subtitulo_filtro = (
         f"{mes_selecionado_atual if mes_selecionado_atual != 'Todos' else 'Todo período'} · "
         f"{canal_selecionado_atual if canal_selecionado_atual != 'Todos' else 'Todos canais'}"
+        + (f" · Cód. {codigo_atual}" if codigo_atual else "")
     )
 
     # ------------------------------------------------------------------
@@ -2200,16 +2304,18 @@ def _secao_listagem():
     col_kpi1, col_kpi2, col_kpi3, col_kpi4 = st.columns(4)
     
     with col_kpi1:
-        _kpi_card("Total", qtd_total, soma_total, subtitulo="Todo período")
+        _kpi_card("Total", qtd_total, soma_total, comissao_total, subtitulo="Todo período")
         
     with col_kpi2:
-        _kpi_card("Ano Atual", qtd_ano, soma_ano, subtitulo=f"Ano de {ano_atual}")
+        _kpi_card("Ano Atual", qtd_ano, soma_ano, comissao_ano, subtitulo=f"Ano de {ano_atual}")
         
     with col_kpi3:
-        _kpi_card("Mês Atual", qtd_mes_atual, soma_mes_atual, subtitulo=MESES_PT[mes_atual])
+        _kpi_card(
+            "Mês Atual", qtd_mes_atual, soma_mes_atual, comissao_mes_atual, subtitulo=MESES_PT[mes_atual]
+        )
         
     with col_kpi4:
-        _kpi_card("Filtros", qtd_filtro, soma_filtro, subtitulo=subtitulo_filtro)
+        _kpi_card("Filtros", qtd_filtro, soma_filtro, comissao_filtro, subtitulo=subtitulo_filtro)
 
     st.markdown("---")
 
@@ -2226,11 +2332,17 @@ def _secao_listagem():
     # 4) Widgets de filtro (Mês/Ano da venda e Canal de venda) + botão
     #    para limpar os filtros
     # ------------------------------------------------------------------
-    col_filtro_mes, col_filtro_canal, col_acoes = st.columns([2, 2, 2.4])
+    col_filtro_mes, col_filtro_canal, col_filtro_codigo, col_acoes = st.columns([1.5, 1.5, 1.7, 2.6])
     with col_filtro_mes:
         mes_selecionado = st.selectbox("Mês da venda", opcoes_mes, key="vendas_filtro_mes")
     with col_filtro_canal:
         canal_selecionado = st.selectbox("Canal", opcoes_canal, key="vendas_filtro_canal")
+    with col_filtro_codigo:
+        codigo_selecionado = st.text_input(
+            "Código do produto",
+            placeholder="Digite o código...",
+            key="vendas_filtro_codigo",
+        ).strip()
     with col_acoes:
         st.markdown("<div style='margin-top:1.85rem;'></div>", unsafe_allow_html=True)
         btn_limpar, btn_adicionar, btn_exportar = st.columns([3, 3, 1.1])
@@ -2247,7 +2359,7 @@ def _secao_listagem():
             if st.button(
                 "📥",
                 key="vendas_btn_exportar",
-                help="Exportar para Excel (respeita os filtros de Mês e Canal)",
+                help="Exportar para Excel (respeita os filtros de Mês, Canal e Código do produto)",
                 use_container_width=True,
             ):
                 exp_inicio = exp_fim = None
@@ -2257,10 +2369,12 @@ def _secao_listagem():
                     exp_fim = (
                         date(ano_f + 1, 1, 1) if mes_f == 12 else date(ano_f, mes_f + 1, 1)
                     ).isoformat()
-                _dialog_exportar_vendas(exp_inicio, exp_fim, canal_selecionado, mes_selecionado)
+                _dialog_exportar_vendas(
+                    exp_inicio, exp_fim, canal_selecionado, mes_selecionado, codigo_selecionado
+                )
 
     # Reseta a página para 1 sempre que algum filtro mudar
-    assinatura_filtros = f"{mes_selecionado}|{canal_selecionado}"
+    assinatura_filtros = f"{mes_selecionado}|{canal_selecionado}|{codigo_selecionado}"
     if st.session_state.get("vendas_assinatura_filtros") != assinatura_filtros:
         st.session_state.pagina_atual_vendas = 1
         st.session_state.vendas_assinatura_filtros = assinatura_filtros
@@ -2275,6 +2389,10 @@ def _secao_listagem():
     # Embed do canal como inner join só quando o filtro de canal está ativo,
     # para não excluir vendas sem canal preenchido quando não há filtro.
     canal_embed = "canais_venda!inner(nome)" if canal_selecionado != "Todos" else "canais_venda(nome)"
+    # Mesmo raciocínio para o código do produto: inner join só com o filtro ativo.
+    produto_embed = (
+        "produtos!inner(descricao, codigo_interno)" if codigo_selecionado else "produtos(descricao, codigo_interno)"
+    )
 
     def _monta_query():
         query = (
@@ -2282,8 +2400,8 @@ def _secao_listagem():
             .table("vendas")
             .select(
                 "id, produto_id, quantidade, valor_lista, valor_desconto,"
-                " valor_final, data_venda, cliente, detalhe_feira_id,"
-                f" produtos(descricao, codigo_interno), {canal_embed}, "
+                " valor_final, comissao_percentual, comissao_valor, data_venda, cliente, detalhe_feira_id,"
+                f" {produto_embed}, {canal_embed}, "
                 "status_venda(nome), formas_pagamento(descricao), "
                 "detalhes_feira(nome_feira)",
                 count="exact",
@@ -2298,6 +2416,9 @@ def _secao_listagem():
 
         if canal_selecionado != "Todos":
             query = query.eq("canais_venda.nome", canal_selecionado)
+
+        if codigo_selecionado:
+            query = query.ilike("produtos.codigo_interno", f"%{codigo_selecionado}%")
 
         return query
 
@@ -2370,7 +2491,16 @@ def _secao_listagem():
             col_codigo.write(produto.get("codigo_interno") or "-")
             col_prod.write(produto.get("descricao") or "-")
 
-            col_total.write(_fmt_moeda(v.get("valor_final")))
+            valor_final_fmt = _fmt_moeda(v.get("valor_final"))
+            comissao_fmt = _fmt_moeda(v.get("comissao_valor"))
+            percentual_fmt = (
+                f"{float(v.get('comissao_percentual') or 0):g}%"
+                if v.get("comissao_percentual") is not None else "-"
+            )
+            col_total.markdown(
+                f'<span title="Valor final: {html.escape(valor_final_fmt)}&#10;Comissão: {html.escape(comissao_fmt)} ({html.escape(percentual_fmt)})" style="cursor:help;">{html.escape(valor_final_fmt)}</span>',
+                unsafe_allow_html=True,
+            )
             col_forma.write((v.get("formas_pagamento") or {}).get("descricao") or "-")
             col_status.write((v.get("status_venda") or {}).get("nome") or "-")
             col_cliente.write(v.get("cliente") or "-")
