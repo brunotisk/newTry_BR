@@ -23,3 +23,6 @@ Baixa vendas em Excel
 
 ## 1.6.5 - 02/10/2026
 Ajustes valores KPI vendas (desconsidera comissão)
+
+## 1.6.6 - 03/10/2026
+Tela admin reseta comissão

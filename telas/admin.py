@@ -393,6 +393,260 @@ def _secao_exclusao_vendas_massa():
             st.caption("Recarregue a aba (ou troque de filtro) para atualizar a lista.")
 
 
+def _secao_ajuste_comissao():
+    st.subheader("💰 Ajuste de Comissão")
+    st.caption(
+        "Aplica nas vendas de um canal o percentual de comissão cadastrado no "
+        "parceiro vinculado a esse canal. A comissão é calculada sobre o "
+        "**valor final** da venda e grava `comissao_percentual` e `comissao_valor`."
+    )
+
+    # --- Canais que possuem parceiro cadastrado ---
+    try:
+        canais = (
+            supabase.table("canais_venda")
+            .select("id, nome, ativo")
+            .order("nome")
+            .execute()
+            .data
+            or []
+        )
+        parceiros = (
+            supabase.table("parceiros")
+            .select("id, canal_id, nome, percentual_comissao, ativo")
+            .execute()
+            .data
+            or []
+        )
+    except Exception as e:
+        st.error(f"Erro ao carregar canais e parceiros: {e}")
+        return
+
+    parceiro_por_canal = {p["canal_id"]: p for p in parceiros}
+    canais_map = {c["id"]: c for c in canais}
+
+    def _rotulo_canal(cid) -> str:
+        c = canais_map[cid]
+        p = parceiro_por_canal.get(cid)
+        if not p:
+            return f"{c['nome']} — sem parceiro cadastrado"
+        return f"{c['nome']} — {p['nome']} ({float(p['percentual_comissao'] or 0):g}%)"
+
+    canal_id = st.selectbox(
+        "Canal de venda",
+        options=[None] + [c["id"] for c in canais],
+        format_func=lambda cid: "Selecione um canal..." if cid is None else _rotulo_canal(cid),
+        key="admin_comissao_canal",
+    )
+    if canal_id is None:
+        st.caption("Selecione um canal para continuar.")
+        return
+
+    parceiro = parceiro_por_canal.get(canal_id)
+    if not parceiro:
+        st.warning(
+            "Este canal não possui parceiro cadastrado, então não há comissão "
+            "para aplicar. Cadastre o parceiro e tente novamente."
+        )
+        return
+    if not parceiro.get("ativo"):
+        st.warning(f"⚠️ O parceiro **{parceiro['nome']}** está marcado como inativo.")
+
+    pct = float(parceiro.get("percentual_comissao") or 0)
+    with st.container(border=True):
+        c1, c2 = st.columns(2)
+        c1.markdown(f"**Parceiro:** {parceiro['nome']}")
+        c2.markdown(f"**Comissão cadastrada:** {pct:g}%")
+
+    # --- Escopo da seleção ---
+    modo = st.radio(
+        "Quais vendas ajustar?",
+        options=["Período", "Todas as vendas do canal", "Venda específica (ID)"],
+        horizontal=True,
+        key="admin_comissao_modo",
+    )
+
+    data_ini = data_fim = None
+    ids_venda: list[int] = []
+
+    if modo == "Período":
+        col_di, col_df = st.columns(2)
+        with col_di:
+            data_ini = st.date_input("Data inicial", value=None, key="admin_comissao_data_ini")
+        with col_df:
+            data_fim = st.date_input("Data final", value=None, key="admin_comissao_data_fim")
+        if not data_ini or not data_fim:
+            st.caption("Selecione a data inicial e a final.")
+            return
+        if data_ini > data_fim:
+            st.error("A data inicial não pode ser depois da data final.")
+            return
+
+    elif modo == "Venda específica (ID)":
+        texto_ids = st.text_input(
+            "ID da venda (para várias, separe por vírgula)",
+            placeholder="Ex.: 123 ou 123, 124, 130",
+            key="admin_comissao_ids",
+        ).strip()
+        if not texto_ids:
+            st.caption("Informe ao menos um ID de venda.")
+            return
+        partes = [p.strip() for p in re.split(r"[,\s;]+", texto_ids) if p.strip()]
+        invalidos = [p for p in partes if not p.isdigit()]
+        if invalidos:
+            st.error(f"ID(s) inválido(s): {', '.join(invalidos)}. Use apenas números.")
+            return
+        ids_venda = sorted({int(p) for p in partes})
+
+    # --- Consulta das vendas (sempre restritas ao canal escolhido) ---
+    try:
+        query = (
+            supabase.table("vendas")
+            .select(
+                "id, data_venda, valor_final, cliente, comissao_percentual, "
+                "comissao_valor, produtos(descricao)"
+            )
+            .eq("canal_venda_id", canal_id)
+            .order("data_venda", desc=True)
+        )
+        if modo == "Período":
+            query = query.gte("data_venda", data_ini.isoformat()).lte(
+                "data_venda", data_fim.isoformat()
+            )
+        elif modo == "Venda específica (ID)":
+            query = query.in_("id", ids_venda)
+        vendas = query.execute().data or []
+    except Exception as e:
+        st.error(f"Erro ao consultar vendas: {e}")
+        return
+
+    if modo == "Venda específica (ID)":
+        encontrados = {v["id"] for v in vendas}
+        faltantes = [i for i in ids_venda if i not in encontrados]
+        if faltantes:
+            st.warning(
+                "Venda(s) não encontrada(s) neste canal: "
+                + ", ".join(f"#{i}" for i in faltantes)
+            )
+
+    if not vendas:
+        st.info("Nenhuma venda encontrada para os critérios selecionados.")
+        return
+
+    # --- Vendas já incluídas em fechamento de parceria ficam de fora ---
+    fechadas: set[int] = set()
+    try:
+        ids_todas = [v["id"] for v in vendas]
+        for i in range(0, len(ids_todas), 200):
+            lote = ids_todas[i:i + 200]
+            resp = (
+                supabase.table("parcerias_fechamento_vendas")
+                .select("venda_id")
+                .in_("venda_id", lote)
+                .execute()
+                .data
+                or []
+            )
+            fechadas.update(r["venda_id"] for r in resp)
+    except Exception as e:
+        st.error(f"Erro ao verificar fechamentos de parceria: {e}")
+        return
+
+    elegiveis = [v for v in vendas if v["id"] not in fechadas]
+    if fechadas:
+        st.warning(
+            f"{len(fechadas)} venda(s) já fazem parte de um fechamento de parceria e "
+            "**não serão alteradas**, para não divergir do valor já fechado: "
+            + ", ".join(f"#{i}" for i in sorted(fechadas)[:20])
+            + ("..." if len(fechadas) > 20 else "")
+        )
+    if not elegiveis:
+        st.info("Nenhuma venda elegível para ajuste.")
+        return
+
+    def _nova_comissao(v: dict) -> float:
+        return round(float(v.get("valor_final") or 0) * pct / 100, 2)
+
+    total_vendas = len(elegiveis)
+    base_total = sum(float(v.get("valor_final") or 0) for v in elegiveis)
+    comissao_atual = sum(float(v.get("comissao_valor") or 0) for v in elegiveis)
+    comissao_nova = sum(_nova_comissao(v) for v in elegiveis)
+
+    k1, k2, k3, k4 = st.columns(4)
+    with k1:
+        with st.container(border=True):
+            st.caption("Vendas a ajustar")
+            st.title(f"{total_vendas}")
+    with k2:
+        with st.container(border=True):
+            st.caption("Valor vendido")
+            st.title(_fmt_moeda(base_total))
+    with k3:
+        with st.container(border=True):
+            st.caption("Comissão atual")
+            st.title(_fmt_moeda(comissao_atual))
+    with k4:
+        with st.container(border=True):
+            st.caption(f"Comissão nova ({pct:g}%)")
+            st.title(_fmt_moeda(comissao_nova))
+
+    with st.expander(f"Ver as {total_vendas} venda(s) que serão ajustadas"):
+        st.dataframe(
+            [
+                {
+                    "ID": v["id"],
+                    "Data": _fmt_data(v.get("data_venda")),
+                    "Produto": (v.get("produtos") or {}).get("descricao") or "-",
+                    "Cliente": v.get("cliente") or "-",
+                    "Valor final": _fmt_moeda(v.get("valor_final")),
+                    "% atual": (
+                        "-" if v.get("comissao_percentual") is None
+                        else f"{float(v['comissao_percentual']):g}%"
+                    ),
+                    "Comissão atual": _fmt_moeda(v.get("comissao_valor")),
+                    "% nova": f"{pct:g}%",
+                    "Comissão nova": _fmt_moeda(_nova_comissao(v)),
+                }
+                for v in elegiveis
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    st.divider()
+    if st.button(
+        f"✅ Aplicar {pct:g}% em {total_vendas} venda(s)",
+        type="primary",
+        use_container_width=True,
+        key="btn_admin_aplicar_comissao",
+    ):
+        ok, falhas = 0, []
+        with st.spinner(f"Atualizando {total_vendas} venda(s)..."):
+            for v in elegiveis:
+                try:
+                    supabase.table("vendas").update(
+                        {
+                            "comissao_percentual": pct,
+                            "comissao_valor": _nova_comissao(v),
+                        }
+                    ).eq("id", v["id"]).execute()
+                    ok += 1
+                except Exception as e:
+                    falhas.append({"ID": v["id"], "Erro": str(e)})
+
+        if falhas:
+            st.warning(
+                f"⚠️ {ok} de {total_vendas} venda(s) atualizada(s). "
+                f"{len(falhas)} falharam — veja abaixo."
+            )
+            st.dataframe(falhas, use_container_width=True, hide_index=True)
+        else:
+            st.success(
+                f"✅ Comissão de {pct:g}% aplicada em {ok} venda(s) do canal "
+                f"**{canais_map[canal_id]['nome']}**."
+            )
+
+
 _ICONE_ETAPA = {
     "cadastro_produto": "📇",
     "ajusta_estoque": "📦",
@@ -756,9 +1010,10 @@ def tela_admin():
 
     st.header("⚙️ Painel de Administração")
 
-    aba_compras, aba_vendas, aba_log, aba_info = st.tabs([
+    aba_compras, aba_vendas, aba_comissao, aba_log, aba_info = st.tabs([
         "🗑️ Exclusão de Compras (XML)",
         "🗑️ Exclusão de Vendas em Massa",
+        "💰 Ajuste Comissão",
         "📋 Log de Automações",
         "ℹ️ Informações do Sistema",
     ])
@@ -768,6 +1023,9 @@ def tela_admin():
 
     with aba_vendas:
         _secao_exclusao_vendas_massa()
+
+    with aba_comissao:
+        _secao_ajuste_comissao()
 
     with aba_log:
         _secao_log_automacoes()
