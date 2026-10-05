@@ -26,3 +26,6 @@ Ajustes valores KPI vendas (desconsidera comissão)
 
 ## 1.6.6 - 03/10/2026
 Tela admin reseta comissão
+
+## 1.7.0 - 05/10/2026
+Módulo de testes
