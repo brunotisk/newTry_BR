@@ -1,7 +1,8 @@
 import streamlit as st
-from datetime import datetime
+from datetime import date, datetime
+from io import BytesIO
 
-from db import supabase
+from db import supabase, buscar_todos
 from componentes.paginacao import render_paginacao, get_itens_por_pagina, reset_paginacao
 from componentes.campo_mascarado import campo_mascarado
 
@@ -58,9 +59,26 @@ def _format_phone(value):
 
 
 
+_COLUNAS_CLIENTE = "id, nome, telefone, canal_id, data_nascimento, data_casamento, detalhe_feira_id"
+
+# rótulo -> (campo, decrescente?)
+_ORDENACOES = {
+    "Nome (A–Z)": ("nome", False),
+    "Nome (Z–A)": ("nome", True),
+    "Mais compras": ("qtde", True),
+    "Menos compras": ("qtde", False),
+    "Compra mais recente": ("ultima", True),
+    "Compra mais antiga": ("ultima", False),
+    "Maior valor comprado": ("valor", True),
+    "Menor valor comprado": ("valor", False),
+}
+_ORDEM_PADRAO = "Nome (A–Z)"
+
+
 def _limpar_filtros():
     st.session_state["clientes_filtro_nome"] = ""
     st.session_state["clientes_filtro_canal"] = "Todos os canais"
+    st.session_state["clientes_ordem"] = _ORDEM_PADRAO
     reset_paginacao("clientes")
 
 
@@ -436,22 +454,340 @@ def _dialog_unificar_clientes():
         st.error(f"Erro ao unificar clientes: {err}")
 
 
-def _buscar_resumo_compras():
-    resumo = {}
+def _fmt_moeda(valor) -> str:
     try:
-        response = supabase.table("vendas").select("cliente, data_venda").execute()
-        for venda in response.data or []:
+        v = float(valor or 0)
+        return (
+            f"R$ {v:,.2f}"
+            .replace(",", "X")
+            .replace(".", ",")
+            .replace("X", ".")
+        )
+    except Exception:
+        return "R$ 0,00"
+
+
+def _buscar_vendas_do_cliente(cliente: dict) -> list[dict]:
+    """Vendas de um cliente.
+
+    Une os dois vínculos existentes no sistema, sem duplicar:
+      1. vendas com `cliente_id` = id do cliente (vínculo real);
+      2. vendas antigas/manuais sem `cliente_id`, casadas pelo nome (sem
+         espaços nas pontas e sem diferenciar maiúsculas/minúsculas) — a
+         mesma regra usada em _buscar_resumo_compras e na unificação.
+    """
+    colunas = (
+        "id, data_venda, cliente, cliente_id, quantidade, valor_final, "
+        "produtos(codigo_interno, descricao), canais_venda(nome), "
+        "status_venda(nome), formas_pagamento(descricao)"
+    )
+
+    por_id = buscar_todos(
+        lambda: supabase.table("vendas")
+        .select(colunas)
+        .eq("cliente_id", cliente["id"])
+        .order("id")
+    )
+
+    vendas = {v["id"]: v for v in por_id}
+
+    nome = (cliente.get("nome") or "").strip()
+    if nome:
+        # Escapa curingas do LIKE para o nome ser tratado literalmente. O
+        # ilike só pré-filtra; a comparação exata é feita em Python abaixo.
+        nome_like = nome.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        candidatas = buscar_todos(
+            lambda: supabase.table("vendas")
+            .select(colunas)
+            .is_("cliente_id", "null")
+            .ilike("cliente", f"%{nome_like}%")
+            .order("id")
+        )
+        alvo = nome.casefold()
+        for v in candidatas:
+            if (v.get("cliente") or "").strip().casefold() == alvo:
+                vendas.setdefault(v["id"], v)
+
+    return sorted(
+        vendas.values(),
+        key=lambda v: (str(v.get("data_venda") or ""), v["id"]),
+        reverse=True,
+    )
+
+
+@_dialog("🛒 Vendas do cliente", width="large")
+def _dialog_vendas_cliente(cliente: dict, canal_labels: dict):
+    st.markdown(f"### {cliente.get('nome') or '-'}")
+    st.caption(
+        f"Canal: {canal_labels.get(cliente.get('canal_id'), '-')}"
+        + (f" · Telefone: {cliente['telefone']}" if cliente.get("telefone") else "")
+    )
+
+    try:
+        vendas = _buscar_vendas_do_cliente(cliente)
+    except Exception as err:
+        st.error(f"Erro ao consultar as vendas do cliente: {err}")
+        return
+
+    if not vendas:
+        st.info("Este cliente ainda não possui vendas.")
+        return
+
+    valor_total = sum(float(v.get("valor_final") or 0) for v in vendas)
+    ultima = max((_parse_date(v.get("data_venda")) for v in vendas if v.get("data_venda")), default=None)
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Itens vendidos", len(vendas))
+    col2.metric("Valor total", _fmt_moeda(valor_total))
+    col3.metric("Última compra", _fmt_date(ultima))
+
+    st.dataframe(
+        [
+            {
+                "Venda": v["id"],
+                "Data": _fmt_date(v.get("data_venda")),
+                "Produto": (v.get("produtos") or {}).get("descricao") or "-",
+                "Código": (v.get("produtos") or {}).get("codigo_interno") or "-",
+                "Qtd": v.get("quantidade"),
+                "Valor": _fmt_moeda(v.get("valor_final")),
+                "Canal": (v.get("canais_venda") or {}).get("nome") or "-",
+                "Pagamento": (v.get("formas_pagamento") or {}).get("descricao") or "-",
+                "Status": (v.get("status_venda") or {}).get("nome") or "-",
+            }
+            for v in vendas
+        ],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
+def _buscar_resumo_compras() -> dict:
+    """Resumo de compras por cliente: quantidade, última compra e valor.
+
+    Segue a mesma regra de vínculo da janela "Vendas do cliente": a venda
+    pertence ao cliente pelo `cliente_id` quando ele existe; as vendas sem
+    `cliente_id` (antigas/manuais) são casadas pelo nome, sem espaços nas
+    pontas e sem diferenciar maiúsculas/minúsculas.
+    """
+    resumo = {"por_id": {}, "por_nome": {}}
+    try:
+        vendas = buscar_todos(
+            lambda: supabase.table("vendas")
+            .select("id, cliente, cliente_id, data_venda, valor_final")
+            .order("id")
+        )
+    except Exception as err:
+        st.warning(f"Não foi possível carregar o resumo de compras dos clientes: {err}")
+        return resumo
+
+    for venda in vendas:
+        if venda.get("cliente_id") is not None:
+            bucket, chave = resumo["por_id"], venda["cliente_id"]
+        else:
             nome = (venda.get("cliente") or "").strip().casefold()
             if not nome:
                 continue
-            item = resumo.setdefault(nome, {"qtde": 0, "ultima": None})
-            item["qtde"] += 1
-            data = _parse_date(venda.get("data_venda"))
-            if data and (item["ultima"] is None or data > item["ultima"]):
-                item["ultima"] = data
-    except Exception:
-        pass
+            bucket, chave = resumo["por_nome"], nome
+
+        item = bucket.setdefault(chave, {"qtde": 0, "ultima": None, "valor": 0.0})
+        item["qtde"] += 1
+        item["valor"] += float(venda.get("valor_final") or 0)
+        data = _parse_date(venda.get("data_venda"))
+        if data and (item["ultima"] is None or data > item["ultima"]):
+            item["ultima"] = data
     return resumo
+
+
+def _stats_cliente(resumo: dict, cliente: dict) -> dict:
+    """Soma o que está vinculado por `cliente_id` com o que casa pelo nome."""
+    itens = (
+        resumo["por_id"].get(cliente["id"]),
+        resumo["por_nome"].get((cliente.get("nome") or "").strip().casefold()),
+    )
+    qtde, valor, ultima = 0, 0.0, None
+    for item in itens:
+        if not item:
+            continue
+        qtde += item["qtde"]
+        valor += item["valor"]
+        if item["ultima"] and (ultima is None or item["ultima"] > ultima):
+            ultima = item["ultima"]
+    return {"qtde": qtde, "valor": valor, "ultima": ultima}
+
+
+def _query_clientes(filtro_nome: str, canal_id, count: bool = False):
+    if count:
+        query = supabase.table("clientes").select(_COLUNAS_CLIENTE, count="exact")
+    else:
+        query = supabase.table("clientes").select(_COLUNAS_CLIENTE)
+    if filtro_nome.strip():
+        query = query.ilike("nome", f"%{filtro_nome.strip()}%")
+    if canal_id is not None:
+        query = query.eq("canal_id", canal_id)
+    return query
+
+
+def _buscar_clientes_filtrados(filtro_nome: str, canal_id, ordem: str, resumo: dict) -> list[dict]:
+    """TODOS os clientes dos filtros, já na ordem escolhida (sem paginar)."""
+    campo, decrescente = _ORDENACOES.get(ordem, _ORDENACOES[_ORDEM_PADRAO])
+
+    clientes = buscar_todos(
+        lambda: _query_clientes(filtro_nome, canal_id)
+        .order("nome", desc=(campo == "nome" and decrescente))
+        .order("id")
+    )
+    if campo == "nome":
+        return clientes
+
+    # A lista parte ordenada por nome; o sort do Python é estável, então
+    # clientes empatados na métrica continuam em ordem alfabética.
+    if campo == "ultima":
+        # Quem nunca comprou fica sempre no fim, em qualquer direção.
+        com_compra = [c for c in clientes if _stats_cliente(resumo, c)["ultima"]]
+        sem_compra = [c for c in clientes if not _stats_cliente(resumo, c)["ultima"]]
+        com_compra.sort(key=lambda c: _stats_cliente(resumo, c)["ultima"], reverse=decrescente)
+        return com_compra + sem_compra
+
+    clientes.sort(key=lambda c: _stats_cliente(resumo, c)[campo], reverse=decrescente)
+    return clientes
+
+
+def _gerar_excel_clientes(linhas: list[dict]) -> bytes:
+    """Planilha de clientes (uma linha por cliente) com valores numéricos
+    reais, filtro, cabeçalho fixo e linha de total."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Clientes"
+
+    cabecalhos = [
+        "Nome", "Telefone", "Canal", "Feira", "Nascimento", "Casamento",
+        "Última compra", "Qtd compras", "Valor comprado",
+    ]
+    fill = PatternFill(fill_type="solid", fgColor="1F4E78")
+    fonte = Font(color="FFFFFF", bold=True)
+    for col, titulo in enumerate(cabecalhos, 1):
+        c = ws.cell(1, col, titulo)
+        c.fill = fill
+        c.font = fonte
+        c.alignment = Alignment(horizontal="center", vertical="center")
+
+    linha = 2
+    for item in linhas:
+        valores = [
+            item["nome"], item["telefone"], item["canal"], item["feira"],
+            item["nascimento"], item["casamento"], item["ultima"],
+            item["qtde"], item["valor"],
+        ]
+        for col, valor in enumerate(valores, 1):
+            ws.cell(linha, col, valor)
+        ws.cell(linha, 2).number_format = "@"  # telefone como texto
+        for col in (5, 6, 7):
+            ws.cell(linha, col).number_format = "DD/MM/YYYY"
+            ws.cell(linha, col).alignment = Alignment(horizontal="center")
+        ws.cell(linha, 8).number_format = "0"
+        ws.cell(linha, 9).number_format = "R$ #,##0.00"
+        linha += 1
+
+    ultima_dados = linha - 1
+
+    # SUBTOTAL: o total acompanha os filtros aplicados na própria planilha.
+    linha_total = linha
+    ws.cell(linha_total, 7, "TOTAL").font = Font(bold=True)
+    ws.cell(linha_total, 7).alignment = Alignment(horizontal="right")
+    borda = Border(top=Side(style="thin"))
+    for col in range(1, len(cabecalhos) + 1):
+        ws.cell(linha_total, col).border = borda
+    for col in (8, 9):
+        letra = get_column_letter(col)
+        c = ws.cell(linha_total, col, f"=SUBTOTAL(109,{letra}2:{letra}{ultima_dados})")
+        c.font = Font(bold=True)
+        c.number_format = "0" if col == 8 else "R$ #,##0.00"
+
+    larguras = [34, 18, 20, 24, 14, 14, 16, 13, 18]
+    for i, largura in enumerate(larguras, 1):
+        ws.column_dimensions[get_column_letter(i)].width = largura
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(cabecalhos))}{ultima_dados}"
+
+    buffer = BytesIO()
+    wb.save(buffer)
+    return buffer.getvalue()
+
+
+def _nome_arquivo_clientes(canal: str) -> str:
+    """clientes_<canal>_<data>.xlsx, sem acentos nem caracteres inválidos."""
+    import re
+    import unicodedata
+
+    sem_acento = unicodedata.normalize("NFKD", canal).encode("ascii", "ignore").decode()
+    canal_limpo = re.sub(r"[^A-Za-z0-9]+", "-", sem_acento).strip("-") or "todos"
+    return f"clientes_{canal_limpo}_{date.today():%Y%m%d}.xlsx"
+
+
+@_dialog("📥 Exportar clientes", width="small")
+def _dialog_exportar_clientes(filtro_nome: str, canal_id, canal_rotulo: str, ordem: str):
+    """Busca TODOS os clientes dos filtros atuais (não só a página visível),
+    na ordenação escolhida na tela, e oferece o download em Excel."""
+    st.caption(
+        f"Canal: **{canal_rotulo}**"
+        + (f" · Nome contém: **{filtro_nome.strip()}**" if filtro_nome.strip() else "")
+        + f" · Ordenação: **{ordem}**"
+    )
+
+    try:
+        with st.spinner("Gerando planilha..."):
+            resumo = _buscar_resumo_compras()
+            clientes = _buscar_clientes_filtrados(filtro_nome, canal_id, ordem, resumo)
+
+            canais = {
+                c["id"]: c["nome"]
+                for c in buscar_todos(
+                    lambda: supabase.table("canais_venda").select("id, nome").order("id")
+                )
+            }
+            feiras = {
+                f["id"]: f["nome_feira"]
+                for f in buscar_todos(
+                    lambda: supabase.table("detalhes_feira").select("id, nome_feira").order("id")
+                )
+            }
+
+            linhas = []
+            for cliente in clientes:
+                stats = _stats_cliente(resumo, cliente)
+                linhas.append({
+                    "nome": cliente.get("nome") or "",
+                    "telefone": cliente.get("telefone") or "",
+                    "canal": canais.get(cliente.get("canal_id"), ""),
+                    "feira": feiras.get(cliente.get("detalhe_feira_id"), ""),
+                    "nascimento": _parse_date(cliente.get("data_nascimento")),
+                    "casamento": _parse_date(cliente.get("data_casamento")),
+                    "ultima": stats["ultima"],
+                    "qtde": stats["qtde"],
+                    "valor": stats["valor"],
+                })
+            dados = _gerar_excel_clientes(linhas) if linhas else None
+    except Exception as err:
+        st.error(f"Não foi possível gerar a planilha: {err}")
+        return
+
+    if not linhas:
+        st.info("Nenhum cliente para exportar com os filtros atuais.")
+        return
+
+    st.success(f"{len(linhas)} cliente(s) prontos para exportar.")
+    st.download_button(
+        "⬇️ Baixar Excel",
+        data=dados,
+        file_name=_nome_arquivo_clientes(canal_rotulo),
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+        key="clientes_download_excel",
+    )
 
 
 def _secao_clientes():
@@ -466,8 +802,8 @@ def _secao_clientes():
         canais = canais_resp.data or []
         canal_labels = {c["id"]: c["nome"] for c in canais}
 
-        col_nome, col_canal, col_limpar, col_unificar, col_adicionar = st.columns(
-            [2.4, 1.7, 1.1, 1.5, 1.5]
+        col_nome, col_canal, col_limpar, col_unificar, col_exportar, col_adicionar = st.columns(
+            [2.0, 1.5, 1.0, 1.2, 1.2, 1.5]
         )
 
         with col_nome:
@@ -481,30 +817,67 @@ def _secao_clientes():
             )
         with col_limpar:
             st.button("Limpar filtros", use_container_width=True, on_click=_limpar_filtros)
+
+        canal_selecionado = None
+        if filtro_canal != "Todos os canais":
+            canal_selecionado = next((c["id"] for c in canais if c["nome"] == filtro_canal), None)
+
         with col_unificar:
             if st.button("🔗 Unificar", use_container_width=True, help="Unificar clientes duplicados"):
                 _dialog_unificar_clientes()
+        with col_exportar:
+            exportar = st.button(
+                "📥 Exportar", use_container_width=True,
+                help="Baixar os clientes dos filtros atuais em Excel",
+            )
         with col_adicionar:
             if st.button("➕ Adicionar cliente", type="secondary", use_container_width=True):
                 _dialog_cliente()
 
-        chave_filtro = f"{filtro_nome.strip().casefold()}|{filtro_canal}"
+        col_ordem, _ = st.columns([2.0, 5.0])
+        with col_ordem:
+            ordem = st.selectbox(
+                "Ordenar por",
+                options=list(_ORDENACOES.keys()),
+                key="clientes_ordem",
+            )
+
+        if exportar:
+            _dialog_exportar_clientes(filtro_nome, canal_selecionado, filtro_canal, ordem)
+
+        chave_filtro = f"{filtro_nome.strip().casefold()}|{filtro_canal}|{ordem}"
         if st.session_state.get("clientes_chave_filtro") != chave_filtro:
             st.session_state["clientes_chave_filtro"] = chave_filtro
             reset_paginacao("clientes")
 
-        query = supabase.table("clientes").select(
-            "id, nome, telefone, canal_id, data_nascimento, data_casamento", count="exact"
-        )
-        if filtro_nome.strip():
-            query = query.ilike("nome", f"%{filtro_nome.strip()}%")
-        if filtro_canal != "Todos os canais":
-            canal_selecionado = next((c["id"] for c in canais if c["nome"] == filtro_canal), None)
-            if canal_selecionado is not None:
-                query = query.eq("canal_id", canal_selecionado)
+        resumo = _buscar_resumo_compras()
+        campo_ordem, decrescente = _ORDENACOES[ordem]
 
-        total_resp = query.order("nome").range(0, 0).execute()
-        total = total_resp.count if total_resp.count is not None else 0
+        if campo_ordem == "nome":
+            # Ordenação por nome: paginação feita direto no banco.
+            total_resp = (
+                _query_clientes(filtro_nome, canal_selecionado, count=True)
+                .order("nome", desc=decrescente).order("id")
+                .range(0, 0).execute()
+            )
+            total = total_resp.count if total_resp.count is not None else 0
+
+            def _carregar_pagina(offset, limite):
+                resp = (
+                    _query_clientes(filtro_nome, canal_selecionado)
+                    .order("nome", desc=decrescente).order("id")
+                    .range(offset, offset + limite - 1).execute()
+                )
+                return resp.data or []
+        else:
+            # Quantidade/última compra/valor dependem das vendas, então a
+            # lista toda é ordenada em memória e só então paginada.
+            todos = _buscar_clientes_filtrados(filtro_nome, canal_selecionado, ordem, resumo)
+            total = len(todos)
+
+            def _carregar_pagina(offset, limite):
+                return todos[offset:offset + limite]
+
         st.header(f"👤 Clientes ({total} Clientes)")
         itens_por_pagina = get_itens_por_pagina("clientes")
         pagina = render_paginacao(
@@ -513,33 +886,41 @@ def _secao_clientes():
         )
         offset = (pagina - 1) * get_itens_por_pagina("clientes")
 
-        response = query.order("nome").range(offset, offset + get_itens_por_pagina("clientes") - 1).execute()
-        clientes = response.data or []
+        clientes = _carregar_pagina(offset, get_itens_por_pagina("clientes"))
 
         if not clientes:
             st.info("Nenhum cliente encontrado para os filtros informados.")
             return
 
-        resumo = _buscar_resumo_compras()
-
+        larguras = [2.0, 1.2, 1.0, 1.0, 1.0, 1.1, 0.8, 1.2, 1.1]
         with st.container(border=True):
-            cab = st.columns([2.3, 1.4, 1.2, 1.2, 1.2, 1.2, 1.0, 0.6])
-            for col, texto in zip(cab, ["Nome", "Telefone", "Canal", "Nascimento", "Casamento", "Última compra", "Compras", "Ações"]):
+            cab = st.columns(larguras)
+            for col, texto in zip(
+                cab,
+                ["Nome", "Telefone", "Canal", "Nascimento", "Casamento", "Última compra", "Compras", "Valor comprado", "Ações"],
+            ):
                 col.markdown(f"**{texto}**")
             st.divider()
 
             for cliente in clientes:
-                nome_key = (cliente.get("nome") or "").strip().casefold()
-                stats = resumo.get(nome_key, {})
-                cols = st.columns([2.3, 1.4, 1.2, 1.2, 1.2, 1.2, 1.0, 0.6])
+                stats = _stats_cliente(resumo, cliente)
+                cols = st.columns(larguras)
                 cols[0].write(cliente.get("nome") or "-")
                 cols[1].write(cliente.get("telefone") or "-")
                 cols[2].write(canal_labels.get(cliente.get("canal_id"), "-"))
                 cols[3].write(_fmt_date(cliente.get("data_nascimento")))
                 cols[4].write(_fmt_date(cliente.get("data_casamento")))
-                cols[5].write(_fmt_date(stats.get("ultima")))
-                cols[6].write(str(stats.get("qtde", 0)))
-                if cols[7].button("✏️", key=f"editar_cliente_{cliente['id']}"):
+                cols[5].write(_fmt_date(stats["ultima"]))
+                cols[6].write(str(stats["qtde"]))
+                cols[7].write(_fmt_moeda(stats["valor"]))
+                col_vendas, col_editar = cols[8].columns(2)
+                if col_vendas.button(
+                    "🛒", key=f"vendas_cliente_{cliente['id']}", help="Ver vendas do cliente"
+                ):
+                    _dialog_vendas_cliente(cliente, canal_labels)
+                if col_editar.button(
+                    "✏️", key=f"editar_cliente_{cliente['id']}", help="Editar cliente"
+                ):
                     _dialog_cliente(cliente)
 
         render_paginacao(

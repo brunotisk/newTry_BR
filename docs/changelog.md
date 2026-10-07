@@ -32,3 +32,6 @@ Módulo de testes
 
 ## 1.7.1 - 07/10/2026
 Ajuste tela de estoque (KPI e botão Exportar)
+
+## 1.7.2 - 07/10/2026
+Melhoria tela Clientes, filtro Mesano tela compras e export 

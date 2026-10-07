@@ -1,9 +1,9 @@
 import streamlit as st
-from datetime import datetime
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 from io import BytesIO
 from openpyxl import Workbook
-from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from db import supabase
 from telas.importar_nf import tela_importar_nf
 from componentes.paginacao import render_paginacao, get_itens_por_pagina, reset_paginacao
@@ -82,9 +82,97 @@ def _estilizar_cabecalho_planilha(ws, ultima_coluna: int) -> None:
     ws.freeze_panes = "A2"
 
 
+MESES_PT = {
+    1: "Janeiro", 2: "Fevereiro", 3: "Março", 4: "Abril",
+    5: "Maio", 6: "Junho", 7: "Julho", 8: "Agosto",
+    9: "Setembro", 10: "Outubro", 11: "Novembro", 12: "Dezembro",
+}
+
+
+def _data_iso_para_date(valor_iso: str | None):
+    """Mesma leitura de data usada em _fmt_data_iso, mas devolvendo `date`
+    (ou None). Serve ao filtro de mês/ano e às células de data do Excel."""
+    if not valor_iso:
+        return None
+    try:
+        return datetime.fromisoformat(str(valor_iso).replace("Z", "+00:00")).date()
+    except Exception:
+        return None
+
+
+def _buscar_em_lotes(
+    tabela: str,
+    coluna_filtro: str,
+    valores: list,
+    colunas_select: str,
+    tamanho_lote: int = 200,
+    tamanho_pagina: int = 1000,
+) -> list[dict]:
+    """Busca registros em lotes e pagina cada lote até esgotar os dados.
+
+    O limite máximo de linhas configurado no PostgREST/Supabase pode ser
+    menor que o `.limit(50000)` solicitado pelo cliente. Sem paginação,
+    isso fazia algumas compras aparecerem com zero itens quando seus
+    registros ficavam além da primeira página retornada.
+    """
+    linhas: list[dict] = []
+
+    for inicio in range(0, len(valores), tamanho_lote):
+        lote = valores[inicio:inicio + tamanho_lote]
+        numero_lote = inicio // tamanho_lote + 1
+        offset = 0
+
+        try:
+            while True:
+                fim = offset + tamanho_pagina - 1
+                resp = (
+                    supabase.table(tabela)
+                    .select(colunas_select)
+                    .in_(coluna_filtro, lote)
+                    .range(offset, fim)
+                    .execute()
+                )
+                dados_pagina = resp.data or []
+                linhas.extend(dados_pagina)
+
+                # Menos que o tamanho da página significa que não há
+                # mais registros para este lote.
+                if len(dados_pagina) < tamanho_pagina:
+                    break
+
+                offset += tamanho_pagina
+        except Exception as err:
+            st.warning(
+                f"Erro ao consultar {tabela} (lote {numero_lote}, "
+                f"a partir da linha {offset}): {err}"
+            )
+
+    return linhas
+
+
+def _finalizar_planilha(ws, ultima_dados: int, total_colunas: int, col_rotulo: int, somas: dict) -> None:
+    """Filtro automático + linha de TOTAL com SUBTOTAL (acompanha os filtros
+    aplicados na própria planilha), no mesmo padrão da planilha de vendas."""
+    from openpyxl.utils import get_column_letter
+
+    linha_total = ultima_dados + 1
+    ws.cell(linha_total, col_rotulo, "TOTAL").font = Font(bold=True)
+    ws.cell(linha_total, col_rotulo).alignment = Alignment(horizontal="right")
+    borda = Border(top=Side(style="thin"))
+    for col in range(1, total_colunas + 1):
+        ws.cell(linha_total, col).border = borda
+    for col, formato in somas.items():
+        letra = get_column_letter(col)
+        c = ws.cell(linha_total, col, f"=SUBTOTAL(109,{letra}2:{letra}{ultima_dados})")
+        c.font = Font(bold=True)
+        c.number_format = formato
+    ws.auto_filter.ref = f"A1:{get_column_letter(total_colunas)}{ultima_dados}"
+
+
 def _gerar_excel_compras(compras_lista: list[dict], qtd_itens_por_compra: dict) -> bytes:
-    """Gera um .xlsx com exatamente os mesmos campos exibidos na tabela de
-    compras da tela (uma linha por compra/NF)."""
+    """Planilha só com o cabeçalho das compras (uma linha por compra/NF), com
+    os mesmos campos exibidos na tabela da tela. Datas e valores são
+    numéricos reais (somáveis/filtráveis no Excel)."""
     wb = Workbook()
     ws = wb.active
     ws.title = "Compras"
@@ -98,7 +186,7 @@ def _gerar_excel_compras(compras_lista: list[dict], qtd_itens_por_compra: dict) 
     for compra in compras_lista:
         ws.append([
             compra.get("numero_nf") or "",
-            _fmt_data_iso(compra.get("data_emissao")),
+            _data_iso_para_date(compra.get("data_emissao")),
             float(compra.get("valor_produtos") or 0),
             float(compra.get("valor_desconto") or 0),
             float(compra.get("valor_total") or 0),
@@ -106,15 +194,24 @@ def _gerar_excel_compras(compras_lista: list[dict], qtd_itens_por_compra: dict) 
             qtd_itens_por_compra.get(compra["id"], 0),
         ])
 
-    _estilizar_cabecalho_planilha(ws, len(cabecalho))
+    ultima_dados = ws.max_row
+    for linha in range(2, ultima_dados + 1):
+        ws.cell(linha, 1).number_format = "@"  # NF como texto (preserva zeros)
+        ws.cell(linha, 2).number_format = "DD/MM/YYYY"
+        ws.cell(linha, 2).alignment = Alignment(horizontal="center")
+        for col in (3, 4, 5, 6):
+            ws.cell(linha, col).number_format = "R$ #,##0.00"
+        ws.cell(linha, 7).number_format = "0"
 
-    larguras = [16, 14, 15, 13, 15, 18, 8]
+    _estilizar_cabecalho_planilha(ws, len(cabecalho))
+    _finalizar_planilha(
+        ws, ultima_dados, len(cabecalho), col_rotulo=2,
+        somas={3: "R$ #,##0.00", 4: "R$ #,##0.00", 5: "R$ #,##0.00", 6: "R$ #,##0.00", 7: "0"},
+    )
+
+    larguras = [16, 14, 16, 14, 16, 18, 8]
     for indice, largura in enumerate(larguras, start=1):
         ws.column_dimensions[ws.cell(row=1, column=indice).column_letter].width = largura
-
-    for linha in ws.iter_rows(min_row=2, min_col=3, max_col=6):
-        for cel in linha:
-            cel.number_format = "#,##0.00"
 
     buffer = BytesIO()
     wb.save(buffer)
@@ -122,11 +219,9 @@ def _gerar_excel_compras(compras_lista: list[dict], qtd_itens_por_compra: dict) 
 
 
 def _gerar_excel_itens_compras(compras_lista: list[dict], itens_lista: list[dict]) -> bytes:
-    """Gera um .xlsx com uma linha por item de compra. Os dados da NF
-    (cabeçalho da compra) são repetidos em toda linha de item que pertence
-    a ela, já que uma mesma compra pode ter vários itens."""
-    compras_por_id = {compra["id"]: compra for compra in compras_lista}
-
+    """Planilha com cabeçalho + itens: uma linha por item de compra. Os dados
+    da NF (cabeçalho da compra) são repetidos em toda linha de item que
+    pertence a ela, já que uma mesma compra pode ter vários itens."""
     itens_por_compra: dict[int, list[dict]] = {}
     for item in itens_lista:
         itens_por_compra.setdefault(item["compra_id"], []).append(item)
@@ -150,12 +245,12 @@ def _gerar_excel_itens_compras(compras_lista: list[dict], itens_lista: list[dict
             key=lambda it: it.get("numero_item") or 0,
         )
         numero_nf = compra.get("numero_nf") or ""
-        data_compra_fmt = _fmt_data_iso(compra.get("data_emissao"))
+        data_compra = _data_iso_para_date(compra.get("data_emissao"))
         for item in itens_da_compra:
             produto = item.get("produtos") or {}
             ws.append([
                 numero_nf,
-                data_compra_fmt,
+                data_compra,
                 item.get("numero_item") or "",
                 produto.get("codigo_interno") or "",
                 produto.get("descricao") or "",
@@ -166,19 +261,101 @@ def _gerar_excel_itens_compras(compras_lista: list[dict], itens_lista: list[dict
                 float(item.get("valor_unit_ajustado") or 0),
             ])
 
-    _estilizar_cabecalho_planilha(ws, len(cabecalho))
+    ultima_dados = max(ws.max_row, 2)
+    for linha in range(2, ultima_dados + 1):
+        ws.cell(linha, 1).number_format = "@"
+        ws.cell(linha, 2).number_format = "DD/MM/YYYY"
+        ws.cell(linha, 2).alignment = Alignment(horizontal="center")
+        ws.cell(linha, 4).number_format = "@"  # código como texto (zeros à esquerda)
+        ws.cell(linha, 6).number_format = "#,##0.####"
+        for col in (7, 8, 9, 10):
+            ws.cell(linha, col).number_format = "R$ #,##0.00"
 
-    larguras = [16, 14, 9, 14, 40, 12, 15, 15, 15, 18]
+    _estilizar_cabecalho_planilha(ws, len(cabecalho))
+    # Totais só onde somar faz sentido (valores unitários ficam de fora).
+    _finalizar_planilha(
+        ws, ultima_dados, len(cabecalho), col_rotulo=5,
+        somas={6: "#,##0.####", 8: "R$ #,##0.00", 9: "R$ #,##0.00"},
+    )
+
+    larguras = [16, 14, 9, 14, 40, 12, 16, 16, 16, 20]
     for indice, largura in enumerate(larguras, start=1):
         ws.column_dimensions[ws.cell(row=1, column=indice).column_letter].width = largura
-
-    for linha in ws.iter_rows(min_row=2, min_col=6, max_col=10):
-        for indice_col, cel in enumerate(linha, start=6):
-            cel.number_format = "#,##0.####" if indice_col == 6 else "#,##0.00"
 
     buffer = BytesIO()
     wb.save(buffer)
     return buffer.getvalue()
+
+
+def _nome_arquivo_compras(prefixo: str, mes_rotulo: str) -> str:
+    """<prefixo>_<mes>_<data>.xlsx, sem acentos nem caracteres inválidos."""
+    import re
+    import unicodedata
+
+    sem_acento = unicodedata.normalize("NFKD", mes_rotulo).encode("ascii", "ignore").decode()
+    mes_limpo = re.sub(r"[^A-Za-z0-9]+", "-", sem_acento).strip("-") or "todos"
+    return f"{prefixo}_{mes_limpo}_{date.today():%Y%m%d}.xlsx"
+
+
+_EXPORT_SO_CABECALHO = "Somente cabeçalho (uma linha por NF)"
+_EXPORT_CABECALHO_ITENS = "Cabeçalho + itens (uma linha por item)"
+
+
+@_dialog("📥 Exportar compras", width="small")
+def _dialog_exportar_compras(
+    compras_lista: list[dict],
+    qtd_itens_por_compra: dict,
+    descricao_filtros: str,
+    mes_rotulo: str,
+):
+    """Exporta TODAS as compras dos filtros atuais (não só a página visível).
+    A planilha é gerada quando o popup abre ou quando o tipo muda."""
+    st.caption(descricao_filtros)
+
+    if not compras_lista:
+        st.info("Nenhuma compra para exportar com os filtros atuais.")
+        return
+
+    tipo = st.radio(
+        "O que exportar?",
+        [_EXPORT_SO_CABECALHO, _EXPORT_CABECALHO_ITENS],
+        key="compras_export_tipo",
+    )
+
+    try:
+        with st.spinner("Gerando planilha..."):
+            if tipo == _EXPORT_SO_CABECALHO:
+                dados = _gerar_excel_compras(compras_lista, qtd_itens_por_compra)
+                nome_arquivo = _nome_arquivo_compras("compras", mes_rotulo)
+                resumo = f"{len(compras_lista)} compra(s) prontas para exportar."
+            else:
+                itens = _buscar_em_lotes(
+                    "compras_itens",
+                    "compra_id",
+                    [c["id"] for c in compras_lista],
+                    "compra_id, numero_item, quantidade, valor_unitario,"
+                    " valor_desconto, valor_total, valor_unit_ajustado,"
+                    " produtos(codigo_interno, descricao)",
+                )
+                dados = _gerar_excel_itens_compras(compras_lista, itens)
+                nome_arquivo = _nome_arquivo_compras("itens_compras", mes_rotulo)
+                resumo = (
+                    f"{len(itens)} item(ns) de {len(compras_lista)} compra(s) "
+                    "prontos para exportar."
+                )
+    except Exception as err:
+        st.error(f"Não foi possível gerar a planilha: {err}")
+        return
+
+    st.success(resumo)
+    st.download_button(
+        "⬇️ Baixar Excel",
+        data=dados,
+        file_name=nome_arquivo,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+        key="compras_download_excel",
+    )
 
 
 def _badge_clipe_arquivos() -> str:
@@ -890,54 +1067,6 @@ def _secao_listagem():
         #    há muitas compras e, principalmente, evita perder itens quando
         #    o limite máximo de linhas do PostgREST é menor que a quantidade
         #    total de registros.
-        def _buscar_em_lotes(
-            tabela: str,
-            coluna_filtro: str,
-            valores: list,
-            colunas_select: str,
-            tamanho_lote: int = 200,
-            tamanho_pagina: int = 1000,
-        ) -> list[dict]:
-            """Busca registros em lotes e pagina cada lote até esgotar os dados.
-
-            O limite máximo de linhas configurado no PostgREST/Supabase pode ser
-            menor que o `.limit(50000)` solicitado pelo cliente. Sem paginação,
-            isso fazia algumas compras aparecerem com zero itens quando seus
-            registros ficavam além da primeira página retornada.
-            """
-            linhas: list[dict] = []
-
-            for inicio in range(0, len(valores), tamanho_lote):
-                lote = valores[inicio:inicio + tamanho_lote]
-                numero_lote = inicio // tamanho_lote + 1
-                offset = 0
-
-                try:
-                    while True:
-                        fim = offset + tamanho_pagina - 1
-                        resp = (
-                            supabase.table(tabela)
-                            .select(colunas_select)
-                            .in_(coluna_filtro, lote)
-                            .range(offset, fim)
-                            .execute()
-                        )
-                        dados_pagina = resp.data or []
-                        linhas.extend(dados_pagina)
-
-                        # Menos que o tamanho da página significa que não há
-                        # mais registros para este lote.
-                        if len(dados_pagina) < tamanho_pagina:
-                            break
-
-                        offset += tamanho_pagina
-                except Exception as err:
-                    st.warning(
-                        f"Erro ao consultar {tabela} (lote {numero_lote}, "
-                        f"a partir da linha {offset}): {err}"
-                    )
-
-            return linhas
 
         compras_com_arquivos: set[int] = set()
         compra_ids_arquivos = [c["id"] for c in compras]
@@ -962,16 +1091,41 @@ def _secao_listagem():
                 cid = row["compra_id"]
                 qtd_itens_por_compra[cid] = qtd_itens_por_compra.get(cid, 0) + 1
 
-        # 4. Cálculo dos Cards (KPIs)
-        total_compras = len(compras)
+        # 3.1 Opções do filtro de Mês/Ano (a partir das compras existentes).
+        #     Calculadas antes dos cards para que os KPIs já reflitam o mês
+        #     escolhido (o valor do widget já está em session_state no rerun).
+        meses_disponiveis = sorted(
+            {
+                (d.year, d.month)
+                for c in compras
+                if (d := _data_iso_para_date(c.get("data_emissao"))) is not None
+            },
+            reverse=True,
+        )
+        opcoes_mes = ["Todos"] + [f"{MESES_PT[m]}/{a}" for (a, m) in meses_disponiveis]
+        if st.session_state.get("compras_filtro_mes", "Todos") not in opcoes_mes:
+            st.session_state["compras_filtro_mes"] = "Todos"
+        mes_selecionado = st.session_state.get("compras_filtro_mes", "Todos")
+
+        compras_do_mes = compras
+        if mes_selecionado != "Todos":
+            ano_f, mes_f = meses_disponiveis[opcoes_mes.index(mes_selecionado) - 1]
+            compras_do_mes = [
+                c for c in compras
+                if (d := _data_iso_para_date(c.get("data_emissao")))
+                and (d.year, d.month) == (ano_f, mes_f)
+            ]
+
+        # 4. Cálculo dos Cards (KPIs) — respeitam o filtro de Mês/Ano
+        total_compras = len(compras_do_mes)
         soma_valor_total = sum(
-            float(item.get("valor_total") or 0) for item in compras
+            float(item.get("valor_total") or 0) for item in compras_do_mes
         )
 
         data_ultima_compra = "-"
-        if compras and compras[0].get("data_emissao"):
+        if compras_do_mes and compras_do_mes[0].get("data_emissao"):
             dt_ultima = datetime.fromisoformat(
-                compras[0]["data_emissao"].replace("Z", "+00:00")
+                compras_do_mes[0]["data_emissao"].replace("Z", "+00:00")
             )
             data_ultima_compra = dt_ultima.strftime("%d/%m/%y")
 
@@ -1020,9 +1174,12 @@ def _secao_listagem():
         # 5. Filtros da listagem
         # Os filtros ficam abaixo dos KPIs e imediatamente antes da tabela,
         # conforme o layout solicitado.
-        col_filtro_nf, col_filtro_pct, col_exportar = st.columns(
-            [2.2, 1.3, 0.4], vertical_alignment="center"
+        col_filtro_mes, col_filtro_nf, col_filtro_pct, col_exportar = st.columns(
+            [1.5, 2.0, 1.4, 0.4], vertical_alignment="center"
         )
+
+        with col_filtro_mes:
+            st.selectbox("Mês/Ano da compra", opcoes_mes, key="compras_filtro_mes")
 
         with col_filtro_nf:
             filtro_nf = st.text_input(
@@ -1040,7 +1197,7 @@ def _secao_listagem():
                 help="Quando ativado, mostra somente NFs que possuem percentual de desconto nos itens.",
             )
 
-        compras_filtradas = compras
+        compras_filtradas = compras_do_mes
 
         if filtro_nf:
             termo_nf = filtro_nf.casefold()
@@ -1055,73 +1212,39 @@ def _secao_listagem():
                 if float(compra.get("pct_desconto_item") or 0) > 0
             ]
 
-        # 5.1 Exportação em Excel — botão de ícone que abre um popup com as
-        # opções de download. Respeita os filtros acima (NF / % desconto),
-        # mas ignora a paginação: exporta todas as compras filtradas de uma vez.
+        # 5.1 Exportação em Excel — botão de ícone que abre um popup (mesmo
+        # padrão da tela de vendas). Respeita os filtros acima (Mês/Ano, NF e
+        # % desconto), mas ignora a paginação: exporta tudo de uma vez.
         with col_exportar:
-            with st.popover("⬇️", use_container_width=True, help="Exportar para Excel"):
-                st.caption("📊 Compras (uma linha por NF)")
-                if st.button(
-                    "Gerar Excel — Compras",
-                    use_container_width=True,
-                    key="btn_gerar_excel_compras",
-                    disabled=not compras_filtradas,
-                ):
-                    with st.spinner("Gerando planilha de compras..."):
-                        st.session_state["_excel_compras_bytes"] = _gerar_excel_compras(
-                            compras_filtradas, qtd_itens_por_compra
-                        )
-                if st.session_state.get("_excel_compras_bytes"):
-                    st.download_button(
-                        "⬇️ Baixar compras.xlsx",
-                        data=st.session_state["_excel_compras_bytes"],
-                        file_name=f"compras_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True,
-                        key="dl_excel_compras",
-                    )
-
-                st.divider()
-
-                st.caption("📄 Itens das compras (uma linha por item)")
-                if st.button(
-                    "Gerar Excel — Itens das compras",
-                    use_container_width=True,
-                    key="btn_gerar_excel_itens",
-                    disabled=not compras_filtradas,
-                ):
-                    with st.spinner("Consultando itens e gerando planilha..."):
-                        compra_ids_export = [c["id"] for c in compras_filtradas]
-                        itens_completos = _buscar_em_lotes(
-                            "compras_itens",
-                            "compra_id",
-                            compra_ids_export,
-                            "compra_id, numero_item, quantidade, valor_unitario,"
-                            " valor_desconto, valor_total, valor_unit_ajustado,"
-                            " produtos(codigo_interno, descricao)",
-                        )
-                        st.session_state["_excel_itens_bytes"] = _gerar_excel_itens_compras(
-                            compras_filtradas, itens_completos
-                        )
-                if st.session_state.get("_excel_itens_bytes"):
-                    st.download_button(
-                        "⬇️ Baixar itens_compras.xlsx",
-                        data=st.session_state["_excel_itens_bytes"],
-                        file_name=f"itens_compras_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True,
-                        key="dl_excel_itens",
-                    )
+            if st.button(
+                "📥",
+                key="compras_btn_exportar",
+                help="Exportar para Excel (respeita os filtros de Mês/Ano, NF e % desconto)",
+                use_container_width=True,
+            ):
+                partes_filtro = [
+                    f"Período: **{mes_selecionado if mes_selecionado != 'Todos' else 'Todo período'}**"
+                ]
+                if filtro_nf:
+                    partes_filtro.append(f"NF contém: **{filtro_nf}**")
+                if mostrar_pct:
+                    partes_filtro.append("Somente NFs com desconto %")
+                _dialog_exportar_compras(
+                    compras_filtradas,
+                    qtd_itens_por_compra,
+                    " · ".join(partes_filtro),
+                    mes_selecionado,
+                )
 
         if not compras_filtradas:
-            if filtro_nf or mostrar_pct:
+            if filtro_nf or mostrar_pct or mes_selecionado != "Todos":
                 st.info("Nenhuma NF encontrada com os filtros selecionados.")
             else:
                 st.info("Nenhuma compra registrada.")
             return
 
         # 6. Paginação da listagem
-        filtro_atual = len(compras_filtradas)
+        filtro_atual = (len(compras_filtradas), mes_selecionado)
         if st.session_state.get("compras_total_anterior") != filtro_atual:
             st.session_state["compras_total_anterior"] = filtro_atual
             reset_paginacao("compras")
