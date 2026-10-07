@@ -164,13 +164,14 @@ def _injetar_estilo_sidebar():
 
 
 # 3. Estrutura de páginas: rótulo (com ícone) -> função da tela
+# A primeira página do dicionário é a aberta por padrão.
 PAGINAS = {
+    "📈 Relatórios": tela_report,
     "📦 Produtos": tela_produtos,
     "🛍️ Compras": tela_compras,
     "💰 Vendas": tela_vendas,
     "📊 Estoque": tela_estoque_saldo,
     "👤 Clientes": tela_clientes,
-    "📈 Relatórios": tela_report,
 }
 
 if usuario_e_admin():
