@@ -1,4 +1,5 @@
 import html
+import io
 from datetime import date
 import streamlit as st
 from db import supabase
@@ -591,6 +592,109 @@ def _dialog_editar_preco_venda(produto_id, codigo_interno, descricao, preco_atua
             st.success("Preço de venda atualizado.")
             st.rerun()
 
+def _gerar_excel_estoque(itens_exportar: list[dict]) -> bytes:
+    """Planilha com a tabela de estoque (uma linha por produto), com valores
+    numéricos reais, filtro, cabeçalho fixo e linha de total da quantidade."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Estoque"
+
+    cabecalhos = [
+        "Cód. Produto", "Produto", "Qtde. Estoque", "Preço Compra",
+        "Preço Venda", "Idade Produto (dias)", "Data Últ. Compra",
+    ]
+    fill = PatternFill(fill_type="solid", fgColor="1F4E78")
+    fonte = Font(color="FFFFFF", bold=True)
+    for col, titulo in enumerate(cabecalhos, 1):
+        c = ws.cell(1, col, titulo)
+        c.fill = fill
+        c.font = fonte
+        c.alignment = Alignment(horizontal="center", vertical="center")
+
+    linha = 2
+    for item in itens_exportar:
+        idade = item.get("idade_media")
+        try:
+            data_compra = date.fromisoformat(str(item.get("data_ultima_compra") or "")[:10])
+        except ValueError:
+            data_compra = None
+        valores = [
+            item["codigo_interno"],
+            item["descricao"],
+            float(item["saldo"] or 0),
+            float(item["preco_compra"] or 0),
+            float(item["preco_venda"] or 0),
+            None if idade is None else round(float(idade)),
+            data_compra,
+        ]
+        for col, valor in enumerate(valores, 1):
+            ws.cell(linha, col, valor)
+        ws.cell(linha, 1).number_format = "@"  # código como texto (preserva zeros à esquerda)
+        ws.cell(linha, 3).number_format = "0.##"
+        for col in (4, 5):
+            ws.cell(linha, col).number_format = "R$ #,##0.00"
+        ws.cell(linha, 6).number_format = "0"
+        ws.cell(linha, 7).number_format = "DD/MM/YYYY"
+        ws.cell(linha, 7).alignment = Alignment(horizontal="center")
+        linha += 1
+
+    ultima_dados = linha - 1
+
+    # Linha de total com SUBTOTAL: acompanha os filtros aplicados na própria planilha.
+    ws.cell(linha, 2, "TOTAL").font = Font(bold=True)
+    ws.cell(linha, 2).alignment = Alignment(horizontal="right")
+    borda = Border(top=Side(style="thin"))
+    for col in range(1, len(cabecalhos) + 1):
+        ws.cell(linha, col).border = borda
+    letra = get_column_letter(3)
+    c = ws.cell(linha, 3, f"=SUBTOTAL(109,{letra}2:{letra}{ultima_dados})")
+    c.font = Font(bold=True)
+    c.number_format = "0.##"
+
+    larguras = [16, 45, 14, 14, 14, 20, 16]
+    for i, largura in enumerate(larguras, 1):
+        ws.column_dimensions[get_column_letter(i)].width = largura
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(cabecalhos))}{ultima_dados}"
+
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    return buffer.getvalue()
+
+
+@_dialog("📥 Exportar estoque", width="small")
+def _dialog_exportar_estoque(itens_exportar: list[dict], descricao_filtros: str):
+    """Oferece o download em Excel da tabela inteira (todas as páginas),
+    respeitando os filtros e a ordenação aplicados. A planilha só é gerada
+    quando o popup abre."""
+    st.caption(f"Filtros aplicados: **{descricao_filtros}**")
+
+    if not itens_exportar:
+        st.info("Nenhum produto para exportar com os filtros atuais.")
+        return
+
+    try:
+        with st.spinner("Gerando planilha..."):
+            dados = _gerar_excel_estoque(itens_exportar)
+    except Exception as e:
+        st.error(f"Não foi possível gerar a planilha: {e}")
+        return
+
+    st.success(f"{len(itens_exportar)} produto(s) prontos para exportar.")
+    st.download_button(
+        "⬇️ Baixar Excel",
+        data=dados,
+        file_name=f"estoque_{date.today():%Y%m%d}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+        key="estoque_download_excel",
+    )
+
+
 def _carregar_estoque_completo():
     """Carrega todo o estoque em lotes para não ficar limitado ao máximo
     de linhas retornado pelo PostgREST/Supabase em uma única consulta."""
@@ -693,14 +797,18 @@ def _secao_estoque_atual():
             item["status"] = "🟢 OK"
 
     # KPIs
-    # Consideram todos os itens carregados, antes dos filtros da tabela.
-    qtde_pecas_estoque = sum(i["saldo"] for i in itens)
-    qtde_distinta_pecas = len({i["id"] for i in itens})
+    # Consideram somente produtos com estoque maior que zero (saldos zerados
+    # ou negativos ficam de fora), antes dos filtros da tabela.
+    itens_em_estoque = [i for i in itens if i["saldo"] > 0]
+
+    qtde_pecas_estoque = sum(i["saldo"] for i in itens_em_estoque)
+    qtde_distinta_pecas = len({i["id"] for i in itens_em_estoque})
+    # Valor total = saldo x preço da última compra / preço de venda sugerida.
     valor_estoque_compra = sum(
-        i["saldo"] * i["preco_compra"] for i in itens
+        i["saldo"] * i["preco_compra"] for i in itens_em_estoque
     )
     valor_estoque_venda = sum(
-        i["saldo"] * i["preco_venda"] for i in itens
+        i["saldo"] * i["preco_venda"] for i in itens_em_estoque
     )
 
     col_kpi_qtde, col_kpi_valor = st.columns(2)
@@ -714,8 +822,8 @@ def _secao_estoque_atual():
     with col_kpi_valor:
         _renderizar_kpi_grupo(
             "💰 Valor de Estoque",
-            ("Preço de compra", _fmt_moeda(valor_estoque_compra)),
-            ("Preço de venda", _fmt_moeda(valor_estoque_venda)),
+            ("Última compra", _fmt_moeda(valor_estoque_compra)),
+            ("Venda sugerida", _fmt_moeda(valor_estoque_venda)),
         )
 
     # Indicador-resumo da idade do estoque: quantidade de produtos em cada faixa.
@@ -727,7 +835,7 @@ def _secao_estoque_atual():
         "idade-laranja": 0,
         "idade-vermelha": 0,
     }
-    for item_kpi in itens:
+    for item_kpi in itens_em_estoque:
         classe_kpi = _classificar_idade(item_kpi.get("idade_media"))["classe"]
         contagem_idade[classe_kpi] = contagem_idade.get(classe_kpi, 0) + 1
 
@@ -790,7 +898,7 @@ def _secao_estoque_atual():
     st.markdown("---")
 
     # Filtros e ordenação
-    col_busca, col_ordenar, col_toggles = st.columns([50, 35, 15])
+    col_busca, col_ordenar, col_toggles = st.columns([44, 31, 25])
 
     with col_busca:
         # Mesmo componente pesquisável usado em produtos.py: dropdown com
@@ -825,8 +933,31 @@ def _secao_estoque_atual():
     with col_toggles:
         # Os dois toggles ficam empilhados (um embaixo do outro) na mesma
         # coluna, já que juntos ocupam só 15% da largura da barra.
-        mostrar_negativo = st.toggle("🔴 Mostrar zerado/negativo", value=False)
-        mostrar_somente_editados = st.toggle("✏️ Somente editados", value=False)
+        col_toggle_itens, col_exportar = st.columns([5, 1], vertical_alignment="center")
+        with col_toggle_itens:
+            mostrar_negativo = st.toggle("🔴 Mostrar zerado/negativo", value=False)
+            mostrar_somente_editados = st.toggle("✏️ Somente editados", value=False)
+        with col_exportar:
+            # Botão quadrado pequeno (mesmo padrão da tela de Vendas). O popup
+            # é aberto mais abaixo, depois que os filtros/ordenação são aplicados.
+            st.markdown(
+                """
+                <style>
+                div[class*="st-key-estoque_btn_exportar"] button {
+                    width: 2.5rem;
+                    min-width: 2.5rem;
+                    height: 2.5rem;
+                    padding: 0;
+                }
+                </style>
+                """,
+                unsafe_allow_html=True,
+            )
+            clicou_exportar = st.button(
+                "📥",
+                key="estoque_btn_exportar",
+                help="Exportar para Excel (respeita os filtros e a ordenação atuais)",
+            )
 
     # Termo digitado e modo de busca (código/descrição) ficam disponíveis em
     # session_state depois da chamada acima, mesmo quando o usuário ainda não
@@ -881,6 +1012,26 @@ def _secao_estoque_atual():
             return item[campo_ordenacao]
 
     itens.sort(key=_chave_ordenacao, reverse=ordem_decrescente)
+
+    if clicou_exportar:
+        rotulos_idade = {
+            "idade-verde": "Idade 0-60 dias",
+            "idade-amarela": "Idade >60-120 dias",
+            "idade-laranja": "Idade >120-180 dias",
+            "idade-vermelha": "Idade >180 dias",
+        }
+        filtros_ativos = []
+        if mostrar_negativo:
+            filtros_ativos.append("Zerado/negativo")
+        elif not mostrar_somente_editados:
+            filtros_ativos.append("Somente com estoque")
+        if mostrar_somente_editados:
+            filtros_ativos.append("Somente editados")
+        if filtro_idade_selecionado:
+            filtros_ativos.append(rotulos_idade.get(filtro_idade_selecionado, filtro_idade_selecionado))
+        if produto_id_selecionado is not None or termo_busca_produto:
+            filtros_ativos.append("Busca de produto")
+        _dialog_exportar_estoque(itens, " · ".join(filtros_ativos))
 
     if not itens:
         if mostrar_negativo:

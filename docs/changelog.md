@@ -29,3 +29,6 @@ Tela admin reseta comissão
 
 ## 1.7.0 - 05/10/2026
 Módulo de testes
+
+## 1.7.1 - 07/10/2026
+Ajuste tela de estoque (KPI e botão Exportar)
