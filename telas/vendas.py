@@ -737,6 +737,40 @@ def _limpar_itens_venda_nova():
         ss.pop(chave, None)
 
 
+def _calcular_desconto_item(texto, em_percentual: bool, quantidade, valor_lista) -> float:
+    """Desconto do item em R$, a partir do que foi digitado.
+
+    Em percentual, o % incide sobre o valor total do item (quantidade x valor
+    lista) e o resultado é arredondado a centavos. O banco continua recebendo
+    sempre o desconto em R$."""
+    valor = _parse_valor_input(texto, 0.0)
+    if em_percentual:
+        return round(float(quantidade) * float(valor_lista) * valor / 100, 2)
+    return valor
+
+
+def _fmt_pct_desconto(valor) -> str:
+    return f"{float(valor or 0):.2f}".replace(".", ",") + "%"
+
+
+def _cb_trocar_tipo_desconto():
+    """Toggle '%' do desconto: converte o número digitado para a outra unidade,
+    mantendo o mesmo desconto (R$ 10,00 de R$ 120,00 vira 8,33%, e vice-versa)."""
+    ss = st.session_state
+    em_percentual = bool(ss.get("vitem_desc_pct"))  # novo estado do toggle
+    quantidade = max(1, int(ss.get("vitem_qtd", 1)))
+    valor_lista = _parse_valor_input(
+        ss.get("vitem_valor_lista_input"), ss.get("vitem_valor_lista", 0)
+    )
+    base = quantidade * valor_lista
+    atual = _parse_valor_input(ss.get("vitem_desconto"), 0.0)
+    if em_percentual:  # estava em R$ -> passa para %
+        novo = atual / base * 100 if base else 0.0
+    else:  # estava em % -> passa para R$
+        novo = base * atual / 100
+    ss["vitem_desconto"] = _fmt_valor_input(novo)
+
+
 def _definir_form_item(produto, quantidade, valor_lista, valor_desconto, aberto=False):
     """Carrega valores no formulário único de item. Só deve ser chamada em
     callbacks ou antes de os widgets do formulário serem criados na execução.
@@ -752,6 +786,10 @@ def _definir_form_item(produto, quantidade, valor_lista, valor_desconto, aberto=
     ss["vitem_valor_lista_input"] = _fmt_valor_input(valor_lista)
     ss["vitem_bloqueio"] = bool(aberto)
     ss["vitem_desconto"] = _fmt_valor_input(valor_desconto)
+    # Valor carregado está em R$. Com desconto zero (novo item) mantém a unidade
+    # que o usuário vinha usando; com desconto > 0 (editar item) volta para R$.
+    if valor_desconto:
+        ss["vitem_desc_pct"] = False
 
 
 def _cb_adicionar_item(produtos_opcoes: dict):
@@ -769,7 +807,9 @@ def _cb_adicionar_item(produtos_opcoes: dict):
     valor_lista = _parse_valor_input(
         ss.get("vitem_valor_lista_input"), ss.get("vitem_valor_lista", 0)
     )
-    valor_desconto = _parse_valor_input(ss.get("vitem_desconto"), 0.0)
+    valor_desconto = _calcular_desconto_item(
+        ss.get("vitem_desconto"), bool(ss.get("vitem_desc_pct")), quantidade, valor_lista
+    )
     valor_final = quantidade * valor_lista - valor_desconto
 
     saldo = produto.get("saldo")
@@ -1132,7 +1172,7 @@ def _render_form_item(produtos_opcoes: dict, itens: list):
                     produto, 1, produto.get("estoque_preco_venda_sugerida") or 0, 0.0
                 )
 
-            col_qtd, col_lista, col_desc, col_final = st.columns(4)
+            col_qtd, col_lista, col_desc, col_final = st.columns([1, 1, 1.45, 1])
 
             with col_qtd:
                 st.markdown("**Quantidade**")
@@ -1171,13 +1211,46 @@ def _render_form_item(produtos_opcoes: dict, itens: list):
                 ss["vitem_valor_lista"] = valor_lista
 
             with col_desc:
-                st.markdown("**Desconto**")
+                # O equivalente aparece na linha do título, que é desenhada ANTES do
+                # campo; por isso usa o texto já digitado (session_state), que o
+                # Streamlit atualiza a cada alteração, e não o retorno do campo.
+                em_pct_atual = bool(ss.get("vitem_desc_pct"))
+                desconto_previa = _calcular_desconto_item(
+                    ss.get("vitem_desconto"), em_pct_atual, quantidade, valor_lista
+                )
+                total_item = quantidade * valor_lista
+                if em_pct_atual:
+                    equivalente = _fmt_moeda(desconto_previa)
+                else:
+                    equivalente = _fmt_pct_desconto(
+                        desconto_previa / total_item * 100 if total_item else 0
+                    )
+
+                col_rotulo_desc, col_tipo_desc = st.columns([3.2, 1], vertical_alignment="center")
+                with col_rotulo_desc:
+                    st.markdown(
+                        f"**Desconto ({'%' if em_pct_atual else 'R$'})** "
+                        f"<span style='opacity:0.65;font-size:0.85em'>= {equivalente}</span>",
+                        unsafe_allow_html=True,
+                    )
+                with col_tipo_desc:
+                    desconto_em_pct = st.toggle(
+                        "%",
+                        key="vitem_desc_pct",
+                        help=(
+                            "Desligado: desconto em R$. Ligado: desconto em percentual, "
+                            "calculado sobre o valor total do item (quantidade x valor lista)."
+                        ),
+                        on_change=_cb_trocar_tipo_desconto,
+                    )
                 desconto_texto = st.text_input(
                     "Desconto",
                     key="vitem_desconto",
                     label_visibility="collapsed",
                 )
-                valor_desconto = _parse_valor_input(desconto_texto, 0.0)
+                valor_desconto = _calcular_desconto_item(
+                    desconto_texto, desconto_em_pct, quantidade, valor_lista
+                )
 
             with col_final:
                 st.markdown("**Valor final**")
@@ -1428,7 +1501,6 @@ def _dialog_editar_venda(
     salvar = cancelar = excluir = False
     salvar_header = False
     itens_validos: list[dict] = []
-    nomes_clientes = [c.get("nome") for c in clientes_disponiveis if c.get("nome")]
     nomes_feiras = [f["nome_feira"] for f in feiras_disponiveis]
 
     # Todos os campos do popup ficam dentro de uma única borda.
@@ -1564,13 +1636,39 @@ def _dialog_editar_venda(
             col_cliente, col_data, col_forma, col_status = st.columns(4)
 
             with col_cliente:
-                cliente = campo_cliente(
-                    "Cliente",
-                    value=header_base.get("cliente", ""),
-                    opcoes=nomes_clientes,
-                    placeholder="Digite ou selecione o cliente...",
-                    key=f"venda_cliente_{sufixo}",
+                # O cliente só é liberado depois de escolher o canal, e as sugestões
+                # são apenas os clientes vinculados a esse canal (clientes.canal_id).
+                canal_id_sel = next(
+                    (c["id"] for c in canais_disponiveis if c["nome"] == canal_nome), None
                 )
+                if canal_id_sel is None:
+                    st.text_input(
+                        "Cliente",
+                        value="",
+                        placeholder="Selecione o canal primeiro",
+                        disabled=True,
+                        key=f"venda_cliente_bloqueado_{sufixo}",
+                    )
+                    cliente = ""
+                else:
+                    nomes_clientes_canal = [
+                        c["nome"] for c in clientes_disponiveis
+                        if c.get("nome") and c.get("canal_id") == canal_id_sel
+                    ]
+                    # O canal entra na key: ao trocar de canal o campo é recriado e o
+                    # cliente do canal anterior não fica selecionado por engano.
+                    mesmo_canal_salvo = canal_nome == header_base.get("canal_nome")
+                    cliente = campo_cliente(
+                        "Cliente",
+                        value=header_base.get("cliente", "") if mesmo_canal_salvo else "",
+                        opcoes=nomes_clientes_canal,
+                        placeholder=(
+                            "Digite ou selecione o cliente..."
+                            if nomes_clientes_canal
+                            else "Nenhum cliente neste canal — digite para cadastrar"
+                        ),
+                        key=f"venda_cliente_{sufixo}_{canal_id_sel}",
+                    )
 
             with col_data:
                 data_venda_texto = campo_mascarado(
@@ -1968,7 +2066,7 @@ def _carregar_cadastros_popup():
     try:
         clientes = buscar_todos(
             lambda: supabase.table("clientes")
-            .select("id, nome")
+            .select("id, nome, canal_id")
             .order("nome")
             .order("id")
         )

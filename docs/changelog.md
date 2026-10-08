@@ -38,3 +38,6 @@ Melhoria tela Clientes, filtro Mesano tela compras e export
 
 ## 1.7.3 - 07/10/2026
 Tela Reports
+
+## 1.7.4 - 08/10/2026
+Tela Vendas ADD - Cliente vinculado ao canal e desconto%
