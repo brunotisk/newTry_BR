@@ -1003,6 +1003,458 @@ def _secao_info_sistema():
             st.markdown(changelog)
 
 
+
+
+def _csv_download(dados: list[dict], nome: str) -> None:
+    """Exibe botão de download CSV sem depender de pandas."""
+    import csv
+    import io
+
+    if not dados:
+        st.info("Não há registros para exportar.")
+        return
+    buffer = io.StringIO()
+    colunas = list(dict.fromkeys(chave for linha in dados for chave in linha.keys()))
+    writer = csv.DictWriter(buffer, fieldnames=colunas, delimiter=";", extrasaction="ignore")
+    writer.writeheader()
+    writer.writerows(dados)
+    st.download_button(
+        f"⬇️ Baixar {nome} (CSV)",
+        data=buffer.getvalue().encode("utf-8-sig"),
+        file_name=nome,
+        mime="text/csv",
+        use_container_width=True,
+        key=f"download_{nome.replace('.', '_')}",
+    )
+
+
+def _carregar_todos_produtos_fotos() -> list[dict]:
+    """Busca todos os produtos, contornando o limite padrão de paginação do Supabase."""
+    todos = []
+    inicio = 0
+    tamanho = 1000
+    while True:
+        lote = (
+            supabase.table("produtos")
+            .select("id, codigo_interno, descricao, foto_url, produto_descricao_site")
+            .order("codigo_interno")
+            .range(inicio, inicio + tamanho - 1)
+            .execute()
+            .data
+            or []
+        )
+        todos.extend(lote)
+        if len(lote) < tamanho:
+            break
+        inicio += tamanho
+    return todos
+
+
+def _secao_auditoria_fotos():
+    """Audita fotos dos produtos contra o catálogo público e gerencia o Storage."""
+    st.subheader("🖼️ Auditoria de Fotos dos Produtos")
+    st.caption(
+        "Compara `produtos.codigo_interno` com o SKU das variantes no site, "
+        "verifica as URLs atuais e permite copiar fotos para o Storage público do Supabase."
+    )
+    st.info(
+        "A auditoria atualiza `produtos.produto_descricao_site` com o título encontrado "
+        "no catálogo público para cada SKU correspondente. As fotos só são enviadas ao "
+        "Storage e `produtos.foto_url` só é atualizado quando você executar uma ação de envio."
+    )
+
+    try:
+        # Serviço de auditoria separado da camada de interface.
+        from servicos.busca_fotos_produtos import (
+            LOJA_PADRAO, BUCKET, ACAO_COPIAR, ACAO_MIGRAR,
+            baixar_catalogo, indexar_por_sku, auditar,
+            testar_urls, processar_lote, enviar_foto_do_produto,
+            gravar_descricao_site, gravar_descricoes_site_lote,
+        )
+    except Exception as e:
+        st.error(
+            "Não foi possível carregar `servicos/busca_fotos_produtos.py`. Confirme que o arquivo "
+            f"está no projeto e que requests e Pillow estão instalados. Detalhe: {e}"
+        )
+        return
+
+    loja = st.text_input(
+        "URL da loja",
+        value=LOJA_PADRAO,
+        key="admin_fotos_url_loja",
+        help="Endereço público da loja Shopify.",
+    ).strip().rstrip("/")
+    bucket = st.text_input(
+        "Bucket do Supabase Storage",
+        value=BUCKET,
+        key="admin_fotos_bucket_v2",
+    ).strip() or BUCKET
+
+    col_auditar, col_limpar = st.columns([1, 1])
+    with col_auditar:
+        executar_auditoria = st.button(
+            "🔎 Auditar fotos agora",
+            type="primary",
+            use_container_width=True,
+            key="admin_fotos_auditar",
+        )
+    with col_limpar:
+        limpar_resultado = st.button(
+            "Limpar resultado",
+            use_container_width=True,
+            key="admin_fotos_limpar",
+        )
+
+    col_cache, col_urls = st.columns(2)
+    with col_cache:
+        atualizar_catalogo = st.checkbox(
+            "Baixar catálogo novamente (ignorar cache)",
+            value=False,
+            key="admin_fotos_atualizar_catalogo",
+            help="Por padrão, reutiliza por 30 minutos o catálogo baixado nesta sessão, reduzindo chamadas à loja e o risco de HTTP 429.",
+        )
+    with col_urls:
+        testar_todas_urls = st.checkbox(
+            "Testar acessibilidade de todas as URLs (mais lento)",
+            value=False,
+            key="admin_fotos_testar_urls",
+            help="Faz requisições HTTP para cada URL de foto. Deixe desmarcado para uma auditoria mais rápida; você pode testar as URLs quando precisar.",
+        )
+
+    if limpar_resultado:
+        for chave_estado in ("admin_fotos_auditoria", "admin_fotos_urls_testadas"):
+            st.session_state.pop(chave_estado, None)
+        st.rerun()
+
+    if executar_auditoria:
+        if not loja.startswith(("https://", "http://")):
+            st.error("Informe uma URL válida começando com http:// ou https://.")
+            return
+        try:
+            with st.spinner("Consultando produtos do banco e catálogo do site..."):
+                produtos_db = _carregar_todos_produtos_fotos()
+                progresso = st.progress(0, text="Preparando catálogo público...")
+                def _progresso(pagina, total):
+                    progresso.progress(min(0.85, pagina / 100), text=f"Catálogo: página {pagina} — {total} produtos")
+                avisos_catalogo = []
+                cache_catalogo = st.session_state.get("admin_fotos_catalogo_cache")
+                loja_cache = st.session_state.get("admin_fotos_catalogo_cache_loja")
+                cache_em = st.session_state.get("admin_fotos_catalogo_cache_em")
+                cache_valido = (
+                    bool(cache_catalogo)
+                    and loja_cache == loja
+                    and isinstance(cache_em, datetime)
+                    and datetime.now() - cache_em < timedelta(minutes=30)
+                )
+                if cache_valido and not atualizar_catalogo:
+                    catalogo = cache_catalogo
+                    progresso.progress(0.85, text=f"Reutilizando catálogo em cache ({len(catalogo)} produtos)")
+                else:
+                    catalogo = baixar_catalogo(loja, progresso=_progresso, avisos=avisos_catalogo)
+                    if catalogo:
+                        st.session_state["admin_fotos_catalogo_cache"] = catalogo
+                        st.session_state["admin_fotos_catalogo_cache_loja"] = loja
+                        st.session_state["admin_fotos_catalogo_cache_em"] = datetime.now()
+                for aviso_catalogo in avisos_catalogo:
+                    st.warning(aviso_catalogo)
+                if not catalogo:
+                    st.error(
+                        "Não foi possível obter nenhuma página do catálogo. "
+                        "A auditoria foi interrompida para evitar resultados incorretos. "
+                        "Tente novamente mais tarde."
+                    )
+                    return
+                indice_site = indexar_por_sku(catalogo, loja)
+                linhas = auditar(produtos_db, indice_site, bucket=bucket)
+                # Persiste o título do produto no site para os SKUs que tiveram correspondência.
+                # Um erro de gravação é mostrado sem descartar os resultados da auditoria.
+                atualizadas_descricao = 0
+                falhas_descricao = []
+                produtos_por_id = {p.get("id"): p for p in produtos_db}
+                descricoes_pendentes = []
+                linhas_por_id = {}
+                for linha in linhas:
+                    descricao_site = str(linha.get("produto_no_site") or "").strip()
+                    if not descricao_site or linha.get("situacao_site") == "nao_encontrado":
+                        continue
+                    produto_id = linha.get("produto_id")
+                    descricao_anterior = str((produtos_por_id.get(produto_id) or {}).get("produto_descricao_site") or "").strip()
+                    if descricao_site == descricao_anterior:
+                        linha["produto_descricao_site"] = descricao_anterior
+                        continue
+                    descricoes_pendentes.append({"id": produto_id, "descricao": descricao_site})
+                    linhas_por_id[produto_id] = linha
+                if descricoes_pendentes:
+                    try:
+                        # Caminho rápido: atualiza todas as descrições em uma única chamada ao banco.
+                        atualizadas_descricao = gravar_descricoes_site_lote(supabase, descricoes_pendentes)
+                        for item in descricoes_pendentes:
+                            linhas_por_id[item["id"]]["produto_descricao_site"] = item["descricao"]
+                    except Exception:
+                        # Compatibilidade com bancos nos quais a função SQL ainda não foi criada.
+                        # Funciona, mas é mais lento; o SQL do pacote habilita a gravação em lote.
+                        for item in descricoes_pendentes:
+                            try:
+                                gravar_descricao_site(supabase, item["id"], item["descricao"])
+                                linhas_por_id[item["id"]]["produto_descricao_site"] = item["descricao"]
+                                atualizadas_descricao += 1
+                            except Exception as erro_descricao:
+                                falhas_descricao.append({
+                                    "codigo_interno": linhas_por_id[item["id"]].get("codigo_interno"),
+                                    "erro": f"{type(erro_descricao).__name__}: {erro_descricao}",
+                                })
+                status_urls = {}
+                if testar_todas_urls:
+                    progresso.progress(0.86, text="Verificando acessibilidade das URLs (etapa mais demorada)...")
+                    urls = sorted({
+                        str(url).strip()
+                        for linha in linhas
+                        for url in (linha.get("foto_site"), linha.get("foto_atual_url"))
+                        if str(url or "").strip().startswith(("https://", "http://"))
+                    })
+                    status_urls = testar_urls(urls) if urls else {}
+                else:
+                    progresso.progress(0.98, text="Pulando teste individual das URLs para concluir mais rápido...")
+                for linha in linhas:
+                    url_site = str(linha.get("foto_site") or "").strip()
+                    url_atual = str(linha.get("foto_atual_url") or "").strip()
+                    if testar_todas_urls:
+                        linha["url_site_testada"] = status_urls.get(url_site, "sem_url") if url_site else "sem_url"
+                        linha["url_banco_testada"] = status_urls.get(url_atual, "sem_url") if url_atual else "sem_url"
+                    else:
+                        linha["url_site_testada"] = "não testada" if url_site else "sem_url"
+                        linha["url_banco_testada"] = "não testada" if url_atual else "sem_url"
+                    if testar_todas_urls and linha.get("acao") == "ok" and url_atual and status_urls.get(url_atual) == "quebrada":
+                        linha["acao"] = "verificar_url_storage"
+                st.session_state["admin_fotos_auditoria"] = linhas
+                st.session_state["admin_fotos_urls_testadas"] = status_urls
+                st.success(
+                    f"Auditoria concluída: {len(produtos_db)} produtos cadastrados auditados; "
+                    f"{atualizadas_descricao} descrição(ões) do site atualizada(s) no banco."
+                )
+                if not testar_todas_urls:
+                    st.caption("Para acelerar a auditoria, o teste HTTP individual das fotos foi pulado. Marque a opção acima se precisar validar as URLs.")
+                if falhas_descricao:
+                    st.warning(
+                        "Algumas descrições não foram gravadas em `produto_descricao_site`. "
+                        "Confirme se a coluna foi criada no banco e veja os detalhes abaixo."
+                    )
+                    st.dataframe(falhas_descricao, use_container_width=True, hide_index=True)
+        except Exception as e:
+            st.error(f"Falha ao executar a auditoria: {type(e).__name__}: {e}")
+            return
+
+    linhas = st.session_state.get("admin_fotos_auditoria")
+    if linhas is None:
+        st.caption("Clique em **Auditar fotos agora** para consultar o banco e o catálogo do site.")
+        return
+
+    total = len(linhas)
+    sem_foto = sum(1 for r in linhas if r.get("foto_atual_tipo") == "sem_foto")
+    storage_ok = sum(1 for r in linhas if r.get("foto_atual_tipo") == "storage" and r.get("url_banco_testada") == "ok")
+    url_quebrada = sum(1 for r in linhas if "quebrada" in (r.get("url_banco_testada"), r.get("url_site_testada")))
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Produtos auditados", total)
+    k2.metric("Sem foto no banco", sem_foto)
+    k3.metric("Fotos no Storage acessíveis", storage_ok)
+    k4.metric("URLs quebradas", url_quebrada)
+
+    st.markdown("#### Resultado da auditoria")
+    filtro = st.multiselect(
+        "Filtrar por ação",
+        options=sorted({str(r.get("acao") or "") for r in linhas}),
+        default=sorted({str(r.get("acao") or "") for r in linhas}),
+        key="admin_fotos_filtro_acao",
+    )
+    exibidas = [r for r in linhas if str(r.get("acao") or "") in filtro]
+    colunas_visiveis = [
+        "codigo_interno", "descricao", "produto_no_site", "produto_descricao_site",
+        "situacao_site", "foto_atual_tipo", "url_banco_testada", "url_site_testada", "acao",
+        "pagina_site", "foto_site", "foto_atual_url", "origem_copia",
+    ]
+    st.dataframe(
+        [{c: r.get(c, "") for c in colunas_visiveis} for r in exibidas],
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "pagina_site": st.column_config.LinkColumn("Página no site"),
+            "foto_site": st.column_config.LinkColumn("Foto no site"),
+            "foto_atual_url": st.column_config.LinkColumn("Foto atual no banco"),
+            "origem_copia": st.column_config.LinkColumn("Origem da cópia"),
+        },
+    )
+    _csv_download(linhas, "auditoria_fotos_produtos.csv")
+
+    st.divider()
+    st.markdown("#### Enviar fotos para o Storage")
+    st.caption(
+        "Escolha o alcance do envio. Só entram produtos cadastrados no banco e que tenham "
+        "uma foto correspondente encontrada no catálogo da loja."
+    )
+    elegiveis = [
+        r for r in linhas
+        if r.get("acao") in (ACAO_COPIAR, ACAO_MIGRAR)
+        and r.get("origem_copia")
+    ]
+    sem_foto_elegiveis = [
+        r for r in elegiveis
+        if r.get("foto_atual_tipo") == "sem_foto" or r.get("acao") == ACAO_COPIAR
+    ]
+
+    if not elegiveis:
+        st.success("Não há fotos encontradas no site para os produtos cadastrados que precisam ser enviadas.")
+    else:
+        modo_envio = st.radio(
+            "O que você deseja enviar?",
+            options=["Sem foto cadastrada", "Todos encontrados no site", "Escolher código"],
+            format_func=lambda opcao: {
+                "Sem foto cadastrada": f"Somente produtos sem foto cadastrada ({len(sem_foto_elegiveis)})",
+                "Todos encontrados no site": f"Todos os produtos com foto encontrada no site ({len(elegiveis)})",
+                "Escolher código": "Escolher um produto pelo código",
+            }[opcao],
+            index=0,
+            key="admin_fotos_modo_envio",
+            help=(
+                "Enviar todos pode substituir as fotos atuais dos produtos selecionados. "
+                "A opção de código limita o envio a um único produto."
+            ),
+        )
+        por_codigo = {str(r.get("codigo_interno")): r for r in elegiveis}
+        selecionados = []
+        if modo_envio == "Sem foto cadastrada":
+            selecionados = [str(r.get("codigo_interno")) for r in sem_foto_elegiveis]
+            st.caption("Serão enviados apenas produtos que ainda não têm foto cadastrada no banco.")
+        elif modo_envio == "Todos encontrados no site":
+            selecionados = list(por_codigo)
+            st.warning(
+                "Esta opção pode substituir fotos que já estão cadastradas, usando a imagem atual do site. "
+                "Confira a lista antes de confirmar."
+            )
+        else:
+            codigos = list(por_codigo)
+            codigo_escolhido = st.selectbox(
+                "Código do produto",
+                options=codigos,
+                index=None,
+                placeholder="Digite ou selecione um código...",
+                format_func=lambda codigo: (
+                    f"{codigo} — {por_codigo[codigo].get('descricao') or por_codigo[codigo].get('produto_no_site') or ''}"
+                ),
+                key="admin_fotos_codigo_envio_unico",
+            )
+            if codigo_escolhido:
+                selecionados = [codigo_escolhido]
+
+        if selecionados:
+            itens_envio = [por_codigo[c] for c in selecionados]
+            st.caption(f"Produtos selecionados para envio: **{len(itens_envio)}**")
+            with st.expander("Conferir produtos selecionados", expanded=(modo_envio != "Todos encontrados no site")):
+                st.dataframe(
+                    [
+                        {
+                            "Código": item.get("codigo_interno"),
+                            "Produto cadastrado": item.get("descricao"),
+                            "Descrição no site": item.get("produto_no_site"),
+                            "Situação atual": item.get("foto_atual_tipo"),
+                        }
+                        for item in itens_envio
+                    ],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+        confirmar = st.checkbox(
+            "Confirmo o envio das fotos selecionadas e a atualização de produtos.foto_url.",
+            key="admin_fotos_confirmar_copia_v2",
+        )
+        if st.button(
+            f"☁️ Enviar {len(selecionados)} foto(s) para o bucket {bucket}",
+            type="primary",
+            disabled=not selecionados or not confirmar,
+            use_container_width=True,
+            key="admin_fotos_enviar_lote_v2",
+        ):
+            itens = [por_codigo[c] for c in selecionados]
+            barra = st.progress(0, text="Enviando fotos...")
+            def _progresso_lote(n, total_lote, codigo):
+                barra.progress(n / max(total_lote, 1), text=f"Processando {n}/{total_lote}: {codigo}")
+            with st.spinner("Baixando, normalizando e enviando as imagens..."):
+                resultados = processar_lote(supabase, itens, progresso=_progresso_lote, bucket=bucket)
+            st.session_state["admin_fotos_resultado_lote"] = resultados
+            ok = sum(1 for r in resultados if r.get("ok"))
+            st.success(f"Processamento concluído: {ok} de {len(resultados)} foto(s) enviada(s).")
+            falhas = [r for r in resultados if not r.get("ok")]
+            if falhas:
+                st.warning("Algumas fotos falharam. Veja os detalhes:")
+                st.dataframe(falhas, use_container_width=True, hide_index=True)
+            st.rerun()
+
+    resultado_lote = st.session_state.get("admin_fotos_resultado_lote")
+    if resultado_lote:
+        with st.expander("Último resultado do envio automático"):
+            st.dataframe(resultado_lote, use_container_width=True, hide_index=True)
+            _csv_download(resultado_lote, "resultado_envio_fotos.csv")
+
+    st.divider()
+    st.markdown("#### Enviar uma foto manualmente")
+    produtos_db = None
+    try:
+        produtos_db = _carregar_todos_produtos_fotos()
+    except Exception as e:
+        st.error(f"Não foi possível carregar os produtos para envio manual: {e}")
+        return
+
+    opcoes_produto = {
+        p["id"]: p for p in produtos_db
+    }
+    opcoes_ids = list(opcoes_produto)
+    if not opcoes_ids:
+        st.info("Não há produtos cadastrados.")
+        return
+
+    produto_id = st.selectbox(
+        "Produto que receberá a foto",
+        options=opcoes_ids,
+        format_func=lambda pid: (
+            f"{opcoes_produto[pid].get('codigo_interno')} — {opcoes_produto[pid].get('descricao')}"
+        ),
+        key="admin_fotos_produto_manual",
+    )
+    arquivo_foto = st.file_uploader(
+        "Selecione a foto do produto",
+        type=["jpg", "jpeg", "png", "webp", "bmp", "tif", "tiff"],
+        key="admin_fotos_arquivo_manual",
+        help="A imagem será convertida para JPEG, limitada a 1200 px e enviada ao bucket público.",
+    )
+    confirmar_manual = st.checkbox(
+        "Confirmo que quero substituir a foto_url deste produto pela nova foto.",
+        key="admin_fotos_confirmar_manual",
+    )
+    if st.button(
+        "⬆️ Enviar foto manual ao Storage",
+        type="primary",
+        disabled=arquivo_foto is None or not confirmar_manual,
+        use_container_width=True,
+        key="admin_fotos_enviar_manual",
+    ):
+        produto = opcoes_produto[produto_id]
+        try:
+            with st.spinner("Normalizando e enviando a foto..."):
+                nova_url = enviar_foto_do_produto(
+                    supabase,
+                    produto_id,
+                    str(produto.get("codigo_interno") or ""),
+                    arquivo_foto.getvalue(),
+                    bucket=bucket,
+                )
+            st.success(f"Foto enviada e `produtos.foto_url` atualizado para {produto.get('codigo_interno')}.")
+            st.markdown(f"[Abrir foto no Storage]({nova_url})")
+            st.session_state.pop("admin_fotos_auditoria", None)
+        except Exception as e:
+            st.error(f"Falha ao enviar a foto: {type(e).__name__}: {e}")
+
+
+
 def tela_admin():
     if not usuario_e_admin():
         st.error("⛔ Acesso não autorizado. Esta área é restrita a administradores.")
@@ -1010,11 +1462,12 @@ def tela_admin():
 
     st.header("⚙️ Painel de Administração")
 
-    aba_compras, aba_vendas, aba_comissao, aba_log, aba_info = st.tabs([
+    aba_compras, aba_vendas, aba_comissao, aba_log, aba_fotos, aba_info = st.tabs([
         "🗑️ Exclusão de Compras (XML)",
         "🗑️ Exclusão de Vendas em Massa",
         "💰 Ajuste Comissão",
         "📋 Log de Automações",
+        "🖼️ Auditoria de Fotos",
         "ℹ️ Informações do Sistema",
     ])
 
@@ -1029,6 +1482,9 @@ def tela_admin():
 
     with aba_log:
         _secao_log_automacoes()
+
+    with aba_fotos:
+        _secao_auditoria_fotos()
 
     with aba_info:
         _secao_info_sistema()

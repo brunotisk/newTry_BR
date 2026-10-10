@@ -155,7 +155,7 @@ def _carregar_fornecedores():
 
 @st.cache_data(ttl=_TTL, show_spinner=False)
 def _carregar_produtos():
-    return _todos("produtos", "id, codigo_interno, descricao, categoria_id")
+    return _todos("produtos", "id, codigo_interno, descricao, categoria_id, foto_url")
 
 
 @st.cache_data(ttl=_TTL, show_spinner=False)
@@ -168,7 +168,7 @@ def _carregar_vendas():
     return _todos(
         "vendas",
         "id, quantidade, valor_final, comissao_valor, data_venda, cliente,"
-        " produtos(id, codigo_interno, descricao, categoria_id),"
+        " produtos(id, codigo_interno, descricao, categoria_id, foto_url),"
         " canais_venda(nome), status_venda(nome), formas_pagamento(descricao),"
         " detalhes_feira(nome_feira)",
     )
@@ -628,10 +628,11 @@ def _visao_compras(ini, fim):
             itens.append({
                 "codigo": prod.get("codigo_interno") or "-",
                 "produto": prod.get("descricao") or "-",
+                "foto_url": prod.get("foto_url") or "",
                 "quantidade": _num(it.get("quantidade")),
                 "valor_total": _num(it.get("valor_total")),
             })
-        df_it = pd.DataFrame(itens, columns=["codigo", "produto", "quantidade", "valor_total"])
+        df_it = pd.DataFrame(itens, columns=["codigo", "produto", "foto_url", "quantidade", "valor_total"])
     except Exception as e:
         st.error(f"Erro ao carregar dados de compras: {e}")
         return
@@ -656,12 +657,13 @@ def _visao_compras(ini, fim):
         return
     g = (
         df_it.groupby(["codigo", "produto"], as_index=False)
-        .agg(pecas=("quantidade", "sum"), valor=("valor_total", "sum"))
+        .agg(pecas=("quantidade", "sum"), valor=("valor_total", "sum"), foto_url=("foto_url", "first"))
         .sort_values("pecas", ascending=False)
         .head(10)
     )
     st.dataframe(
         pd.DataFrame({
+            "Foto": g["foto_url"],
             "Cód. Produto": g["codigo"],
             "Produto": g["produto"],
             "Peças": g["pecas"].map(_fmt_qtd),
@@ -670,6 +672,7 @@ def _visao_compras(ini, fim):
         }),
         hide_index=True,
         use_container_width=True,
+        column_config={"Foto": st.column_config.ImageColumn("Foto", width="small")},
     )
 
 
@@ -678,7 +681,7 @@ def _visao_compras(ini, fim):
 # ----------------------------------------------------------------------
 _COLUNAS_VENDAS = [
     "id", "data", "quantidade", "valor_final", "comissao", "canal", "forma", "status",
-    "codigo", "produto", "categoria", "custo", "tem_custo", "cliente", "cliente_key", "feira",
+    "codigo", "produto", "foto_url", "categoria", "custo", "tem_custo", "cliente", "cliente_key", "feira",
 ]
 
 
@@ -705,6 +708,7 @@ def _df_vendas_base() -> pd.DataFrame:
             "status": (v.get("status_venda") or {}).get("nome") or "Sem status",
             "codigo": prod.get("codigo_interno") or "-",
             "produto": prod.get("descricao") or "-",
+            "foto_url": prod.get("foto_url") or "",
             "categoria": categorias.get(prod.get("categoria_id"), "Sem categoria"),
             "custo": custo_unit * qtd,
             "tem_custo": custo_unit > 0,
@@ -1039,6 +1043,7 @@ def _visao_vendas(ini, fim):
     st.dataframe(
         pd.DataFrame({
             "Data": ultimas["data"].map(_fmt_data),
+            "Foto": ultimas["foto_url"],
             "Cliente": ultimas["cliente"].replace("", "-"),
             "Produto": ultimas["produto"],
             "Canal": ultimas["canal"],
@@ -1047,6 +1052,7 @@ def _visao_vendas(ini, fim):
         }),
         hide_index=True,
         use_container_width=True,
+        column_config={"Foto": st.column_config.ImageColumn("Foto", width="small")},
     )
 
 

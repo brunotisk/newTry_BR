@@ -41,3 +41,6 @@ Tela Reports
 
 ## 1.7.4 - 08/10/2026
 Tela Vendas ADD - Cliente vinculado ao canal e desconto%
+
+## 1.8.0 - 10/10/2026
+Adição FOTOS

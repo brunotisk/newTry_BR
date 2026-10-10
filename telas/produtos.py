@@ -81,6 +81,8 @@ def _secao_consulta():
 
         modo_descricao = st.session_state.get("filtro_produto_buscar_descricao", False)
         filtrar_sem_cat = st.session_state.get("produtos_apenas_sem_categoria", False)
+        filtrar_sem_foto = st.session_state.get("produtos_apenas_sem_foto", False)
+        mostrar_descricao_site = st.session_state.get("produtos_mostrar_descricao_site", False)
 
         with col_busca:
             produtos_busca = _produtos_busca_cache()
@@ -120,11 +122,27 @@ def _secao_consulta():
         modo_descricao = st.session_state.get("filtro_produto_buscar_descricao", modo_descricao)
 
         with col_cat_filtro:
-            st.toggle(
-                "Apenas sem categoria",
-                value=filtrar_sem_cat,
-                key="produtos_apenas_sem_categoria",
-            )
+            col_toggle_cat, col_toggle_foto, col_toggle_desc_site = st.columns([1, 1, 1])
+            with col_toggle_cat:
+                st.toggle(
+                    "Apenas sem categoria",
+                    value=filtrar_sem_cat,
+                    key="produtos_apenas_sem_categoria",
+                )
+            with col_toggle_foto:
+                st.toggle(
+                    "Apenas sem foto",
+                    value=filtrar_sem_foto,
+                    key="produtos_apenas_sem_foto",
+                    help="Exibe somente produtos sem foto cadastrada.",
+                )
+            with col_toggle_desc_site:
+                mostrar_descricao_site = st.toggle(
+                    "Descrição do site",
+                    value=mostrar_descricao_site,
+                    key="produtos_mostrar_descricao_site",
+                    help="Mostra a descrição do site quando cadastrada; caso contrário, mantém a descrição original.",
+                )
 
         # O componente é um iframe. Quando o dropdown abre ele precisa crescer
         # para manter a lista clicável; este pequeno espaço negativo devolve
@@ -159,13 +177,13 @@ def _secao_consulta():
         offset = (st.session_state.pagina_atual_produtos - 1) * itens_por_pagina
 
         # Reseta para a página 1 se qualquer filtro mudar
-        chave_filtro = f"{produto_id_filtro}_{categoria_selecionada}_{filtrar_sem_cat}_{modo_descricao}"
+        chave_filtro = f"{produto_id_filtro}_{categoria_selecionada}_{filtrar_sem_cat}_{filtrar_sem_foto}_{modo_descricao}"
         if st.session_state.get("chave_filtro_ant") != chave_filtro:
             st.session_state.pagina_atual_produtos = 1
             st.session_state.chave_filtro_ant = chave_filtro
 
         # 2. Construção da query com contagem total
-        query = supabase.table("produtos").select("id, codigo_interno, descricao, categoria_id, ultima_compra, nr_compras", count="exact")
+        query = supabase.table("produtos").select("id, codigo_interno, foto_url, descricao, produto_descricao_site, categoria_id, ultima_compra, nr_compras", count="exact")
 
         if filtrar_sem_cat or categoria_selecionada == "Sem Categoria":
             query = query.is_("categoria_id", "null")
@@ -173,6 +191,10 @@ def _secao_consulta():
             ids_cat_sel = [cid for cid, info in cat_dict.items() if info["categoria"] == categoria_selecionada]
             if ids_cat_sel:
                 query = query.in_("categoria_id", ids_cat_sel)
+
+        if filtrar_sem_foto:
+            # Inclui URLs nulas e strings vazias.
+            query = query.or_("foto_url.is.null,foto_url.eq.")
 
         if produto_id_filtro is not None:
             query = query.eq("id", produto_id_filtro)
@@ -207,10 +229,11 @@ def _secao_consulta():
 
         # 4. Tabela dentro de Container
         with st.container(border=True):
-            c_id, c_cod, c_desc, c_cat, c_banho, c_ult_compra, c_nr_compra, c_acao = st.columns([1, 2, 3, 2, 2, 2, 1, 1])
+            c_id, c_cod, c_foto, c_desc, c_cat, c_banho, c_ult_compra, c_nr_compra, c_acao = st.columns([1, 2, 1, 3, 2, 2, 2, 1, 1])
 
             c_id.markdown("**id**")
             c_cod.markdown("**codigo_interno**")
+            c_foto.markdown("**foto**")
             c_desc.markdown("**descricao**")
             c_cat.markdown("**categoria**")
             c_banho.markdown("**banho**")
@@ -221,11 +244,23 @@ def _secao_consulta():
             st.divider()
 
             for prod in produtos:
-                col_id, col_cod, col_desc, col_cat, col_banho, col_ult_compra, col_nr_compra, col_acao = st.columns([1, 2, 3, 2, 2, 2, 1, 1])
+                col_id, col_cod, col_foto, col_desc, col_cat, col_banho, col_ult_compra, col_nr_compra, col_acao = st.columns([1, 2, 1, 3, 2, 2, 2, 1, 1])
 
                 col_id.write(prod["id"])
                 col_cod.write(prod.get("codigo_interno", "-"))
-                col_desc.write(prod.get("descricao", "-"))
+                foto_url = prod.get("foto_url")
+                if foto_url:
+                    col_foto.image(foto_url, width=64)
+                else:
+                    col_foto.write("—")
+                descricao_original = prod.get("descricao")
+                descricao_site = prod.get("produto_descricao_site")
+                descricao_exibida = (
+                    descricao_site.strip()
+                    if mostrar_descricao_site and isinstance(descricao_site, str) and descricao_site.strip()
+                    else descricao_original
+                )
+                col_desc.write(descricao_exibida or "-")
 
                 cat_atual_id = prod.get("categoria_id")
                 info_cat = cat_dict.get(cat_atual_id)
