@@ -44,3 +44,6 @@ Tela Vendas ADD - Cliente vinculado ao canal e desconto%
 
 ## 1.8.0 - 10/10/2026
 Adição FOTOS
+
+## 1.8.1 - 10/10/2026
+Adição FOTOS v2

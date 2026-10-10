@@ -15,6 +15,7 @@ ignorando zeros à esquerda (0010575 == 10575).
 from __future__ import annotations
 
 import io
+import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -255,23 +256,52 @@ def baixar_imagem(url: str) -> bytes:
     return bytes(dados)
 
 
+def _conferir_resposta_storage(resposta) -> None:
+    """Versões antigas do cliente devolvem a resposta HTTP em vez de levantar erro."""
+    status = getattr(resposta, "status_code", None)
+    if isinstance(status, int) and status >= 400:
+        raise RuntimeError(f"Storage respondeu HTTP {status}: {getattr(resposta, 'text', '')[:200]}")
+    if isinstance(resposta, dict) and resposta.get("error"):
+        raise RuntimeError(f"Storage: {resposta.get('error')}")
+
+
 def enviar_para_storage(supabase, codigo: str, jpeg: bytes, bucket: str = BUCKET) -> str:
     """Sobe <codigo>.jpg para o bucket (sobrescreve) e devolve a URL pública com ?v=<hora>,
     para o navegador não mostrar a versão antiga em cache."""
     path = caminho_foto(codigo)
     storage = supabase.storage.from_(bucket)
-    storage.upload(path, jpeg, {"content-type": "image/jpeg", "upsert": "true", "cache-control": "3600"})
+    resposta = storage.upload(
+        path, jpeg, {"content-type": "image/jpeg", "upsert": "true", "cache-control": "3600"}
+    )
+    _conferir_resposta_storage(resposta)
     url = str(storage.get_public_url(path)).rstrip("?")
     return f"{url}?v={int(time.time())}"
 
 
+_MSG_ZERO_LINHAS = (
+    "o banco não atualizou nenhuma linha de produtos (id={id}). Sem erro do banco, isso "
+    "costuma ser bloqueio de RLS: falta policy de UPDATE em produtos neste ambiente."
+)
+
+
 def gravar_foto_url(supabase, produto_id, url: str) -> None:
-    supabase.table("produtos").update({"foto_url": url}).eq("id", produto_id).execute()
+    """Grava produtos.foto_url. Se o banco não alterar nenhuma linha (RLS bloqueando o UPDATE
+    não gera erro, só devolve vazio), levanta erro em vez de fingir que gravou."""
+    resp = supabase.table("produtos").update({"foto_url": url}).eq("id", produto_id).execute()
+    if not resp.data:
+        raise RuntimeError(_MSG_ZERO_LINHAS.format(id=produto_id))
 
 
 def gravar_descricao_site(supabase, produto_id, descricao: str) -> None:
     """Grava em produtos.produto_descricao_site o título correspondente do catálogo público."""
-    supabase.table("produtos").update({"produto_descricao_site": descricao}).eq("id", produto_id).execute()
+    resp = (
+        supabase.table("produtos")
+        .update({"produto_descricao_site": descricao})
+        .eq("id", produto_id)
+        .execute()
+    )
+    if not resp.data:
+        raise RuntimeError(_MSG_ZERO_LINHAS.format(id=produto_id))
 
 
 def gravar_descricoes_site_lote(supabase, itens: list[dict]) -> int:
@@ -285,10 +315,18 @@ def gravar_descricoes_site_lote(supabase, itens: list[dict]) -> int:
     resposta = supabase.rpc(
         "atualizar_descricoes_site_lote", {"itens": itens}
     ).execute()
+    if resposta.data is None:
+        return len(itens)  # função sem retorno numérico: não dá para conferir
     try:
-        return int(resposta.data or 0)
+        atualizadas = int(resposta.data)
     except (TypeError, ValueError):
         return len(itens)
+    if atualizadas == 0:
+        raise RuntimeError(
+            f"a função atualizar_descricoes_site_lote não alterou nenhuma das {len(itens)} linhas "
+            "(possível bloqueio de RLS ou função sem permissão neste ambiente)."
+        )
+    return atualizadas
 
 
 def enviar_foto_do_produto(supabase, produto_id, codigo: str, conteudo: bytes, bucket: str = BUCKET) -> str:
@@ -322,4 +360,108 @@ def processar_lote(supabase, itens: list, progresso=None, workers: int = 4, buck
             resultados.append(res)
             if progresso:
                 progresso(n, len(itens), item["codigo_interno"])
+    return resultados
+
+
+# ----------------------------------------------------------------------
+# Diagnóstico do ambiente (DEV x PROD)
+# ----------------------------------------------------------------------
+def _versao(pacote: str) -> str:
+    try:
+        from importlib.metadata import version
+        return version(pacote)
+    except Exception:
+        return "?"
+
+
+def diagnosticar_ambiente(supabase, bucket: str = BUCKET, loja: str = LOJA_PADRAO) -> list:
+    """Roda, no ambiente atual, cada passo de que o envio de fotos depende e diz qual falha.
+
+    Pensado para comparar HML e PRD: rode nos dois e veja onde muda. Escreve apenas um arquivo
+    de teste (`_diagnostico/teste.jpg`, removido ao final) e regrava produtos.foto_url de um
+    produto com o MESMO valor que ele já tem.
+    """
+    resultados = []
+
+    def reg(nome, ok, detalhe):
+        status = "ℹ️ info" if ok is None else ("✅ ok" if ok else "❌ falha")
+        resultados.append({"verificação": nome, "status": status, "detalhe": detalhe})
+
+    # 1) qual ambiente/projeto este código está falando
+    url_supabase = os.getenv("SUPABASE_URL") or ""
+    reg(
+        "Ambiente e projeto Supabase", bool(url_supabase),
+        f"BD={os.getenv('BD') or '(não definido)'} · projeto: "
+        f"{urlparse(url_supabase).netloc or '(SUPABASE_URL não definida)'}",
+    )
+    reg("Versões", None, f"supabase {_versao('supabase')} · storage3 {_versao('storage3')} · "
+                          f"postgrest {_versao('postgrest')}")
+
+    # 2) colunas esperadas em produtos
+    produto = None
+    try:
+        r = supabase.table("produtos").select("id, foto_url, produto_descricao_site").limit(1).execute()
+        produto = (r.data or [None])[0]
+        reg("Colunas produtos.foto_url e produto_descricao_site", True,
+            "existem" + ("" if produto else " (tabela vazia)"))
+    except Exception as e:
+        reg("Colunas produtos.foto_url e produto_descricao_site", False, f"{type(e).__name__}: {e}")
+
+    # 3) UPDATE em produtos (RLS bloqueando devolve vazio, sem erro)
+    if produto:
+        try:
+            r = (
+                supabase.table("produtos")
+                .update({"foto_url": produto.get("foto_url")})
+                .eq("id", produto["id"])
+                .execute()
+            )
+            reg("Permissão de UPDATE em produtos", bool(r.data),
+                "gravou" if r.data else "0 linhas atualizadas: falta policy de UPDATE em produtos (RLS) neste ambiente")
+        except Exception as e:
+            reg("Permissão de UPDATE em produtos", False, f"{type(e).__name__}: {e}")
+
+    # 4) função de gravação em lote das descrições
+    try:
+        supabase.rpc("atualizar_descricoes_site_lote", {"itens": []}).execute()
+        reg("Função atualizar_descricoes_site_lote", True, "existe e responde")
+    except Exception as e:
+        reg("Função atualizar_descricoes_site_lote", False,
+            f"{type(e).__name__}: {e} (sem ela a gravação das descrições cai no modo lento)")
+
+    # 5) Storage: envio, leitura pública e remoção de um arquivo de teste
+    caminho = "_diagnostico/teste.jpg"
+    minimo = io.BytesIO()
+    Image.new("RGB", (2, 2), (255, 255, 255)).save(minimo, format="JPEG")
+    try:
+        armazenamento = supabase.storage.from_(bucket)
+        _conferir_resposta_storage(
+            armazenamento.upload(caminho, minimo.getvalue(), {"content-type": "image/jpeg", "upsert": "true"})
+        )
+        reg(f"Storage: envio ao bucket '{bucket}'", True, "INSERT/UPDATE permitidos")
+        url_teste = str(armazenamento.get_public_url(caminho)).rstrip("?")
+        try:
+            resp = requests.get(url_teste, headers=UA, timeout=10)
+            ok = resp.status_code == 200 and resp.headers.get("content-type", "").startswith("image")
+            reg("Storage: leitura pública da foto", ok,
+                f"HTTP {resp.status_code}" + ("" if ok else " — bucket não está público ou falta policy de SELECT"))
+        except Exception as e:
+            reg("Storage: leitura pública da foto", False, f"{type(e).__name__}: {e}")
+        try:
+            armazenamento.remove([caminho])
+            reg("Storage: remoção do arquivo de teste", True, "removido")
+        except Exception as e:
+            reg("Storage: remoção do arquivo de teste", None,
+                f"não removido ({type(e).__name__}); apague '{caminho}' no painel se quiser")
+    except Exception as e:
+        reg(f"Storage: envio ao bucket '{bucket}'", False,
+            f"{type(e).__name__}: {e} — confira se o bucket existe neste projeto e as policies de storage.objects")
+
+    # 6) rede até a loja (de onde o servidor da aplicação está rodando)
+    try:
+        resp = requests.get(f"{loja.rstrip('/')}/products.json?limit=1", headers=UA, timeout=15)
+        reg("Acesso do servidor ao catálogo da loja", resp.status_code == 200, f"HTTP {resp.status_code}")
+    except Exception as e:
+        reg("Acesso do servidor ao catálogo da loja", False, f"{type(e).__name__}: {e}")
+
     return resultados

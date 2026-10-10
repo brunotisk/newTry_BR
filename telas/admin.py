@@ -1069,7 +1069,7 @@ def _secao_auditoria_fotos():
             LOJA_PADRAO, BUCKET, ACAO_COPIAR, ACAO_MIGRAR,
             baixar_catalogo, indexar_por_sku, auditar,
             testar_urls, processar_lote, enviar_foto_do_produto,
-            gravar_descricao_site, gravar_descricoes_site_lote,
+            gravar_descricao_site, gravar_descricoes_site_lote, diagnosticar_ambiente,
         )
     except Exception as e:
         st.error(
@@ -1089,6 +1089,22 @@ def _secao_auditoria_fotos():
         value=BUCKET,
         key="admin_fotos_bucket_v2",
     ).strip() or BUCKET
+
+    with st.expander("🩺 Diagnóstico do ambiente (rode em DEV e em PROD e compare)"):
+        st.caption(
+            "Testa, no ambiente em que o app está rodando agora: projeto Supabase, colunas, permissão "
+            "de UPDATE em produtos, função em lote, envio/leitura/remoção no bucket e acesso à loja."
+        )
+        if st.button("Rodar diagnóstico", key="admin_fotos_diagnostico"):
+            with st.spinner("Verificando banco, Storage e rede..."):
+                st.session_state["admin_fotos_diag"] = diagnosticar_ambiente(supabase, bucket, loja)
+        diagnostico = st.session_state.get("admin_fotos_diag")
+        if diagnostico:
+            st.dataframe(diagnostico, use_container_width=True, hide_index=True)
+            if any(l["status"].startswith("❌") for l in diagnostico):
+                st.error("Há verificações com falha neste ambiente — é aí que o envio de fotos para.")
+            else:
+                st.success("Todas as verificações passaram neste ambiente.")
 
     col_auditar, col_limpar = st.columns([1, 1])
     with col_auditar:
@@ -1380,17 +1396,23 @@ def _secao_auditoria_fotos():
                 barra.progress(n / max(total_lote, 1), text=f"Processando {n}/{total_lote}: {codigo}")
             with st.spinner("Baixando, normalizando e enviando as imagens..."):
                 resultados = processar_lote(supabase, itens, progresso=_progresso_lote, bucket=bucket)
+            # O resultado fica em session_state e é mostrado logo abaixo, depois do rerun
+            # (mensagens exibidas antes do st.rerun() desaparecem na hora).
             st.session_state["admin_fotos_resultado_lote"] = resultados
-            ok = sum(1 for r in resultados if r.get("ok"))
-            st.success(f"Processamento concluído: {ok} de {len(resultados)} foto(s) enviada(s).")
-            falhas = [r for r in resultados if not r.get("ok")]
-            if falhas:
-                st.warning("Algumas fotos falharam. Veja os detalhes:")
-                st.dataframe(falhas, use_container_width=True, hide_index=True)
             st.rerun()
 
     resultado_lote = st.session_state.get("admin_fotos_resultado_lote")
     if resultado_lote:
+        ok_lote = sum(1 for r in resultado_lote if r.get("ok"))
+        falhas_lote = [r for r in resultado_lote if not r.get("ok")]
+        if falhas_lote:
+            st.error(
+                f"Último envio: {ok_lote} de {len(resultado_lote)} foto(s) gravada(s); "
+                f"{len(falhas_lote)} falharam. O erro de cada código está na coluna `erro` abaixo."
+            )
+            st.dataframe(falhas_lote, use_container_width=True, hide_index=True)
+        else:
+            st.success(f"Último envio: {ok_lote} de {len(resultado_lote)} foto(s) enviada(s) e gravada(s) em `produtos.foto_url`.")
         with st.expander("Último resultado do envio automático"):
             st.dataframe(resultado_lote, use_container_width=True, hide_index=True)
             _csv_download(resultado_lote, "resultado_envio_fotos.csv")
