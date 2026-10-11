@@ -1090,6 +1090,38 @@ def _secao_auditoria_fotos():
         key="admin_fotos_bucket_v2",
     ).strip() or BUCKET
 
+    # Os indicadores e o upload manual ficam disponíveis sem executar auditoria do site.
+    try:
+        produtos_db = _carregar_todos_produtos_fotos()
+    except Exception as e:
+        st.error(f"Não foi possível carregar os produtos para o resumo e envio manual: {e}")
+        produtos_db = []
+
+    total_produtos = len(produtos_db)
+    produtos_com_foto = [p for p in produtos_db if str(p.get("foto_url") or "").strip()]
+    produtos_sem_foto = [p for p in produtos_db if not str(p.get("foto_url") or "").strip()]
+    produtos_com_desc_site = [p for p in produtos_db if str(p.get("produto_descricao_site") or "").strip()]
+    produtos_sem_desc_site = [p for p in produtos_db if not str(p.get("produto_descricao_site") or "").strip()]
+
+    st.markdown("#### 📊 Situação atual dos cadastros")
+    met1, met2, met3, met4 = st.columns(4)
+    met1.metric("Produtos com foto", len(produtos_com_foto))
+    met2.metric("Produtos sem foto", len(produtos_sem_foto))
+    met3.metric("Com descrição do site", len(produtos_com_desc_site))
+    met4.metric("Sem descrição do site", len(produtos_sem_desc_site))
+    st.caption(f"Total de produtos cadastrados: {total_produtos}. Estes números vêm diretamente da tabela `produtos` e não dependem da auditoria do site.")
+
+    with st.expander(f"📋 Listar produtos sem foto ({len(produtos_sem_foto)})", expanded=False):
+        if produtos_sem_foto:
+            tabela_sem_foto = [
+                {"Código": p.get("codigo_interno") or "-", "Descrição": p.get("descricao") or "-", "Descrição do site": p.get("produto_descricao_site") or "-"}
+                for p in produtos_sem_foto
+            ]
+            st.dataframe(tabela_sem_foto, use_container_width=True, hide_index=True)
+            _csv_download(tabela_sem_foto, "produtos_sem_foto.csv")
+        else:
+            st.success("Todos os produtos possuem foto cadastrada.")
+
     with st.expander("🩺 Diagnóstico do ambiente (rode em DEV e em PROD e compare)"):
         st.caption(
             "Testa, no ambiente em que o app está rodando agora: projeto Supabase, colunas, permissão "
@@ -1262,176 +1294,177 @@ def _secao_auditoria_fotos():
 
     linhas = st.session_state.get("admin_fotos_auditoria")
     if linhas is None:
-        st.caption("Clique em **Auditar fotos agora** para consultar o banco e o catálogo do site.")
-        return
-
-    total = len(linhas)
-    sem_foto = sum(1 for r in linhas if r.get("foto_atual_tipo") == "sem_foto")
-    storage_ok = sum(1 for r in linhas if r.get("foto_atual_tipo") == "storage" and r.get("url_banco_testada") == "ok")
-    url_quebrada = sum(1 for r in linhas if "quebrada" in (r.get("url_banco_testada"), r.get("url_site_testada")))
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Produtos auditados", total)
-    k2.metric("Sem foto no banco", sem_foto)
-    k3.metric("Fotos no Storage acessíveis", storage_ok)
-    k4.metric("URLs quebradas", url_quebrada)
-
-    st.markdown("#### Resultado da auditoria")
-    filtro = st.multiselect(
-        "Filtrar por ação",
-        options=sorted({str(r.get("acao") or "") for r in linhas}),
-        default=sorted({str(r.get("acao") or "") for r in linhas}),
-        key="admin_fotos_filtro_acao",
-    )
-    exibidas = [r for r in linhas if str(r.get("acao") or "") in filtro]
-    colunas_visiveis = [
-        "codigo_interno", "descricao", "produto_no_site", "produto_descricao_site",
-        "situacao_site", "foto_atual_tipo", "url_banco_testada", "url_site_testada", "acao",
-        "pagina_site", "foto_site", "foto_atual_url", "origem_copia",
-    ]
-    st.dataframe(
-        [{c: r.get(c, "") for c in colunas_visiveis} for r in exibidas],
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "pagina_site": st.column_config.LinkColumn("Página no site"),
-            "foto_site": st.column_config.LinkColumn("Foto no site"),
-            "foto_atual_url": st.column_config.LinkColumn("Foto atual no banco"),
-            "origem_copia": st.column_config.LinkColumn("Origem da cópia"),
-        },
-    )
-    _csv_download(linhas, "auditoria_fotos_produtos.csv")
-
-    st.divider()
-    st.markdown("#### Enviar fotos para o Storage")
-    st.caption(
-        "Escolha o alcance do envio. Só entram produtos cadastrados no banco e que tenham "
-        "uma foto correspondente encontrada no catálogo da loja."
-    )
-    elegiveis = [
-        r for r in linhas
-        if r.get("acao") in (ACAO_COPIAR, ACAO_MIGRAR)
-        and r.get("origem_copia")
-    ]
-    sem_foto_elegiveis = [
-        r for r in elegiveis
-        if r.get("foto_atual_tipo") == "sem_foto" or r.get("acao") == ACAO_COPIAR
-    ]
-
-    if not elegiveis:
-        st.success("Não há fotos encontradas no site para os produtos cadastrados que precisam ser enviadas.")
+        st.caption("A auditoria do catálogo é opcional. Você já pode consultar os indicadores, listar produtos sem foto e fazer upload manual abaixo.")
     else:
-        modo_envio = st.radio(
-            "O que você deseja enviar?",
-            options=["Sem foto cadastrada", "Todos encontrados no site", "Escolher código"],
-            format_func=lambda opcao: {
-                "Sem foto cadastrada": f"Somente produtos sem foto cadastrada ({len(sem_foto_elegiveis)})",
-                "Todos encontrados no site": f"Todos os produtos com foto encontrada no site ({len(elegiveis)})",
-                "Escolher código": "Escolher um produto pelo código",
-            }[opcao],
-            index=0,
-            key="admin_fotos_modo_envio",
-            help=(
-                "Enviar todos pode substituir as fotos atuais dos produtos selecionados. "
-                "A opção de código limita o envio a um único produto."
-            ),
-        )
-        por_codigo = {str(r.get("codigo_interno")): r for r in elegiveis}
-        selecionados = []
-        if modo_envio == "Sem foto cadastrada":
-            selecionados = [str(r.get("codigo_interno")) for r in sem_foto_elegiveis]
-            st.caption("Serão enviados apenas produtos que ainda não têm foto cadastrada no banco.")
-        elif modo_envio == "Todos encontrados no site":
-            selecionados = list(por_codigo)
-            st.warning(
-                "Esta opção pode substituir fotos que já estão cadastradas, usando a imagem atual do site. "
-                "Confira a lista antes de confirmar."
-            )
-        else:
-            codigos = list(por_codigo)
-            codigo_escolhido = st.selectbox(
-                "Código do produto",
-                options=codigos,
-                index=None,
-                placeholder="Digite ou selecione um código...",
-                format_func=lambda codigo: (
-                    f"{codigo} — {por_codigo[codigo].get('descricao') or por_codigo[codigo].get('produto_no_site') or ''}"
-                ),
-                key="admin_fotos_codigo_envio_unico",
-            )
-            if codigo_escolhido:
-                selecionados = [codigo_escolhido]
+        total = len(linhas)
+        sem_foto = sum(1 for r in linhas if r.get("foto_atual_tipo") == "sem_foto")
+        storage_ok = sum(1 for r in linhas if r.get("foto_atual_tipo") == "storage" and r.get("url_banco_testada") == "ok")
+        url_quebrada = sum(1 for r in linhas if "quebrada" in (r.get("url_banco_testada"), r.get("url_site_testada")))
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Produtos auditados", total)
+        k2.metric("Sem foto no banco", sem_foto)
+        k3.metric("Fotos no Storage acessíveis", storage_ok)
+        k4.metric("URLs quebradas", url_quebrada)
 
-        if selecionados:
-            itens_envio = [por_codigo[c] for c in selecionados]
-            st.caption(f"Produtos selecionados para envio: **{len(itens_envio)}**")
-            with st.expander("Conferir produtos selecionados", expanded=(modo_envio != "Todos encontrados no site")):
-                st.dataframe(
-                    [
-                        {
-                            "Código": item.get("codigo_interno"),
-                            "Produto cadastrado": item.get("descricao"),
-                            "Descrição no site": item.get("produto_no_site"),
-                            "Situação atual": item.get("foto_atual_tipo"),
-                        }
-                        for item in itens_envio
-                    ],
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-        confirmar = st.checkbox(
-            "Confirmo o envio das fotos selecionadas e a atualização de produtos.foto_url.",
-            key="admin_fotos_confirmar_copia_v2",
+        st.markdown("#### Resultado da auditoria")
+        filtro = st.multiselect(
+            "Filtrar por ação",
+            options=sorted({str(r.get("acao") or "") for r in linhas}),
+            default=sorted({str(r.get("acao") or "") for r in linhas}),
+            key="admin_fotos_filtro_acao",
         )
-        if st.button(
-            f"☁️ Enviar {len(selecionados)} foto(s) para o bucket {bucket}",
-            type="primary",
-            disabled=not selecionados or not confirmar,
+        exibidas = [r for r in linhas if str(r.get("acao") or "") in filtro]
+        colunas_visiveis = [
+            "codigo_interno", "descricao", "produto_no_site", "produto_descricao_site",
+            "situacao_site", "foto_atual_tipo", "url_banco_testada", "url_site_testada", "acao",
+            "pagina_site", "foto_site", "foto_atual_url", "origem_copia",
+        ]
+        st.dataframe(
+            [{c: r.get(c, "") for c in colunas_visiveis} for r in exibidas],
             use_container_width=True,
-            key="admin_fotos_enviar_lote_v2",
-        ):
-            itens = [por_codigo[c] for c in selecionados]
-            barra = st.progress(0, text="Enviando fotos...")
-            def _progresso_lote(n, total_lote, codigo):
-                barra.progress(n / max(total_lote, 1), text=f"Processando {n}/{total_lote}: {codigo}")
-            with st.spinner("Baixando, normalizando e enviando as imagens..."):
-                resultados = processar_lote(supabase, itens, progresso=_progresso_lote, bucket=bucket)
-            # O resultado fica em session_state e é mostrado logo abaixo, depois do rerun
-            # (mensagens exibidas antes do st.rerun() desaparecem na hora).
-            st.session_state["admin_fotos_resultado_lote"] = resultados
-            st.rerun()
+            hide_index=True,
+            column_config={
+                "pagina_site": st.column_config.LinkColumn("Página no site"),
+                "foto_site": st.column_config.LinkColumn("Foto no site"),
+                "foto_atual_url": st.column_config.LinkColumn("Foto atual no banco"),
+                "origem_copia": st.column_config.LinkColumn("Origem da cópia"),
+            },
+        )
+        _csv_download(linhas, "auditoria_fotos_produtos.csv")
 
-    resultado_lote = st.session_state.get("admin_fotos_resultado_lote")
-    if resultado_lote:
-        ok_lote = sum(1 for r in resultado_lote if r.get("ok"))
-        falhas_lote = [r for r in resultado_lote if not r.get("ok")]
-        if falhas_lote:
-            st.error(
-                f"Último envio: {ok_lote} de {len(resultado_lote)} foto(s) gravada(s); "
-                f"{len(falhas_lote)} falharam. O erro de cada código está na coluna `erro` abaixo."
-            )
-            st.dataframe(falhas_lote, use_container_width=True, hide_index=True)
+        st.divider()
+        st.markdown("#### Enviar fotos para o Storage")
+        st.caption(
+            "Escolha o alcance do envio. Só entram produtos cadastrados no banco e que tenham "
+            "uma foto correspondente encontrada no catálogo da loja."
+        )
+        elegiveis = [
+            r for r in linhas
+            if r.get("acao") in (ACAO_COPIAR, ACAO_MIGRAR)
+            and r.get("origem_copia")
+        ]
+        sem_foto_elegiveis = [
+            r for r in elegiveis
+            if r.get("foto_atual_tipo") == "sem_foto" or r.get("acao") == ACAO_COPIAR
+        ]
+
+        if not elegiveis:
+            st.success("Não há fotos encontradas no site para os produtos cadastrados que precisam ser enviadas.")
         else:
-            st.success(f"Último envio: {ok_lote} de {len(resultado_lote)} foto(s) enviada(s) e gravada(s) em `produtos.foto_url`.")
-        with st.expander("Último resultado do envio automático"):
-            st.dataframe(resultado_lote, use_container_width=True, hide_index=True)
-            _csv_download(resultado_lote, "resultado_envio_fotos.csv")
+            modo_envio = st.radio(
+                "O que você deseja enviar?",
+                options=["Sem foto cadastrada", "Todos encontrados no site", "Escolher código"],
+                format_func=lambda opcao: {
+                    "Sem foto cadastrada": f"Somente produtos sem foto cadastrada ({len(sem_foto_elegiveis)})",
+                    "Todos encontrados no site": f"Todos os produtos com foto encontrada no site ({len(elegiveis)})",
+                    "Escolher código": "Escolher um produto pelo código",
+                }[opcao],
+                index=0,
+                key="admin_fotos_modo_envio",
+                help=(
+                    "Enviar todos pode substituir as fotos atuais dos produtos selecionados. "
+                    "A opção de código limita o envio a um único produto."
+                ),
+            )
+            por_codigo = {str(r.get("codigo_interno")): r for r in elegiveis}
+            selecionados = []
+            if modo_envio == "Sem foto cadastrada":
+                selecionados = [str(r.get("codigo_interno")) for r in sem_foto_elegiveis]
+                st.caption("Serão enviados apenas produtos que ainda não têm foto cadastrada no banco.")
+            elif modo_envio == "Todos encontrados no site":
+                selecionados = list(por_codigo)
+                st.warning(
+                    "Esta opção pode substituir fotos que já estão cadastradas, usando a imagem atual do site. "
+                    "Confira a lista antes de confirmar."
+                )
+            else:
+                codigos = list(por_codigo)
+                codigo_escolhido = st.selectbox(
+                    "Código do produto",
+                    options=codigos,
+                    index=None,
+                    placeholder="Digite ou selecione um código...",
+                    format_func=lambda codigo: (
+                        f"{codigo} — {por_codigo[codigo].get('descricao') or por_codigo[codigo].get('produto_no_site') or ''}"
+                    ),
+                    key="admin_fotos_codigo_envio_unico",
+                )
+                if codigo_escolhido:
+                    selecionados = [codigo_escolhido]
+
+            if selecionados:
+                itens_envio = [por_codigo[c] for c in selecionados]
+                st.caption(f"Produtos selecionados para envio: **{len(itens_envio)}**")
+                with st.expander("Conferir produtos selecionados", expanded=(modo_envio != "Todos encontrados no site")):
+                    st.dataframe(
+                        [
+                            {
+                                "Código": item.get("codigo_interno"),
+                                "Produto cadastrado": item.get("descricao"),
+                                "Descrição no site": item.get("produto_no_site"),
+                                "Situação atual": item.get("foto_atual_tipo"),
+                            }
+                            for item in itens_envio
+                        ],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+            confirmar = st.checkbox(
+                "Confirmo o envio das fotos selecionadas e a atualização de produtos.foto_url.",
+                key="admin_fotos_confirmar_copia_v2",
+            )
+            if st.button(
+                f"☁️ Enviar {len(selecionados)} foto(s) para o bucket {bucket}",
+                type="primary",
+                disabled=not selecionados or not confirmar,
+                use_container_width=True,
+                key="admin_fotos_enviar_lote_v2",
+            ):
+                itens = [por_codigo[c] for c in selecionados]
+                barra = st.progress(0, text="Enviando fotos...")
+                def _progresso_lote(n, total_lote, codigo):
+                    barra.progress(n / max(total_lote, 1), text=f"Processando {n}/{total_lote}: {codigo}")
+                with st.spinner("Baixando, normalizando e enviando as imagens..."):
+                    resultados = processar_lote(supabase, itens, progresso=_progresso_lote, bucket=bucket)
+                # O resultado fica em session_state e é mostrado logo abaixo, depois do rerun
+                # (mensagens exibidas antes do st.rerun() desaparecem na hora).
+                st.session_state["admin_fotos_resultado_lote"] = resultados
+                st.rerun()
+
+        resultado_lote = st.session_state.get("admin_fotos_resultado_lote")
+        if resultado_lote:
+            ok_lote = sum(1 for r in resultado_lote if r.get("ok"))
+            falhas_lote = [r for r in resultado_lote if not r.get("ok")]
+            if falhas_lote:
+                st.error(
+                    f"Último envio: {ok_lote} de {len(resultado_lote)} foto(s) gravada(s); "
+                    f"{len(falhas_lote)} falharam. O erro de cada código está na coluna `erro` abaixo."
+                )
+                st.dataframe(falhas_lote, use_container_width=True, hide_index=True)
+            else:
+                st.success(f"Último envio: {ok_lote} de {len(resultado_lote)} foto(s) enviada(s) e gravada(s) em `produtos.foto_url`.")
+            with st.expander("Último resultado do envio automático"):
+                st.dataframe(resultado_lote, use_container_width=True, hide_index=True)
+                _csv_download(resultado_lote, "resultado_envio_fotos.csv")
 
     st.divider()
-    st.markdown("#### Enviar uma foto manualmente")
-    produtos_db = None
-    try:
-        produtos_db = _carregar_todos_produtos_fotos()
-    except Exception as e:
-        st.error(f"Não foi possível carregar os produtos para envio manual: {e}")
-        return
-
-    opcoes_produto = {
-        p["id"]: p for p in produtos_db
-    }
+    st.markdown("#### ⬆️ Enviar uma foto manualmente")
+    st.caption("Esta área funciona sem executar a auditoria do site. Por padrão, a seleção mostra apenas produtos sem foto.")
+    incluir_com_foto = st.toggle(
+        "Incluir produtos que já têm foto (substituição manual)",
+        value=False,
+        key="admin_fotos_manual_incluir_com_foto",
+        help="Ative somente se quiser substituir a foto já cadastrada de um produto.",
+    )
+    produtos_para_upload = produtos_db if incluir_com_foto else produtos_sem_foto
+    opcoes_produto = {p["id"]: p for p in produtos_para_upload}
     opcoes_ids = list(opcoes_produto)
+    if not produtos_db:
+        st.info("Não há produtos cadastrados ou não foi possível carregar a lista de produtos.")
+        return
     if not opcoes_ids:
-        st.info("Não há produtos cadastrados.")
+        st.success("Não há produtos sem foto para enviar. Ative a opção acima se deseja substituir uma foto existente.")
         return
 
     produto_id = st.selectbox(
@@ -1449,7 +1482,7 @@ def _secao_auditoria_fotos():
         help="A imagem será convertida para JPEG, limitada a 1200 px e enviada ao bucket público.",
     )
     confirmar_manual = st.checkbox(
-        "Confirmo que quero substituir a foto_url deste produto pela nova foto.",
+        "Confirmo que quero gravar a nova foto em produtos.foto_url (substituindo a atual, se houver).",
         key="admin_fotos_confirmar_manual",
     )
     if st.button(

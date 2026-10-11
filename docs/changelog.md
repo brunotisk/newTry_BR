@@ -47,3 +47,6 @@ Adição FOTOS
 
 ## 1.8.1 - 10/10/2026
 Adição FOTOS v2
+
+## 1.8.2 - 10/10/2026
+Melhoria Performance Maleta envio Parceiro

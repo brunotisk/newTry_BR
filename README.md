@@ -11,3 +11,5 @@ pytest --cov=. --cov-report=term-missing   # cobertura
 pytest -v
 # Gera TXT
 pytest -q > pytest_log.txt 2>&1 
+
+select count(*) from produtos where foto_url is not null
