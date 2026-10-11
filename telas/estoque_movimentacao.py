@@ -120,7 +120,9 @@ def _secao_movimentacoes():
             )
 
     with col_tipo:
-        tipo_filtro = st.selectbox("Tipo", ["Todos", "Entrada", "Saída", "Ajuste"], key="movimentos_tipo")
+        tipo_filtro = st.selectbox(
+            "Tipo", ["Todos", "Entrada", "Saída", "Ajuste", "Retirada pessoal"], key="movimentos_tipo"
+        )
 
     with col_busca:
         busca_codigo = st.text_input("Código do produto", placeholder="Ex.: 11389", key="movimentos_busca_codigo")
@@ -208,7 +210,12 @@ def _secao_movimentacoes():
             )
             st.caption("📜 Mostrando todo o histórico de movimentações.")
 
-    tipo_map = {"Entrada": "entrada", "Saída": "saida", "Ajuste": "ajuste"}
+    tipo_map = {
+        "Entrada": "entrada",
+        "Saída": "saida",
+        "Ajuste": "ajuste",
+        "Retirada pessoal": "retirada_pessoal",
+    }
 
     try:
         query = (
@@ -293,7 +300,12 @@ def _secao_movimentacoes():
         st.info("Nenhuma movimentação encontrada para o filtro selecionado.")
         return
 
-    icone_tipo = {"entrada": "🟢 Entrada", "saida": "🔴 Saída", "ajuste": "🟡 Ajuste"}
+    icone_tipo = {
+        "entrada": "🟢 Entrada",
+        "saida": "🔴 Saída",
+        "ajuste": "🟡 Ajuste",
+        "retirada_pessoal": "🟠 Retirada pessoal",
+    }
 
     def _navegar_para_transacao(tipo: str, registro_id: int, produto_id: int | None = None):
         """Prepara a navegação para Compras/Vendas e abre o detalhe após o rerun."""
@@ -374,6 +386,10 @@ def _secao_movimentacoes():
                 # Ainda não há navegação para a tela de ajustes. O próprio
                 # movimento identifica o ajuste pelo seu ID.
                 col_origem.markdown(_texto_celula(f"Ajuste #{m['id']}"), unsafe_allow_html=True)
+                col_obs.markdown(_texto_celula(m.get("motivo") or "-"), unsafe_allow_html=True)
+            elif m.get("tipo") == "retirada_pessoal":
+                # Baixa para uso próprio (não é venda): a origem é a própria retirada.
+                col_origem.markdown(_texto_celula(f"Retirada #{m['id']}"), unsafe_allow_html=True)
                 col_obs.markdown(_texto_celula(m.get("motivo") or "-"), unsafe_allow_html=True)
             else:
                 col_origem.markdown(_texto_celula("-"), unsafe_allow_html=True)

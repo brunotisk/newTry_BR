@@ -8,6 +8,7 @@ Usado por:
   - servicos/vendas_import.py   (tipo="saida", ligado a uma venda; e
                                   "ajuste" para estornos de edição/exclusão)
   - telas/estoque_ajuste.py     (tipo="ajuste", lançamento manual)
+  - telas/estoque_retirada.py   (tipo="retirada_pessoal", baixa para uso próprio; não é venda)
 
 Antes desta refatoração, essa lógica de "ler saldo, somar, upsert, inserir
 no ledger" estava reimplementada de forma quase idêntica em três arquivos
@@ -37,7 +38,14 @@ _FLUXO_PADRAO_POR_TIPO = {
     "entrada": "compra_importacao",
     "saida": "venda_manual",
     "ajuste": "ajuste_manual",
+    "retirada_pessoal": "retirada_pessoal",
 }
+
+# Retirada pessoal: baixa de estoque para uso próprio. Não passa por `vendas`, então não
+# entra em faturamento, ticket, comissão nem margem. O estorno é um "ajuste" positivo cujo
+# motivo carrega o id da retirada original (é assim que a retirada é marcada como estornada).
+TIPO_RETIRADA_PESSOAL = "retirada_pessoal"
+PREFIXO_ESTORNO_RETIRADA = "Estorno da retirada pessoal #"
 
 
 def obter_saldo(sb: Client, produto_id: int) -> float:
@@ -57,6 +65,8 @@ def registrar_movimento(
     venda_id: int | None = None,
     operacao_id: str | None = None,
     fluxo: str | None = None,
+    custo_unitario: float | None = None,
+    realizado_por: str | None = None,
 ) -> int:
     """Atualiza o saldo de estoque do produto e grava o movimento correspondente
     no ledger (`estoque_movimentos`). Retorna o id do movimento criado.
@@ -74,6 +84,8 @@ def registrar_movimento(
     `fluxo` identifica o pipeline de origem para a tela de administração
     (ex.: "compra_importacao", "venda_manual"); se omitido, é inferido de
     `tipo`.
+    `custo_unitario` e `realizado_por` são opcionais e só são enviados quando
+    informados (o banco usa os valores padrão das colunas nos demais casos).
     """
     operacao_id = operacao_id or str(uuid.uuid4())
     fluxo = fluxo or _FLUXO_PADRAO_POR_TIPO.get(tipo, "outro")
@@ -114,6 +126,10 @@ def registrar_movimento(
         dados_movimento["compra_id"] = compra_id
     if venda_id is not None:
         dados_movimento["venda_id"] = venda_id
+    if custo_unitario is not None:
+        dados_movimento["custo_unitario"] = float(custo_unitario)
+    if realizado_por is not None:
+        dados_movimento["realizado_por"] = realizado_por
 
     try:
         resp = sb.table("estoque_movimentos").insert(dados_movimento).execute()
@@ -157,4 +173,136 @@ def registrar_ajuste(
         motivo=motivo,
         operacao_id=operacao_id,
         fluxo=fluxo or "ajuste_manual",
+    )
+
+
+# ----------------------------------------------------------------------
+# Retirada pessoal (baixa de estoque para uso próprio — não é venda)
+# ----------------------------------------------------------------------
+class SaldoInsuficienteError(ValueError):
+    """A retirada pede mais peças do que o saldo disponível."""
+
+
+_COLUNA_CUSTO_VERIFICADA = False
+
+
+def _garantir_coluna_custo(sb: Client) -> None:
+    """Falha cedo, ANTES de mexer no saldo, se a migração do custo não foi aplicada."""
+    global _COLUNA_CUSTO_VERIFICADA
+    if _COLUNA_CUSTO_VERIFICADA:
+        return
+    try:
+        sb.table("estoque_movimentos").select("custo_unitario").limit(1).execute()
+    except Exception as exc:
+        raise RuntimeError(
+            "A coluna estoque_movimentos.custo_unitario não existe neste ambiente. "
+            "Execute adicionar_retirada_pessoal.sql no Supabase (HML e PRD) e tente de novo."
+        ) from exc
+    _COLUNA_CUSTO_VERIFICADA = True
+
+
+def obter_custo_unitario(sb: Client, produto_id: int) -> float | None:
+    """Preço da última compra do produto (None se ainda não houver)."""
+    resp = (
+        sb.table("estoque")
+        .select("estoque_preco_ultima_compra")
+        .eq("produto_id", produto_id)
+        .execute()
+    )
+    if not resp.data or resp.data[0].get("estoque_preco_ultima_compra") is None:
+        return None
+    return float(resp.data[0]["estoque_preco_ultima_compra"])
+
+
+def registrar_retirada_pessoal(
+    sb: Client,
+    produto_id: int,
+    quantidade: float,
+    data_movimento: str,
+    motivo: str | None = None,
+    custo_unitario: float | None = None,
+    operacao_id: str | None = None,
+    realizado_por: str = "Manual",
+    permitir_saldo_negativo: bool = False,
+) -> int:
+    """Dá baixa no estoque para uso próprio. `quantidade` é POSITIVA (é gravada negativa).
+
+    Não toca em `vendas`. Grava o custo unitário vigente (preço da última compra) no
+    movimento, para que o valor retirado não mude se o custo mudar depois. Por padrão
+    recusa retirar mais do que o saldo. Retorna o id do movimento.
+    """
+    quantidade = float(quantidade)
+    if quantidade <= 0:
+        raise ValueError("A quantidade da retirada deve ser maior que zero.")
+
+    _garantir_coluna_custo(sb)
+
+    saldo = obter_saldo(sb, produto_id)
+    if not permitir_saldo_negativo and quantidade > saldo + 1e-9:
+        raise SaldoInsuficienteError(
+            f"Saldo insuficiente: disponível {saldo:g}, retirada de {quantidade:g}."
+        )
+    if custo_unitario is None:
+        custo_unitario = obter_custo_unitario(sb, produto_id)
+
+    return registrar_movimento(
+        sb,
+        produto_id=produto_id,
+        quantidade=-quantidade,
+        tipo=TIPO_RETIRADA_PESSOAL,
+        data_movimento=data_movimento,
+        motivo=motivo,
+        operacao_id=operacao_id,
+        fluxo="retirada_pessoal",
+        custo_unitario=custo_unitario,
+        realizado_por=realizado_por,
+    )
+
+
+def estornar_retirada_pessoal(
+    sb: Client,
+    movimento_id: int,
+    data_movimento: str,
+    operacao_id: str | None = None,
+) -> int:
+    """Devolve ao estoque as peças de uma retirada, sem apagar o histórico.
+
+    Grava um "ajuste" positivo automático com motivo "Estorno da retirada pessoal #<id>".
+    Uma retirada só pode ser estornada uma vez. Retorna o id do movimento de estorno.
+    """
+    resp = (
+        sb.table("estoque_movimentos")
+        .select("id, produto_id, tipo, quantidade, custo_unitario")
+        .eq("id", movimento_id)
+        .execute()
+    )
+    if not resp.data:
+        raise ValueError("Retirada não encontrada.")
+    mov = resp.data[0]
+    if mov.get("tipo") != TIPO_RETIRADA_PESSOAL:
+        raise ValueError("O movimento informado não é uma retirada pessoal.")
+
+    motivo = f"{PREFIXO_ESTORNO_RETIRADA}{movimento_id}"
+    ja_estornada = (
+        sb.table("estoque_movimentos")
+        .select("id")
+        .eq("tipo", "ajuste")
+        .eq("motivo", motivo)
+        .limit(1)
+        .execute()
+    )
+    if ja_estornada.data:
+        raise ValueError("Esta retirada já foi estornada.")
+
+    return registrar_movimento(
+        sb,
+        produto_id=mov["produto_id"],
+        quantidade=abs(float(mov["quantidade"])),
+        tipo="ajuste",
+        data_movimento=data_movimento,
+        motivo=motivo,
+        operacao_id=operacao_id,
+        fluxo="retirada_pessoal_estorno",
+        custo_unitario=mov.get("custo_unitario"),
+        realizado_por="Automático",
     )

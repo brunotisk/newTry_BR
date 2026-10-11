@@ -15,6 +15,7 @@ graph LR
         UI_compras["compras.py"]
         UI_vendas["vendas.py"]
         UI_ajuste["estoque_ajuste.py"]
+        UI_retirada["estoque_retirada.py"]
     end
 
     subgraph SERVICOS["servicos/"]
@@ -35,6 +36,7 @@ graph LR
     UI_compras --> arquivos_compra
     UI_vendas --> vendas_import
     UI_ajuste --> estoque
+    UI_retirada --> estoque
 
     compras_import --> estoque
     compras_import --> arquivos_compra
@@ -124,13 +126,39 @@ refatoração, essa lógica estava duplicada em três lugares.
 - `registrar_ajuste(...)` — atalho para `registrar_movimento(tipo="ajuste", ...)`,
   usado tanto pelo ajuste manual de estoque quanto pelos estornos de
   edição/exclusão em `compras_import.py` e `vendas_import.py`.
+- `registrar_retirada_pessoal(sb, produto_id, quantidade, data_movimento, ...) -> int`
+  — baixa para uso próprio (veja a seção "Retirada pessoal" abaixo).
+- `estornar_retirada_pessoal(sb, movimento_id, data_movimento) -> int`
+- `obter_custo_unitario(sb, produto_id) -> float | None` — preço da última compra.
+- `SaldoInsuficienteError`, `TIPO_RETIRADA_PESSOAL`, `PREFIXO_ESTORNO_RETIRADA`.
+
+`registrar_movimento` aceita ainda `custo_unitario` e `realizado_por`
+opcionais: só são enviados ao banco quando informados.
 
 `quantidade` sempre tem sinal (positivo = entrada, negativo = saída/estorno).
 `fluxo` identifica a origem para a tela de admin; se omitido, é inferido do
 `tipo` via `_FLUXO_PADRAO_POR_TIPO`.
 
-Chamado por `compras_import.py` (entradas de NF-e e estornos de exclusão) e
-`vendas_import.py` (saídas de venda e estornos de edição/exclusão).
+Chamado por `compras_import.py` (entradas de NF-e e estornos de exclusão),
+`vendas_import.py` (saídas de venda e estornos de edição/exclusão) e
+`telas/estoque_retirada.py` (retiradas pessoais e seus estornos).
+
+#### Retirada pessoal (baixa que não é venda)
+Retirada de peças para uso próprio. **Não passa por `vendas`**, então não entra
+em faturamento, ticket, comissão nem margem.
+- Cada retirada é uma linha de `estoque_movimentos` com `tipo = 'retirada_pessoal'`,
+  quantidade **negativa**, `venda_id` e `compra_id` nulos e `custo_unitario`
+  preenchido com o preço da última compra **no momento** (o valor retirado não
+  muda se o custo mudar depois). Exige a coluna criada por
+  `adicionar_retirada_pessoal.sql`; sem ela a função falha **antes** de mexer
+  no saldo.
+- Por padrão recusa retirar mais do que o saldo (`SaldoInsuficienteError`).
+- O estorno é um `ajuste` positivo automático (`realizado_por = 'Automático'`)
+  cujo motivo é `"Estorno da retirada pessoal #<id>"`; é assim que a retirada
+  original é marcada como estornada, e por isso só pode ser estornada uma vez.
+- Fluxos de log: `retirada_pessoal` e `retirada_pessoal_estorno`.
+- O FIFO de idade do estoque (`telas/estoque_saldo.py`) trata a retirada como
+  saída, consumindo as camadas mais antigas.
 
 ### `arquivos_compra.py`
 Guarda XML/PDF de uma compra no bucket `compras` do Supabase Storage e

@@ -50,3 +50,6 @@ Adição FOTOS v2
 
 ## 1.8.2 - 10/10/2026
 Melhoria Performance Maleta envio Parceiro
+
+## 1.9.0 - 10/10/2026
+Retirada Peças

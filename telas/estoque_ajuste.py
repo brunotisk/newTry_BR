@@ -326,7 +326,7 @@ def _dialog_ajuste(ajuste=None):
         descricao_ajuste = st.text_input(
             "Descrição do ajuste",
             value=descricao_ajuste_atual,
-            placeholder="Ex.: Peça ganha, retirada pessoal...",
+            placeholder="Ex.: Peça ganha, quebra, extravio...",
             label_visibility="collapsed",
             key=f"ajuste_descricao_{id_ref}",
         )
@@ -517,6 +517,7 @@ def tela_estoque_ajuste():
     st.subheader("🛠️ Ajuste manual de estoque")
     st.caption(
         "Use para perdas, quebras, extravios ou correções após contagem física — "
-        "situações que não vêm de uma compra ou venda registrada."
+        "situações que não vêm de uma compra ou venda registrada. "
+        "Para retirar peças para uso próprio, use a aba **Retiradas pessoais**."
     )
     _secao_listagem()

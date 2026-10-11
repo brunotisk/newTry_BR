@@ -19,6 +19,7 @@ Projeto: **Projeto AC**
 | 011    | Criar estrutura de parc. e comissoes  | ✅ Aplicada     | ✅ Aplicada  |
 | 012    | Adicao_preenchimento_comissao         | ✅ Aplicada     | ✅ Aplicada  |
 | 013    | criar_tabelas_envio_parceiros         | ✅ Aplicada     | ✅ Aplicada  |
+| 015    | adicionar_retirada_pessoal            | ✅ Aplicada     | ✅ Aplicada  |
 ------------------------------------------------------------------------------------
 
 
@@ -74,3 +75,7 @@ Descrição: criação da função e trigger para aplicação automática da com
 **Arquivo**: migrations/013_criar_tabelas_envio_parceiros.sql
 Data: 10/10/2026
 Descrição: criação das tabelas public.parcerias_envios e public.parcerias_envio_itens para controlar os envios de produtos aos parceiros, incluindo número e data do envio, status, totais, produtos, quantidades e valores unitários. Criação de índices para consultas e garantia de apenas um envio aberto por parceiro.
+
+**Arquivo**: migrations/015_adicionar_retirada_pessoal.sql
+Data: 10/10/2026
+Descrição: inclusão do campo custo_unitario na tabela public.estoque_movimentos para registrar o custo unitário dos produtos em retiradas pessoais e respectivos estornos. Criação de índice por tipo e data do movimento e atualização da constraint estoque_movimentos_tipo_check para permitir o tipo 'retirada_pessoal'.

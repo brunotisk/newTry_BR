@@ -38,6 +38,8 @@ FLUXOS = {
     "venda_edicao": "Edição de Venda",
     "venda_exclusao": "Exclusão de Venda",
     "ajuste_manual": "Ajuste Manual de Estoque",
+    "retirada_pessoal": "Retirada Pessoal",
+    "retirada_pessoal_estorno": "Estorno de Retirada Pessoal",
     "outro": "Outro",
 }
 
