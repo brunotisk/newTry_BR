@@ -20,6 +20,7 @@ Projeto: **Projeto AC**
 | 012    | Adicao_preenchimento_comissao         | ✅ Aplicada     | ✅ Aplicada  |
 | 013    | criar_tabelas_envio_parceiros         | ✅ Aplicada     | ✅ Aplicada  |
 | 015    | adicionar_retirada_pessoal            | ✅ Aplicada     | ✅ Aplicada  |
+| 016    | migracao_fotos_maleta                 | ✅ Aplicada     | ✅ Aplicada  |
 ------------------------------------------------------------------------------------
 
 
@@ -79,3 +80,7 @@ Descrição: criação das tabelas public.parcerias_envios e public.parcerias_en
 **Arquivo**: migrations/015_adicionar_retirada_pessoal.sql
 Data: 10/10/2026
 Descrição: inclusão do campo custo_unitario na tabela public.estoque_movimentos para registrar o custo unitário dos produtos em retiradas pessoais e respectivos estornos. Criação de índice por tipo e data do movimento e atualização da constraint estoque_movimentos_tipo_check para permitir o tipo 'retirada_pessoal'.
+
+**Arquivo**: migrations/016_migracao_fotos_maleta.sql  
+Data: 11/10/2026  
+Descrição: Cria a tabela `public.parcerias_envio_arquivos` para registrar fotos de saída e retorno das maletas, configura o bucket público `fotos_maletas` no Supabase Storage com limite de 10 MB por arquivo e restringe os tipos permitidos a JPEG, PNG e WebP. Adiciona índice por envio, desabilita RLS na tabela e configura políticas de envio, leitura e exclusão para o bucket.

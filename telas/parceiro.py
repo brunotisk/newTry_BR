@@ -8,6 +8,7 @@ import hashlib
 import html
 import re
 import unicodedata
+import uuid
 from datetime import date, datetime, timedelta
 from functools import lru_cache
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
@@ -41,6 +42,16 @@ TAM_FOTO = 56             # px de exibição
 # miniatura de 56 px). Com plano que inclui "Image Transformations" (Pro), troque
 # para True: o navegador passa a baixar uma versão reduzida de cada foto.
 TRANSFORMAR_NO_SUPABASE = False
+
+# ----------------------------------------------------------------------
+# Fotos da maleta (conferência de saída): bucket do Supabase Storage + tabela
+# parcerias_envio_arquivos (migracao_fotos_maleta.sql cria os dois).
+# ----------------------------------------------------------------------
+BUCKET_MALETAS = "fotos_maletas"
+LADO_MAX_FOTO_MALETA = 1600   # px: a foto é reduzida antes de enviar (celular gera 4000+ px)
+QUALIDADE_JPEG_MALETA = 82
+TIPOS_FOTO_MALETA = ["jpg", "jpeg", "png", "webp"]
+EXIGIR_FOTO_SAIDA = False     # True: só confirma a saída da maleta com pelo menos 1 foto
 
 _CSS_TABELA_FOTOS = (
     "<style>"
@@ -652,6 +663,7 @@ def _invalidar_cache_envios() -> None:
     _buscar_envios.clear()
     _buscar_itens_dos_envios.clear()
     _buscar_movimentos.clear()
+    _buscar_arquivos.clear()
     _carregar_produtos_disponiveis.clear()
     _panorama_parceiros.clear()
 
@@ -1163,6 +1175,155 @@ def _secao_adicionar_produtos(
         _lista_candidatos(envio, itens, disp, modo, liberado, motivo)
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def _buscar_arquivos(ids_envios: tuple) -> dict:
+    """{envio_id: [arquivos]} (fotos da maleta), mais antigas primeiro."""
+    if not ids_envios:
+        return {}
+    linhas = buscar_todos(
+        lambda: supabase.table("parcerias_envio_arquivos")
+        .select("id, envio_id, etapa, caminho_storage, nome_arquivo, mime_type, tamanho_bytes, criado_em")
+        .in_("envio_id", list(ids_envios))
+        .order("id")
+    )
+    por_envio: dict = {}
+    for a in linhas:
+        por_envio.setdefault(a["envio_id"], []).append(a)
+    return por_envio
+
+
+@lru_cache(maxsize=2048)
+def _url_arquivo(caminho: str) -> str:
+    """URL pública da foto no bucket (calculada uma vez por arquivo)."""
+    return str(supabase.storage.from_(BUCKET_MALETAS).get_public_url(caminho))
+
+
+def _preparar_imagem(conteudo: bytes, nome: str):
+    """Corrige a rotação do celular, reduz para LADO_MAX_FOTO_MALETA px e converte para JPEG.
+    Uma foto de 6 MB vira ~300 KB: menos espaço no Storage e a tela abre mais rápido.
+    Sem a biblioteca Pillow, envia o arquivo original. Arquivo que não é imagem gera erro.
+    Retorna (bytes, mime, extensão)."""
+    extensao = "." + nome.rsplit(".", 1)[-1].lower() if "." in (nome or "") else ".jpg"
+    try:
+        from io import BytesIO
+        from PIL import Image, ImageOps
+    except ImportError:
+        return conteudo, "image/png" if extensao == ".png" else "image/jpeg", extensao
+    try:
+        imagem = ImageOps.exif_transpose(Image.open(BytesIO(conteudo)))
+        if imagem.mode in ("RGBA", "LA", "P"):
+            rgba = imagem.convert("RGBA")
+            fundo = Image.new("RGB", rgba.size, (255, 255, 255))
+            fundo.paste(rgba, mask=rgba.split()[3])
+            imagem = fundo
+        else:
+            imagem = imagem.convert("RGB")
+        imagem.thumbnail((LADO_MAX_FOTO_MALETA, LADO_MAX_FOTO_MALETA))
+        saida = BytesIO()
+        imagem.save(saida, format="JPEG", quality=QUALIDADE_JPEG_MALETA, optimize=True)
+        return saida.getvalue(), "image/jpeg", ".jpg"
+    except Exception as e:
+        raise ValueError(f"não é uma imagem válida ({e.__class__.__name__})")
+
+
+def _salvar_fotos_maleta(envio_id, etapa: str, arquivos: list):
+    """Envia as fotos ao Storage e registra cada uma em parcerias_envio_arquivos.
+    Retorna (quantidade_salva, lista_de_erros)."""
+    salvas, erros = 0, []
+    bucket = supabase.storage.from_(BUCKET_MALETAS)
+    for f in arquivos:
+        caminho = None
+        try:
+            conteudo, mime, extensao = _preparar_imagem(f.getvalue(), f.name)
+            caminho = f"envio_{envio_id}/{etapa}/{uuid.uuid4().hex}{extensao}"
+            bucket.upload(caminho, conteudo, {"content-type": mime})
+            supabase.table("parcerias_envio_arquivos").insert({
+                "envio_id": envio_id,
+                "etapa": etapa,
+                "caminho_storage": caminho,
+                "nome_arquivo": f.name,
+                "mime_type": mime,
+                "tamanho_bytes": len(conteudo),
+            }).execute()
+            salvas += 1
+        except Exception as e:
+            erros.append(f"{f.name}: {e}")
+            if caminho:  # não deixa arquivo órfão no Storage se o registro falhou
+                try:
+                    bucket.remove([caminho])
+                except Exception:
+                    pass
+    return salvas, erros
+
+
+def _remover_foto_maleta(arquivo: dict) -> None:
+    try:
+        supabase.storage.from_(BUCKET_MALETAS).remove([arquivo["caminho_storage"]])
+        supabase.table("parcerias_envio_arquivos").delete().eq("id", arquivo["id"]).execute()
+        _buscar_arquivos.clear()
+        _flash("success", "Foto removida.")
+    except Exception as e:
+        _buscar_arquivos.clear()
+        _flash("warning", f"Não foi possível remover a foto: {e}")
+
+
+def _grade_fotos(arquivos: list, editavel: bool = False) -> None:
+    """Miniaturas em grade; clicar na imagem abre em tela cheia."""
+    por_linha = 4
+    for ini in range(0, len(arquivos), por_linha):
+        colunas = st.columns(por_linha)
+        for coluna, a in zip(colunas, arquivos[ini:ini + por_linha]):
+            with coluna:
+                st.image(
+                    _url_arquivo(a["caminho_storage"]),
+                    caption=f"{'Saída' if a.get('etapa') == 'saida' else 'Retorno'} · {_fmt_data(a.get('criado_em'))}",
+                    use_container_width=True,
+                )
+                if editavel and st.button("🗑 Remover", key=f"parceiros_foto_rm_{a['id']}"):
+                    _remover_foto_maleta(a)
+                    st.rerun()
+
+
+def _secao_fotos_maleta(envio_id, etapa: str = "saida") -> int:
+    """Área de fotos da conferência: fotos já salvas + envio de novas. Retorna quantas existem."""
+    st.markdown("**📷 Fotos da maleta**" + ("" if EXIGIR_FOTO_SAIDA else " (opcional)"))
+    existentes = [a for a in _buscar_arquivos((envio_id,)).get(envio_id, []) if a.get("etapa") == etapa]
+    if existentes:
+        _grade_fotos(existentes, editavel=True)
+
+    contador = f"parceiros_fotos_reset_{envio_id}_{etapa}"
+    novos = st.file_uploader(
+        "Adicionar fotos da maleta",
+        type=TIPOS_FOTO_MALETA,
+        accept_multiple_files=True,
+        key=f"parceiros_fotos_up_{envio_id}_{etapa}_{st.session_state.get(contador, 0)}",
+        help="Tire uma foto da maleta aberta, com as peças à vista, antes de enviar. "
+             "No celular, a opção de câmera aparece ao tocar aqui.",
+    )
+    if st.button(
+        f"📤 Salvar {len(novos)} foto(s)" if novos else "📤 Salvar fotos",
+        key=f"parceiros_fotos_salvar_{envio_id}_{etapa}",
+        disabled=not novos,
+    ):
+        salvas, erros = _salvar_fotos_maleta(envio_id, etapa, novos)
+        _buscar_arquivos.clear()
+        st.session_state[contador] = st.session_state.get(contador, 0) + 1  # esvazia o campo de upload
+        if erros:
+            _flash("warning", f"{salvas} foto(s) salva(s). Falharam: " + " | ".join(erros))
+        else:
+            _flash("success", f"{salvas} foto(s) da maleta salva(s).")
+        st.rerun()
+    return len(existentes)
+
+
+def _mostrar_fotos_maleta(envio_id) -> None:
+    """Fotos da maleta somente para consulta (maleta enviada e histórico)."""
+    arquivos = _buscar_arquivos((envio_id,)).get(envio_id, [])
+    if arquivos:
+        st.markdown("**📷 Fotos da maleta**")
+        _grade_fotos(arquivos, editavel=False)
+
+
 def _iniciar_confirmacao(chave: str) -> None:
     st.session_state[chave] = True
 
@@ -1220,6 +1381,8 @@ def _render_conferencia_saida(envio: dict, itens: list, total_pecas: float, tota
         f"{_fmt_moeda(total_valor)}"
     )
 
+    n_fotos = _secao_fotos_maleta(envio_id, "saida")
+
     col_data, col_obs = st.columns([1, 3])
     with col_data:
         data_saida = st.date_input(
@@ -1241,8 +1404,10 @@ def _render_conferencia_saida(envio: dict, itens: list, total_pecas: float, tota
             "✅ Confirmar envio da maleta",
             type="primary",
             key="parceiros_conf_saida_ok",
-            disabled=n_ok < len(itens),
+            disabled=n_ok < len(itens) or (EXIGIR_FOTO_SAIDA and n_fotos == 0),
         )
+    if EXIGIR_FOTO_SAIDA and n_fotos == 0:
+        st.caption("Anexe pelo menos uma foto da maleta para confirmar o envio.")
     with col_voltar:
         if st.button("Voltar", key="parceiros_conf_saida_voltar"):
             _cancelar_confirmacao(chave_conf)
@@ -1273,6 +1438,19 @@ def _render_conferencia_saida(envio: dict, itens: list, total_pecas: float, tota
 
 def _render_envio_aberto(parceiro: dict, envio: dict, itens: list) -> None:
     envio_id = envio["id"]
+    chave_conf = f"parceiros_envio_conferindo_{envio_id}"
+
+    total_pecas = sum(float(i.get("quantidade") or 0) for i in itens)
+    total_valor = sum(
+        float(i.get("quantidade") or 0) * float(i.get("valor_unitario") or 0) for i in itens
+    )
+
+    # Etapa 2 (conferência de saída) tem tela própria: as tabelas da montagem (itens e lista
+    # de adicionar produtos) saem de cena e só voltam ao clicar em "Voltar".
+    if st.session_state.get(chave_conf) and itens:
+        st.markdown(f"##### Envio #{envio['numero_envio']} — conferência de saída")
+        _render_conferencia_saida(envio, itens, total_pecas, total_valor, chave_conf)
+        return
 
     st.markdown(
         f"##### Envio #{envio['numero_envio']} — montagem da maleta "
@@ -1287,10 +1465,6 @@ def _render_envio_aberto(parceiro: dict, envio: dict, itens: list) -> None:
         st.error(f"Não foi possível carregar os produtos em estoque: {e}")
         return
 
-    total_pecas = sum(float(i.get("quantidade") or 0) for i in itens)
-    total_valor = sum(
-        float(i.get("quantidade") or 0) * float(i.get("valor_unitario") or 0) for i in itens
-    )
     c1, c2, c3 = st.columns(3)
     c1.metric("Produtos no envio", len(itens))
     c2.metric("Peças", _fmt_qtd(total_pecas))
@@ -1300,22 +1474,16 @@ def _render_envio_aberto(parceiro: dict, envio: dict, itens: list) -> None:
     _secao_adicionar_produtos(envio, itens, disp, modo="Aberto")
 
     st.divider()
-    chave_conf = f"parceiros_envio_conferindo_{envio_id}"
-
     if pendentes:
         st.warning("Há alterações não salvas na lista acima. Salve-as antes de conferir e enviar.")
-
-    if st.session_state.get(chave_conf) and not pendentes and itens:
-        _render_conferencia_saida(envio, itens, total_pecas, total_valor, chave_conf)
-    else:
-        st.button(
-            "📦 Conferir e enviar a maleta",
-            type="primary",
-            disabled=not itens or pendentes,
-            key="parceiros_envio_conferir",
-            on_click=_iniciar_confirmacao,
-            args=(chave_conf,),
-        )
+    st.button(
+        "📦 Conferir e enviar a maleta",
+        type="primary",
+        disabled=not itens or pendentes,
+        key="parceiros_envio_conferir",
+        on_click=_iniciar_confirmacao,
+        args=(chave_conf,),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1571,6 +1739,7 @@ def _render_envio_enviado(parceiro: dict, envio: dict, itens: list, movimentos: 
             st.markdown(_tabela_movimentos(movimentos), unsafe_allow_html=True)
         else:
             st.caption("Nenhuma adição ou remoção desde a saída da maleta.")
+        _mostrar_fotos_maleta(envio_id)
 
     elif etapa == ETAPAS_ENVIADO[1]:
         st.caption(
@@ -1729,6 +1898,7 @@ def _render_historico_envios(parceiro: dict, envios: list, itens_por_envio: dict
     if movimentos:
         st.markdown("**Movimentações durante o ciclo**")
         st.markdown(_tabela_movimentos(movimentos), unsafe_allow_html=True)
+    _mostrar_fotos_maleta(envio["id"])
 
 
 def _secao_parceiro_produtos_enviados(parceiro: dict) -> None:
@@ -1761,12 +1931,21 @@ def _secao_parceiro_produtos_enviados(parceiro: dict) -> None:
         )
         return
 
+    # em_foco: etapa de trabalho (conferência, ajuste, recebimento). Nela só aparece o conteúdo
+    # da própria etapa; o histórico e as vendas do canal voltam ao sair dela.
+    em_foco = False
     if ativo is None:
         passo = -1
     elif ativo.get("status") == "Aberto":
-        passo = 1 if st.session_state.get(f"parceiros_envio_conferindo_{ativo['id']}") else 0
+        conferindo = bool(
+            st.session_state.get(f"parceiros_envio_conferindo_{ativo['id']}")
+            and itens_por_envio.get(ativo["id"])
+        )
+        passo, em_foco = (1, True) if conferindo else (0, False)
     else:
-        passo = 3 if st.session_state.get(f"parceiros_etapa_{ativo['id']}") == ETAPAS_ENVIADO[2] else 2
+        etapa = st.session_state.get(f"parceiros_etapa_{ativo['id']}")
+        passo = 3 if etapa == ETAPAS_ENVIADO[2] else 2
+        em_foco = etapa in (ETAPAS_ENVIADO[1], ETAPAS_ENVIADO[2])
     st.markdown(
         _html_passos(["Montagem", "Conferência de saída", "Maleta com o parceiro", "Recebimento e fechamento"], passo),
         unsafe_allow_html=True,
@@ -1781,6 +1960,9 @@ def _secao_parceiro_produtos_enviados(parceiro: dict) -> None:
             parceiro, ativo, itens_por_envio.get(ativo["id"], []),
             movimentos_por_envio.get(ativo["id"], []),
         )
+
+    if em_foco:
+        return
 
     st.divider()
     _render_historico_envios(parceiro, envios, itens_por_envio, movimentos_por_envio)
