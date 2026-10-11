@@ -577,15 +577,51 @@ def _top_agrupado(df: pd.DataFrame, col_grupo: str, col_valor: str, n: int = 10)
 
 
 def _grafico_horizontal(df: pd.DataFrame, titulo_valor: str, cor: str | None = None):
+    """Barras horizontais com o mesmo acabamento visual dos gráficos mensais ECharts."""
     if df.empty:
         st.caption("Sem dados no período.")
         return
-    chart = alt.Chart(df).mark_bar(**({"color": cor} if cor else {})).encode(
-        y=alt.Y("rotulo:N", sort="-x", title=None, axis=alt.Axis(labelLimit=240)),
-        x=alt.X("valor:Q", title=None, axis=alt.Axis(format="~s")),
-        tooltip=[alt.Tooltip("rotulo:N", title="Item"), alt.Tooltip("texto:N", title=titulo_valor)],
-    ).properties(height=max(140, 30 * len(df) + 20))
-    st.altair_chart(chart)
+
+    cor = cor or COR_VENDAS
+    dados = {
+        "rotulos": df["rotulo"].astype(str).tolist(),
+        "valores": [_num(v) for v in df["valor"]],
+        "textos": df["texto"].astype(str).tolist(),
+        "nome": titulo_valor,
+        "cor": cor,
+        "tema": _tema_streamlit(),
+    }
+    payload = json.dumps(dados, ensure_ascii=False).replace("</", "<\\/")
+    altura = max(220, 58 * len(df) + 70)
+    html = r'''<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<style>
+html,body{margin:0;padding:0;background:transparent;font-family:"Source Sans Pro",-apple-system,"Segoe UI",Roboto,sans-serif}
+#g{width:100%;height:__ALTURA__px}
+.erro{padding:24px;font-size:14px;color:#6b7280}
+</style>
+<script src="__ECHARTS_URL__"></script></head><body><div id="g"></div>
+<script>
+const D=__DADOS__;
+(function(){
+ const el=document.getElementById('g');
+ if(typeof echarts==='undefined'){el.innerHTML='<div class="erro">Não foi possível carregar a biblioteca do gráfico (ECharts). Verifique a conexão com a internet.</div>';return;}
+ const escuro=(D.tema||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light'))==='dark';
+ const C=escuro?{texto:'#e5e7eb',sub:'#9ca3af',linha:'rgba(255,255,255,0.12)',sombra:'rgba(255,255,255,0.06)',tipFundo:'#1f2937',tipBorda:'#374151'}:{texto:'#1f2937',sub:'#6b7280',linha:'rgba(0,0,0,0.10)',sombra:'rgba(0,0,0,0.04)',tipFundo:'#ffffff',tipBorda:'#e5e7eb'};
+ const compacto=v=>{const a=Math.abs(v);if(a>=1e6)return (v/1e6).toLocaleString('pt-BR',{maximumFractionDigits:1})+' mi';if(a>=1e3)return (v/1e3).toLocaleString('pt-BR',{maximumFractionDigits:1})+' mil';return v.toLocaleString('pt-BR',{maximumFractionDigits:0});};
+ const chart=echarts.init(el,null,{renderer:'canvas'});
+ chart.setOption({animationDuration:600,textStyle:{fontFamily:'"Source Sans Pro",-apple-system,"Segoe UI",Roboto,sans-serif'},
+  grid:{left:8,right:24,top:8,bottom:8,containLabel:true},
+  tooltip:{trigger:'axis',axisPointer:{type:'shadow',shadowStyle:{color:C.sombra}},backgroundColor:C.tipFundo,borderColor:C.tipBorda,padding:[10,12],textStyle:{color:C.texto,fontSize:13},formatter:ps=>{const p=ps[0];return '<div style="font-weight:700;margin-bottom:5px">'+D.rotulos[p.dataIndex]+'</div><div style="display:flex;justify-content:space-between;gap:18px"><span><span style="display:inline-block;width:9px;height:9px;border-radius:50%;background:'+D.cor+';margin-right:6px"></span>'+D.nome+'</span><b>'+D.textos[p.dataIndex]+'</b></div>'; }},
+  xAxis:{type:'value',axisLabel:{color:C.sub,formatter:compacto},axisLine:{show:false},axisTick:{show:false},splitLine:{lineStyle:{color:C.linha,type:'dashed'}}},
+  yAxis:{type:'category',data:D.rotulos,inverse:true,axisLabel:{color:C.sub,fontSize:12,width:230,overflow:'truncate'},axisLine:{show:false},axisTick:{show:false}},
+  series:[{name:D.nome,type:'bar',data:D.valores,barMaxWidth:28,itemStyle:{borderRadius:[0,6,6,0],color:new echarts.graphic.LinearGradient(1,0,0,0,[{offset:0,color:D.cor},{offset:1,color:D.cor+'b3'}])},label:{show:true,position:'right',distance:6,color:C.texto,fontSize:12,fontWeight:600,formatter:p=>D.textos[p.dataIndex]},labelLayout:{hideOverlap:true},emphasis:{itemStyle:{shadowBlur:12,shadowColor:D.cor+'66'}}}]
+ });
+ new ResizeObserver(()=>chart.resize()).observe(el);
+})();
+</script></body></html>'''
+    html = html.replace("__ECHARTS_URL__", _ECHARTS_URL).replace("__ALTURA__", str(altura)).replace("__DADOS__", payload)
+    components.html(html, height=altura + 4)
 
 
 def _kpi(coluna, rotulo: str, valor: str, ajuda: str | None = None, detalhe: str | None = None,
@@ -672,7 +708,9 @@ def _visao_compras(ini, fim):
         }),
         hide_index=True,
         use_container_width=True,
-        column_config={"Foto": st.column_config.ImageColumn("Foto", width="small")},
+        column_config={"Foto": st.column_config.ImageColumn("Foto", width="large")},
+        row_height=180,
+        height=700,
     )
 
 
@@ -865,58 +903,140 @@ def _bloco_kpis_vendas(atual: dict, anterior: dict | None):
     _kpi(c6, "Comissões", _fmt_moeda(atual["comissoes"]), detalhe=d_pct("comissoes"))
 
 
-def _bloco_clientes(df: pd.DataFrame, base: pd.DataFrame, ini):
-    """Novos x recorrentes (1ª compra dentro do período = novo) e top clientes."""
-    com = df[df["cliente_key"] != ""].copy()
-    if com.empty:
-        st.caption("Nenhuma venda com cliente informado no período.")
-        return
+def _grafico_clientes(dados: pd.DataFrame):
+    """Comparação de clientes novos e recorrentes, com valores e percentuais legíveis."""
+    cores = {"Novos": COR_CLIENTE_NOVO, "Recorrentes": COR_VENDAS}
+    rotulos = dados["grupo"].astype(str).tolist()
+    valores = [_num(v) for v in dados["clientes"]]
+    percentuais = [_num(v) for v in dados["pct"]]
+    paleta = [cores.get(r, COR_VENDAS) for r in rotulos]
+    payload = json.dumps({
+        "rotulos": rotulos, "valores": valores, "percentuais": percentuais,
+        "cores": paleta, "tema": _tema_streamlit(),
+    }, ensure_ascii=False).replace("</", "<\\/")
+    altura = max(150, 58 * len(rotulos) + 48)
+    html = r'''<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<style>
+html,body{margin:0;padding:0;background:transparent;font-family:"Source Sans Pro",-apple-system,"Segoe UI",Roboto,sans-serif}
+#g{width:100%;height:__ALTURA__px}
+.erro{padding:20px;font-size:14px;color:#6b7280}
+</style>
+<script src="__ECHARTS_URL__"></script></head><body><div id="g"></div>
+<script>
+const D=__DADOS__;
+(function(){
+ const el=document.getElementById('g');
+ if(typeof echarts==='undefined'){el.innerHTML='<div class="erro">Não foi possível carregar o gráfico. Verifique a conexão com a internet.</div>';return;}
+ const escuro=(D.tema||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light'))==='dark';
+ const C=escuro?{texto:'#e5e7eb',sub:'#9ca3af',linha:'rgba(255,255,255,0.12)',tipFundo:'#1f2937',tipBorda:'#374151'}:{texto:'#1f2937',sub:'#6b7280',linha:'rgba(0,0,0,0.10)',tipFundo:'#ffffff',tipBorda:'#e5e7eb'};
+ const fmt=n=>Number(n).toLocaleString('pt-BR',{maximumFractionDigits:0});
+ const chart=echarts.init(el,null,{renderer:'canvas'});
+ chart.setOption({
+  animationDuration:500,
+  textStyle:{fontFamily:'"Source Sans Pro",-apple-system,"Segoe UI",Roboto,sans-serif'},
+  grid:{left:8,right:66,top:8,bottom:8,containLabel:true},
+  tooltip:{trigger:'axis',axisPointer:{type:'shadow'},backgroundColor:C.tipFundo,borderColor:C.tipBorda,padding:[9,11],textStyle:{color:C.texto,fontSize:13},
+   formatter:ps=>{const p=ps[0],i=p.dataIndex;return '<b>'+D.rotulos[i]+'</b><br>'+fmt(D.valores[i])+' clientes · '+D.percentuais[i].toLocaleString('pt-BR',{maximumFractionDigits:1})+'%';}},
+  xAxis:{type:'value',min:0,axisLabel:{color:C.sub,formatter:fmt},axisLine:{show:false},axisTick:{show:false},splitLine:{lineStyle:{color:C.linha,type:'dashed'}}},
+  yAxis:{type:'category',data:D.rotulos,inverse:true,axisLabel:{color:C.texto,fontSize:13,fontWeight:600},axisLine:{show:false},axisTick:{show:false}},
+  series:[{type:'bar',data:D.valores,barMaxWidth:26,
+   itemStyle:{borderRadius:[0,7,7,0],color:p=>new echarts.graphic.LinearGradient(1,0,0,0,[{offset:0,color:D.cores[p.dataIndex]},{offset:1,color:D.cores[p.dataIndex]+'b3'}])},
+   label:{show:true,position:'right',distance:8,color:C.texto,fontSize:12,fontWeight:600,formatter:p=>fmt(p.value)+' · '+D.percentuais[p.dataIndex].toLocaleString('pt-BR',{maximumFractionDigits:1})+'%'},
+   emphasis:{itemStyle:{shadowBlur:10,shadowColor:'rgba(0,0,0,0.15)'}}}]
+ });
+ new ResizeObserver(()=>chart.resize()).observe(el);
+})();
+</script></body></html>'''
+    html = html.replace("__ECHARTS_URL__", _ECHARTS_URL).replace("__ALTURA__", str(altura)).replace("__DADOS__", payload)
+    components.html(html, height=altura + 4)
 
-    if ini is not None:
+
+def _bloco_clientes(df: pd.DataFrame, base: pd.DataFrame, ini, fim):
+    """Clientes novos/recorrentes e rankings de clientes do período e inativos."""
+    com = df[df["cliente_key"] != ""].copy()
+
+    if not com.empty and ini is not None:
         primeira = base[base["cliente_key"] != ""].groupby("cliente_key")["data"].min()
         com["novo"] = com["cliente_key"].map(primeira) >= pd.Timestamp(ini)
         por_cliente = com.groupby("cliente_key").agg(novo=("novo", "first"))
         n_novos = int(por_cliente["novo"].sum())
         n_rec = len(por_cliente) - n_novos
-
         dados = pd.DataFrame({"grupo": ["Novos", "Recorrentes"], "clientes": [n_novos, n_rec]})
         dados["pct"] = dados["clientes"] / max(len(por_cliente), 1) * 100
         dados["texto"] = [f"{c} ({_fmt_pct(p)})" for c, p in zip(dados["clientes"], dados["pct"])]
-        st.altair_chart(
-            alt.Chart(dados).mark_bar().encode(
-                x=alt.X("clientes:Q", stack="normalize", axis=None),
-                color=alt.Color(
-                    "grupo:N",
-                    scale=alt.Scale(domain=["Novos", "Recorrentes"], range=[COR_CLIENTE_NOVO, COR_VENDAS]),
-                    legend=alt.Legend(orient="bottom", title=None),
-                ),
-                tooltip=[alt.Tooltip("grupo:N", title="Grupo"), alt.Tooltip("texto:N", title="Clientes")],
-            ).properties(height=50)
-        )
-
-        def ticket(novo: bool) -> str:
-            sub = com[com["novo"] == novo]
-            return _fmt_moeda(sub["valor_final"].sum() / len(sub)) if len(sub) else "-"
-
-        st.caption(f"Ticket médio: novos **{ticket(True)}** · recorrentes **{ticket(False)}**")
+        _grafico_clientes(dados)
+    elif com.empty:
+        st.caption("Nenhuma venda com cliente informado no período.")
     else:
-        st.caption("Escolha um período (que não seja “Todo período”) para ver novos x recorrentes.")
+        st.caption("Todo período selecionado: não há um recorte atual para comparar novos x recorrentes.")
 
-    top = (
-        com.groupby("cliente_key")
-        .agg(cliente=("cliente", "first"), compras=("id", "count"), fat=("valor_final", "sum"))
-        .sort_values("fat", ascending=False)
-        .head(5)
-    )
-    st.dataframe(
-        pd.DataFrame({
-            "Cliente": top["cliente"],
-            "Compras": top["compras"].map(_fmt_num),
-            "Faturamento": top["fat"].map(_fmt_moeda),
-        }),
-        hide_index=True,
-        use_container_width=True,
-    )
+    col_atual, col_inativo = st.columns(2, gap="large")
+
+    with col_atual:
+        st.markdown("### Top 5 — período selecionado")
+        if com.empty:
+            st.caption("Nenhuma compra de cliente no período.")
+        else:
+            top_atual = (
+                com.groupby("cliente_key")
+                .agg(
+                    cliente=("cliente", "first"),
+                    valor=("valor_final", "sum"),
+                    compras=("id", "count"),
+                )
+                .sort_values("valor", ascending=False)
+                .head(5)
+                .reset_index(drop=True)
+            )
+            st.dataframe(
+                pd.DataFrame({
+                    "Cliente": top_atual["cliente"],
+                    "Valor comprado": top_atual["valor"].map(_fmt_moeda),
+                    "Compras": top_atual["compras"].map(_fmt_num),
+                }),
+                hide_index=True,
+                use_container_width=True,
+            )
+
+    with col_inativo:
+        st.markdown("### Top 5 — sem compra no período")
+        historico = base[base["cliente_key"] != ""].copy()
+        if ini is not None and fim is not None:
+            dentro = (
+                (historico["data"] >= pd.Timestamp(ini))
+                & (historico["data"] < pd.Timestamp(fim) + pd.Timedelta(days=1))
+            )
+            clientes_atuais = set(historico.loc[dentro, "cliente_key"])
+            historico = historico[~dentro & ~historico["cliente_key"].isin(clientes_atuais)]
+        else:
+            historico = historico.iloc[0:0]
+
+        if historico.empty:
+            st.caption("Não há clientes inativos identificados para o intervalo selecionado.")
+        else:
+            top_hist = (
+                historico.groupby("cliente_key")
+                .agg(
+                    cliente=("cliente", "first"),
+                    valor=("valor_final", "sum"),
+                    compras=("id", "count"),
+                    ultima_compra=("data", "max"),
+                )
+                .sort_values("valor", ascending=False)
+                .head(5)
+                .reset_index(drop=True)
+            )
+            st.dataframe(
+                pd.DataFrame({
+                    "Cliente": top_hist["cliente"],
+                    "Valor histórico": top_hist["valor"].map(_fmt_moeda),
+                    "Compras": top_hist["compras"].map(_fmt_num),
+                    "Última compra": top_hist["ultima_compra"].map(_fmt_data),
+                }),
+                hide_index=True,
+                use_container_width=True,
+            )
 
 
 def _bloco_feiras(df: pd.DataFrame):
@@ -1031,7 +1151,7 @@ def _visao_vendas(ini, fim):
     col_cli, col_fei = st.columns(2)
     with col_cli:
         st.subheader("Clientes")
-        _bloco_clientes(df, base, ini)
+        _bloco_clientes(df, base, ini, fim)
     with col_fei:
         st.subheader("Feiras e eventos")
         _bloco_feiras(df)
@@ -1052,7 +1172,9 @@ def _visao_vendas(ini, fim):
         }),
         hide_index=True,
         use_container_width=True,
-        column_config={"Foto": st.column_config.ImageColumn("Foto", width="small")},
+        column_config={"Foto": st.column_config.ImageColumn("Foto", width="large")},
+        row_height=180,
+        height=700,
     )
 
 

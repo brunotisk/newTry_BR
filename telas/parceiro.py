@@ -6,6 +6,8 @@ Ponto de entrada: secao_parceiros().
 """
 import hashlib
 import html
+import re
+import unicodedata
 from datetime import date, datetime, timedelta
 from functools import lru_cache
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
@@ -52,6 +54,77 @@ _CSS_TABELA_FOTOS = (
     "border:1px dashed rgba(128,128,128,.6)}"
     "</style>"
 )
+
+_CSS_NAVEGACAO = (
+    "<style>"
+    ".nav-chips{display:flex;flex-wrap:wrap;gap:.4rem;margin:.1rem 0 .7rem}"
+    ".nav-chip{display:inline-flex;align-items:center;padding:.2rem .7rem;border-radius:999px;"
+    "font-size:.82rem;border:1px solid rgba(128,128,128,.35);background:rgba(128,128,128,.08)}"
+    ".nav-chip.ok{border-color:rgba(40,167,69,.55);background:rgba(40,167,69,.10)}"
+    ".nav-chip.atencao{border-color:rgba(255,160,0,.65);background:rgba(255,193,7,.14)}"
+    ".nav-passos{display:flex;gap:.3rem;margin:.2rem 0 .9rem;flex-wrap:wrap}"
+    ".nav-passo{flex:1 1 0;min-width:8rem;text-align:center;padding:.35rem .5rem;border-radius:8px;"
+    "font-size:.8rem;border:1px solid rgba(128,128,128,.3);opacity:.55}"
+    ".nav-passo.feito{opacity:.9;border-color:rgba(40,167,69,.55);background:rgba(40,167,69,.10)}"
+    ".nav-passo.atual{opacity:1;font-weight:700;border-color:rgba(0,123,255,.75);background:rgba(0,123,255,.14)}"
+    "</style>"
+)
+
+
+def _injetar_css() -> None:
+    """CSS das tabelas com foto e da navegação, enviado UMA vez por execução (antes cada
+    tabela HTML repetia o bloco <style> inteiro)."""
+    st.markdown(_CSS_TABELA_FOTOS + _CSS_NAVEGACAO, unsafe_allow_html=True)
+
+
+def _html_chips(chips: list) -> str:
+    """chips: lista de (texto, classe) com classe '', 'ok' ou 'atencao'."""
+    itens = "".join(
+        f'<span class="nav-chip {classe}">{html.escape(texto)}</span>' for texto, classe in chips
+    )
+    return f'<div class="nav-chips">{itens}</div>'
+
+
+def _html_passos(passos: list, atual: int) -> str:
+    """Indicador de etapas: as anteriores à atual aparecem concluídas (atual=-1: nenhuma)."""
+    itens = []
+    for i, nome in enumerate(passos):
+        classe = "atual" if i == atual else ("feito" if 0 <= atual and i < atual else "")
+        marca = "✓ " if classe == "feito" else f"{i + 1}. "
+        itens.append(f'<div class="nav-passo {classe}">{marca}{html.escape(nome)}</div>')
+    return f'<div class="nav-passos">{"".join(itens)}</div>'
+
+
+def _menu(rotulo: str, opcoes: list, key: str, formatar=None) -> str:
+    """Menu de navegação: controle segmentado (Streamlit >= 1.40) ou, se não existir,
+    radio horizontal. Sempre devolve uma opção válida (não deixa 'desmarcar')."""
+    formatar = formatar or str
+    ultimo = f"{key}__ultimo"
+    padrao = st.session_state.get(ultimo, opcoes[0])
+    segmentado = getattr(st, "segmented_control", None)
+    if segmentado is None:
+        if st.session_state.get(key) not in opcoes:
+            st.session_state[key] = padrao if padrao in opcoes else opcoes[0]
+        escolhida = st.radio(
+            rotulo, opcoes, horizontal=True, key=key,
+            format_func=formatar, label_visibility="collapsed",
+        )
+    else:
+        if st.session_state.get(key) not in opcoes:
+            st.session_state[key] = padrao if padrao in opcoes else opcoes[0]
+
+        def _nao_desmarcar():
+            if st.session_state.get(key) is None:  # clicar na opção ativa a desmarcaria
+                st.session_state[key] = st.session_state.get(ultimo, opcoes[0])
+
+        escolhida = segmentado(
+            rotulo, opcoes, selection_mode="single", key=key, format_func=formatar,
+            on_change=_nao_desmarcar, label_visibility="collapsed",
+        )
+        if escolhida not in opcoes:
+            escolhida = padrao if padrao in opcoes else opcoes[0]
+    st.session_state[ultimo] = escolhida
+    return escolhida
 
 
 def _url_miniatura_base(url: str) -> str:
@@ -152,7 +225,7 @@ def _html_tabela_produtos(linhas: list) -> str:
         "<tr><th>Foto</th><th>Código</th><th>Produto</th>"
         '<th class="num">Qtd</th><th class="num">Valor unit.</th><th class="num">Subtotal</th></tr>'
     )
-    return _CSS_TABELA_FOTOS + '\n<table class="tab-fotos">' + cabecalho + "".join(corpo) + "</table>"
+    return '<table class="tab-fotos">' + cabecalho + "".join(corpo) + "</table>"
 
 
 
@@ -365,7 +438,7 @@ def _html_tabela(cabecalhos: list, linhas: list, colunas_num=()) -> str:
                 texto = html.escape(str(c)).replace("$", "&#36;")
                 tds.append(f"<td{cls}>{texto}</td>")
         trs.append("<tr>" + "".join(tds) + "</tr>")
-    return _CSS_TABELA_FOTOS + '\n<table class="tab-fotos"><tr>' + ths + "</tr>" + "".join(trs) + "</table>"
+    return '<table class="tab-fotos"><tr>' + ths + "</tr>" + "".join(trs) + "</table>"
 
 
 # ---------------------------------------------------------------------------
@@ -451,6 +524,34 @@ def _vendido_por_produto(canal_id, desde) -> dict:
     return total
 
 
+SEM_CATEGORIA = "(sem categoria)"
+SEM_BANHO = "(sem banho)"
+
+
+def _norm(texto) -> str:
+    """Minúsculas e sem acentos: 'Coração' e 'coracao' passam a ser a mesma busca."""
+    base = unicodedata.normalize("NFKD", str(texto or ""))
+    return "".join(c for c in base if not unicodedata.combining(c)).casefold().strip()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _buscar_categorias() -> dict:
+    """{categoria_id: {'categoria', 'banho'}} de categorias_produtos (cadastro pequeno).
+    Inclui as inativas: um produto antigo ainda pode apontar para elas."""
+    try:
+        linhas = buscar_todos(
+            lambda: supabase.table("categorias_produtos")
+            .select("id, categoria, banho")
+            .order("id")
+        )
+    except Exception:
+        return {}
+    return {
+        l["id"]: {"categoria": (l.get("categoria") or "").strip(), "banho": (l.get("banho") or "").strip()}
+        for l in linhas
+    }
+
+
 @st.cache_data(ttl=30, show_spinner=False)
 def _carregar_produtos_disponiveis() -> dict:
     """Produtos com saldo em estoque, descontando o que está reservado em envios
@@ -459,13 +560,14 @@ def _carregar_produtos_disponiveis() -> dict:
       - envio Enviado: o que ainda está com o parceiro (enviado - vendido), porque
         o que já foi vendido já saiu do saldo do estoque pelo fluxo de vendas.
 
-    Retorna {produto_id: {codigo, descricao, foto_url, saldo, comprometido, disponivel, preco}}.
+    Retorna {produto_id: {codigo, descricao, foto_url, categoria, banho, saldo, comprometido,
+    disponivel, preco, busca_cod, busca_desc}}.
     """
     linhas_estoque = buscar_todos(
         lambda: supabase.table("estoque")
         .select(
             "quantidade_atual, estoque_preco_venda_sugerida, "
-            "produtos(id, codigo_interno, descricao, foto_url)"
+            "produtos(id, codigo_interno, descricao, foto_url, categoria_id)"
         )
         .gt("quantidade_atual", 0)
         .order("produto_id")
@@ -503,17 +605,23 @@ def _carregar_produtos_disponiveis() -> dict:
                 com_parceiro = max(qtd - vendidos.get(pid, 0.0), 0.0) if vendidos else qtd
                 comprometido[pid] = comprometido.get(pid, 0.0) + com_parceiro
 
+    categorias = _buscar_categorias()
     produtos: dict = {}
     for linha in linhas_estoque:
         produto = linha.get("produtos")
         if not produto:
             continue
+        cat = categorias.get(produto.get("categoria_id"), {})
         saldo = float(linha.get("quantidade_atual") or 0)
         reservado = comprometido.get(produto["id"], 0.0)
         produtos[produto["id"]] = {
             "codigo": produto.get("codigo_interno") or "-",
             "descricao": produto.get("descricao") or "-",
             "foto_url": produto.get("foto_url"),
+            "categoria": cat.get("categoria", ""),
+            "banho": cat.get("banho", ""),
+            "busca_cod": _norm(produto.get("codigo_interno")),
+            "busca_desc": _norm(produto.get("descricao")),
             "saldo": saldo,
             "comprometido": reservado,
             "disponivel": max(saldo - reservado, 0.0),
@@ -545,13 +653,17 @@ def _invalidar_cache_envios() -> None:
     _buscar_itens_dos_envios.clear()
     _buscar_movimentos.clear()
     _carregar_produtos_disponiveis.clear()
+    _panorama_parceiros.clear()
 
 
 def _atualizar_dados() -> None:
-    """Botão 'Atualizar': também descarta vendas/estoque alterados em outras telas."""
+    """Botão 🔄 do cabeçalho: descarta TODAS as leituras em cache (inclusive o que foi
+    alterado em outras telas: parceiros, vendas, estoque)."""
     _invalidar_cache_envios()
+    _invalidar_cache_fechamento()
     _vendido_por_produto.clear()
     _buscar_vendas_canal.clear()
+    _buscar_parceiros_ativos.clear()
 
 
 def _atualizar_vendas_fechamento() -> None:
@@ -828,165 +940,228 @@ def _secao_itens_envio(
     return pendentes
 
 
+def _cb_limpar_filtros(chaves: tuple) -> None:
+    for chave in chaves:
+        st.session_state[chave] = [] if chave.endswith(("_cat", "_banho")) else ""
+
+
 @_fragmento
-def _secao_adicionar_produtos(
+def _lista_candidatos(
     envio: dict, itens: list, disp: dict, modo: str,
     liberado: bool = True, motivo: str = "",
 ) -> None:
-    """Seleção (com fotos) de novos produtos para a maleta."""
+    """Lista paginada (com fotos) para escolher novos produtos para a maleta."""
     envio_id = envio["id"]
     reset = st.session_state.get("parceiros_envio_reset", 0)
 
     ja_no_envio = {it["produto_id"] for it in itens}
-    with st.expander("➕ Adicionar produtos ao envio", expanded=not itens):
-        filtro = st.text_input(
-            "Buscar produto (código ou descrição)",
-            key=f"parceiros_envio_busca_{envio_id}",
-        ).strip().lower()
+    disponiveis = [
+        (pid, p) for pid, p in disp.items()
+        if pid not in ja_no_envio and p["disponivel"] > 0
+    ]
 
-        candidatos = [
-            (pid, p) for pid, p in disp.items()
-            if pid not in ja_no_envio
-            and p["disponivel"] > 0
-            and (not filtro or filtro in f"{p['codigo']} {p['descricao']}".lower())
-        ]
+    # --- filtros: código, produto, categoria e banho (todos combinam entre si) ---
+    prefixo = f"parceiros_filtro_{envio_id}"
+    k_cod, k_prod, k_cat, k_banho = (f"{prefixo}_{n}" for n in ("cod", "prod", "cat", "banho"))
+    opcoes_cat = sorted({p.get("categoria") or SEM_CATEGORIA for _, p in disponiveis}, key=_norm)
+    opcoes_banho = sorted({p.get("banho") or SEM_BANHO for _, p in disponiveis}, key=_norm)
+    for chave, opcoes in ((k_cat, opcoes_cat), (k_banho, opcoes_banho)):
+        if chave in st.session_state:  # descarta o que deixou de existir (ex.: acabou o saldo)
+            st.session_state[chave] = [v for v in st.session_state[chave] if v in opcoes]
 
-        if not candidatos:
-            st.info("Nenhum produto disponível para adicionar com este filtro.")
-            return
+    mostrar_categorias = opcoes_cat != [SEM_CATEGORIA] or opcoes_banho != [SEM_BANHO]
+    c_cod, c_prod, c_cat, c_banho = st.columns([1.1, 1.7, 1.4, 1.4])
+    filtro_cod = c_cod.text_input(
+        "Código", key=k_cod, placeholder="13465 ou vários: 13465, 13470",
+        help="Aceita um ou mais códigos separados por vírgula, ponto e vírgula ou espaço.",
+    )
+    filtro_prod = c_prod.text_input(
+        "Produto", key=k_prod, placeholder="ex.: brinco coração",
+        help="Todas as palavras precisam aparecer na descrição. Acentos não importam.",
+    )
+    cats_sel = banhos_sel = []
+    if mostrar_categorias:
+        cats_sel = c_cat.multiselect("Categoria", opcoes_cat, key=k_cat, placeholder="Todas")
+        banhos_sel = c_banho.multiselect("Banho", opcoes_banho, key=k_banho, placeholder="Todos")
 
-        # Seleção guardada em session_state: sobrevive à troca de página e de busca.
-        base = f"parceiros_cand_{envio_id}_{reset}"
-        sel = st.session_state.setdefault(f"{base}_sel", {})
-        for pid in list(sel):  # descarta o que deixou de estar disponível
-            if pid in ja_no_envio or pid not in disp or disp[pid]["disponivel"] <= 0:
-                sel.pop(pid)
+    tokens_cod = [t for t in re.split(r"[\s,;]+", _norm(filtro_cod)) if t]
+    palavras = [w for w in _norm(filtro_prod).split() if w]
+    filtros_ativos = bool(tokens_cod or palavras or cats_sel or banhos_sel)
 
-        POR_PAGINA = 20
-        n_paginas = max(1, (len(candidatos) + POR_PAGINA - 1) // POR_PAGINA)
-        sufixo_filtro = hashlib.md5(filtro.encode("utf-8")).hexdigest()[:8]
-        if n_paginas > 1:
-            pagina = st.number_input(
-                f"Página (de {n_paginas}) — {len(candidatos)} produtos",
-                min_value=1,
-                max_value=n_paginas,
-                value=1,
-                step=1,
-                key=f"{base}_pag_{sufixo_filtro}",
-            )
-        else:
-            pagina = 1
-        visiveis = candidatos[(pagina - 1) * POR_PAGINA: pagina * POR_PAGINA]
+    candidatos = [
+        (pid, p) for pid, p in disponiveis
+        if (not tokens_cod or any(t in p["busca_cod"] for t in tokens_cod))
+        and all(w in p["busca_desc"] for w in palavras)
+        and (not cats_sel or (p.get("categoria") or SEM_CATEGORIA) in cats_sel)
+        and (not banhos_sel or (p.get("banho") or SEM_BANHO) in banhos_sel)
+    ]
 
-        _legenda_fotos([p.get("foto_url") for _, p in visiveis])
-        cols_cand = [0.9, 1.0, 1.3, 3.0, 0.9, 1.0, 1.3, 1.3]
-        with st.container(border=True):
-            for col, titulo in zip(
-                st.columns(cols_cand, vertical_alignment="center"),
-                ["Selecionar", "Foto", "Código", "Produto", "Saldo", "Disp.", "Qtd", "Valor unit."],
-            ):
-                col.markdown(f"**{titulo}**")
+    if filtros_ativos:
+        col_n, col_limpar = st.columns([4, 1])
+        col_n.caption(f"{len(candidatos)} de {len(disponiveis)} produto(s) com os filtros aplicados.")
+        col_limpar.button(
+            "Limpar filtros", key=f"{prefixo}_limpar",
+            on_click=_cb_limpar_filtros, args=((k_cod, k_prod, k_cat, k_banho),),
+        )
 
-            for pid, p in visiveis:
-                c_sel, c_foto, c_cod, c_prod, c_saldo, c_disp, c_qtd, c_val = st.columns(
-                    cols_cand, vertical_alignment="center"
-                )
-                maximo = float(p["disponivel"])
-                minimo = min(1.0, maximo)
-                k_chk, k_qtd = f"{base}_chk_{pid}", f"{base}_qtd_{pid}"
-                if k_chk not in st.session_state:  # widgets fora da tela perdem o estado
-                    st.session_state[k_chk] = pid in sel
-                if k_qtd not in st.session_state:
-                    st.session_state[k_qtd] = float(sel.get(pid, 1.0))
-                st.session_state[k_qtd] = min(max(float(st.session_state[k_qtd]), minimo), maximo)
+    if not candidatos:
+        st.info("Nenhum produto disponível para adicionar com estes filtros.")
+        return
 
-                marcado = c_sel.checkbox("Selecionar", key=k_chk, label_visibility="collapsed")
-                with c_foto:
-                    _mostrar_foto(p.get("foto_url"))
-                c_cod.write(p["codigo"])
-                c_prod.write(p["descricao"])
-                c_saldo.write(_fmt_qtd(p["saldo"]))
-                c_disp.write(_fmt_qtd(p["disponivel"]))
-                qtd = c_qtd.number_input(
-                    "Qtd",
-                    min_value=minimo,
-                    max_value=maximo,
-                    step=1.0,
-                    format="%g",
-                    key=k_qtd,
-                    label_visibility="collapsed",
-                )
-                c_val.write(_fmt_moeda(p["preco"]))
+    # Seleção guardada em session_state: sobrevive à troca de página e de busca.
+    base = f"parceiros_cand_{envio_id}_{reset}"
+    sel = st.session_state.setdefault(f"{base}_sel", {})
+    for pid in list(sel):  # descarta o que deixou de estar disponível
+        if pid in ja_no_envio or pid not in disp or disp[pid]["disponivel"] <= 0:
+            sel.pop(pid)
 
-                if marcado:
-                    sel[pid] = float(qtd)
-                else:
-                    sel.pop(pid, None)
+    POR_PAGINA = 20
+    n_paginas = max(1, (len(candidatos) + POR_PAGINA - 1) // POR_PAGINA)
+    sufixo_filtro = hashlib.md5(
+        "|".join([filtro_cod, filtro_prod, ",".join(sorted(cats_sel)), ",".join(sorted(banhos_sel))]).encode("utf-8")
+    ).hexdigest()[:8]  # muda ao mudar qualquer filtro: a paginação volta para a página 1
+    if n_paginas > 1:
+        pagina = st.number_input(
+            f"Página (de {n_paginas}) — {len(candidatos)} produtos",
+            min_value=1,
+            max_value=n_paginas,
+            value=1,
+            step=1,
+            key=f"{base}_pag_{sufixo_filtro}",
+        )
+    else:
+        pagina = 1
+    visiveis = candidatos[(pagina - 1) * POR_PAGINA: pagina * POR_PAGINA]
 
-        marcados = [
-            {
-                "produto_id": pid,
-                "Código": disp[pid]["codigo"],
-                "Qtd": qtd_sel,
-                "Disponível": disp[pid]["disponivel"],
-                "Valor unit.": disp[pid]["preco"],
-            }
-            for pid, qtd_sel in sel.items()
-        ]
-        if len(marcados) > sum(1 for pid, _ in visiveis if pid in sel):
-            st.caption("A seleção inclui produtos de outras páginas ou buscas.")
-        if modo == "Enviado" and marcados and not liberado:
-            st.info("Marque a conferência física acima para poder adicionar à maleta.")
-
-        if st.button(
-            f"➕ Adicionar selecionados ({len(marcados)})",
-            key="parceiros_envio_adicionar",
-            disabled=not marcados or not liberado,
+    _legenda_fotos([p.get("foto_url") for _, p in visiveis])
+    cols_cand = [0.9, 1.0, 1.3, 3.0, 0.9, 1.0, 1.3, 1.3]
+    with st.container(border=True):
+        for col, titulo in zip(
+            st.columns(cols_cand, vertical_alignment="center"),
+            ["Selecionar", "Foto", "Código", "Produto", "Saldo", "Disp.", "Qtd", "Valor unit."],
         ):
-            _carregar_produtos_disponiveis.clear()
-            disp_agora = _carregar_produtos_disponiveis()
-            erros_add = []
-            novos = []
-            for linha in marcados:
-                qtd = float(linha.get("Qtd") or 0)
-                maximo = float(disp_agora.get(linha["produto_id"], {}).get("disponivel", 0.0))
-                if qtd <= 0:
-                    erros_add.append(f"{linha['Código']}: informe uma quantidade maior que zero.")
-                elif qtd > maximo:
-                    erros_add.append(
-                        f"{linha['Código']}: quantidade {_fmt_qtd(qtd)} maior que o "
-                        f"disponível ({_fmt_qtd(maximo)})."
-                    )
-                else:
-                    novos.append({
-                        "envio_id": envio_id,
-                        "produto_id": linha["produto_id"],
-                        "quantidade": qtd,
-                        "valor_unitario": float(linha.get("Valor unit.") or 0),
-                    })
-            if erros_add:
-                for erro in erros_add:
-                    st.error(erro)
+            col.markdown(f"**{titulo}**")
+
+        for pid, p in visiveis:
+            c_sel, c_foto, c_cod, c_prod, c_saldo, c_disp, c_qtd, c_val = st.columns(
+                cols_cand, vertical_alignment="center"
+            )
+            maximo = float(p["disponivel"])
+            minimo = min(1.0, maximo)
+            k_chk, k_qtd = f"{base}_chk_{pid}", f"{base}_qtd_{pid}"
+            if k_chk not in st.session_state:  # widgets fora da tela perdem o estado
+                st.session_state[k_chk] = pid in sel
+            if k_qtd not in st.session_state:
+                st.session_state[k_qtd] = float(sel.get(pid, 1.0))
+            st.session_state[k_qtd] = min(max(float(st.session_state[k_qtd]), minimo), maximo)
+
+            marcado = c_sel.checkbox("Selecionar", key=k_chk, label_visibility="collapsed")
+            with c_foto:
+                _mostrar_foto(p.get("foto_url"))
+            c_cod.write(p["codigo"])
+            c_prod.write(p["descricao"])
+            detalhe = " · ".join(x for x in (p.get("categoria"), p.get("banho")) if x)
+            if detalhe:
+                c_prod.caption(detalhe)
+            c_saldo.write(_fmt_qtd(p["saldo"]))
+            c_disp.write(_fmt_qtd(p["disponivel"]))
+            qtd = c_qtd.number_input(
+                "Qtd",
+                min_value=minimo,
+                max_value=maximo,
+                step=1.0,
+                format="%g",
+                key=k_qtd,
+                label_visibility="collapsed",
+            )
+            c_val.write(_fmt_moeda(p["preco"]))
+
+            if marcado:
+                sel[pid] = float(qtd)
             else:
-                try:
-                    supabase.table("parcerias_envio_itens").insert(novos).execute()
-                    if modo == "Enviado":
-                        _registrar_movimentos(
-                            envio_id,
-                            [(n["produto_id"], "adicao", n["quantidade"]) for n in novos],
-                            motivo,
-                        )
-                    _resetar_editores_envio()
-                    _flash("success", f"{len(novos)} produto(s) adicionado(s) ao envio.")
-                    st.rerun()
-                except Exception as e:
-                    _invalidar_cache_envios()
-                    st.error(f"Não foi possível adicionar os produtos: {e}")
+                sel.pop(pid, None)
+
+    marcados = [
+        {
+            "produto_id": pid,
+            "Código": disp[pid]["codigo"],
+            "Qtd": qtd_sel,
+            "Disponível": disp[pid]["disponivel"],
+            "Valor unit.": disp[pid]["preco"],
+        }
+        for pid, qtd_sel in sel.items()
+    ]
+    if len(marcados) > sum(1 for pid, _ in visiveis if pid in sel):
+        st.caption("A seleção inclui produtos de outras páginas ou buscas.")
+    if modo == "Enviado" and marcados and not liberado:
+        st.info("Marque a conferência física acima para poder adicionar à maleta.")
+
+    if st.button(
+        f"➕ Adicionar selecionados ({len(marcados)})",
+        key="parceiros_envio_adicionar",
+        disabled=not marcados or not liberado,
+    ):
+        _carregar_produtos_disponiveis.clear()
+        disp_agora = _carregar_produtos_disponiveis()
+        erros_add = []
+        novos = []
+        for linha in marcados:
+            qtd = float(linha.get("Qtd") or 0)
+            maximo = float(disp_agora.get(linha["produto_id"], {}).get("disponivel", 0.0))
+            if qtd <= 0:
+                erros_add.append(f"{linha['Código']}: informe uma quantidade maior que zero.")
+            elif qtd > maximo:
+                erros_add.append(
+                    f"{linha['Código']}: quantidade {_fmt_qtd(qtd)} maior que o "
+                    f"disponível ({_fmt_qtd(maximo)})."
+                )
+            else:
+                novos.append({
+                    "envio_id": envio_id,
+                    "produto_id": linha["produto_id"],
+                    "quantidade": qtd,
+                    "valor_unitario": float(linha.get("Valor unit.") or 0),
+                })
+        if erros_add:
+            for erro in erros_add:
+                st.error(erro)
+        else:
+            try:
+                supabase.table("parcerias_envio_itens").insert(novos).execute()
+                if modo == "Enviado":
+                    _registrar_movimentos(
+                        envio_id,
+                        [(n["produto_id"], "adicao", n["quantidade"]) for n in novos],
+                        motivo,
+                    )
+                _resetar_editores_envio()
+                _flash("success", f"{len(novos)} produto(s) adicionado(s) ao envio.")
+                st.rerun()
+            except Exception as e:
+                _invalidar_cache_envios()
+                st.error(f"Não foi possível adicionar os produtos: {e}")
 
 
 # ---------------------------------------------------------------------------
 # Etapa 1: montagem da maleta + conferência de saída
 # ---------------------------------------------------------------------------
+
+
+def _secao_adicionar_produtos(
+    envio: dict, itens: list, disp: dict, modo: str,
+    liberado: bool = True, motivo: str = "",
+) -> None:
+    """Seleção de novos produtos. A lista só é montada com o interruptor ligado: antes ela
+    era desenhada mesmo recolhida (centenas de elementos a cada interação)."""
+    interruptor = getattr(st, "toggle", st.checkbox)
+    aberto = interruptor(
+        "➕ Adicionar produtos ao envio",
+        value=not itens,
+        key=f"parceiros_add_aberto_{envio['id']}",
+    )
+    if aberto:
+        _lista_candidatos(envio, itens, disp, modo, liberado, motivo)
+
 
 def _iniciar_confirmacao(chave: str) -> None:
     st.session_state[chave] = True
@@ -1362,13 +1537,7 @@ def _render_envio_enviado(parceiro: dict, envio: dict, itens: list, movimentos: 
     c3.metric("Vendidas (sistema)", _fmt_qtd(total_ven))
     c4.metric("Ainda na maleta", _fmt_qtd(total_env - total_ven))
 
-    etapa = st.radio(
-        "Etapa",
-        ETAPAS_ENVIADO,
-        horizontal=True,
-        key=f"parceiros_etapa_{envio_id}",
-        label_visibility="collapsed",
-    )
+    etapa = _menu("Etapa", ETAPAS_ENVIADO, key=f"parceiros_etapa_{envio_id}")
 
     if etapa == ETAPAS_ENVIADO[0]:
         if itens:
@@ -1592,12 +1761,15 @@ def _secao_parceiro_produtos_enviados(parceiro: dict) -> None:
         )
         return
 
-    st.button(
-        "🔄 Atualizar dados",
-        key="parceiros_atualizar",
-        on_click=_atualizar_dados,
-        help="Os dados desta aba são guardados por até 1 minuto para a tela ficar rápida. "
-             "Use este botão após vendas ou ajustes de estoque feitos em outras telas.",
+    if ativo is None:
+        passo = -1
+    elif ativo.get("status") == "Aberto":
+        passo = 1 if st.session_state.get(f"parceiros_envio_conferindo_{ativo['id']}") else 0
+    else:
+        passo = 3 if st.session_state.get(f"parceiros_etapa_{ativo['id']}") == ETAPAS_ENVIADO[2] else 2
+    st.markdown(
+        _html_passos(["Montagem", "Conferência de saída", "Maleta com o parceiro", "Recebimento e fechamento"], passo),
+        unsafe_allow_html=True,
     )
 
     if ativo is None:
@@ -1619,6 +1791,125 @@ def _secao_parceiro_produtos_enviados(parceiro: dict) -> None:
         _secao_parceiro_vendas_canal(parceiro)
 
 
+CHUNK_IN = 400  # tamanho dos blocos em consultas .in_() (URLs enormes falham no PostgREST)
+STATUS_RETIRADA = "Retirada - Parceiros"
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _buscar_fechamentos(parceiro_id) -> list:
+    return buscar_todos(
+        lambda: supabase.table("parcerias_fechamentos")
+        .select(
+            "id, numero_ciclo, data_inicio, data_fim, percentual_comissao, "
+            "valor_total_vendas, valor_total_comissao, status"
+        )
+        .eq("parceiro_id", parceiro_id)
+        .order("numero_ciclo", desc=True)
+    )
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _vendas_candidatas(canal_id, data_ini: str, data_fim: str) -> list:
+    """Vendas do canal no período que ainda não entraram em nenhum fechamento.
+    Só consulta os vínculos das vendas do período (antes lia os de TODOS os ciclos,
+    com o limite padrão de 1000 linhas, o que truncaria o resultado)."""
+    vendas = buscar_todos(
+        lambda: supabase.table("vendas")
+        .select(
+            "id, data_venda, cliente, valor_final, "
+            "comissao_percentual, comissao_valor, "
+            "produtos(descricao), status_venda(nome)"
+        )
+        .eq("canal_venda_id", canal_id)
+        .gte("data_venda", data_ini)
+        .lte("data_venda", data_fim)
+        .order("data_venda")
+        .order("id")
+    )
+    ids = [v["id"] for v in vendas]
+    incluidos = set()
+    for i in range(0, len(ids), CHUNK_IN):
+        bloco_ids = ids[i:i + CHUNK_IN]
+        incluidos.update(
+            r["venda_id"]
+            for r in buscar_todos(
+                lambda: supabase.table("parcerias_fechamento_vendas")
+                .select("venda_id")
+                .in_("venda_id", bloco_ids)
+                .order("id")
+            )
+        )
+    return [v for v in vendas if v["id"] not in incluidos]
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _retiradas_por_fechamento(ids_fechamentos: tuple, canal_id) -> dict:
+    """{fechamento_id: valor das retiradas de peças}. Três consultas no total, em vez de
+    uma por bloco de ids: vínculos, id do status e só as vendas de retirada do canal."""
+    if not ids_fechamentos:
+        return {}
+    vinculos = buscar_todos(
+        lambda: supabase.table("parcerias_fechamento_vendas")
+        .select("fechamento_id, venda_id")
+        .in_("fechamento_id", list(ids_fechamentos))
+        .order("id")
+    )
+    retirada_por_venda = {}
+    status = (
+        supabase.table("status_venda").select("id").eq("nome", STATUS_RETIRADA).execute().data or []
+    )
+    if status and canal_id:
+        retiradas = buscar_todos(
+            lambda: supabase.table("vendas")
+            .select("id, valor_final")
+            .eq("canal_venda_id", canal_id)
+            .eq("status_id", status[0]["id"])
+            .order("id")
+        )
+        retirada_por_venda = {v["id"]: float(v.get("valor_final") or 0) for v in retiradas}
+    total = {fid: 0.0 for fid in ids_fechamentos}
+    for v in vinculos:
+        total[v["fechamento_id"]] = total.get(v["fechamento_id"], 0.0) + retirada_por_venda.get(v["venda_id"], 0.0)
+    return total
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _detalhes_ciclo(fechamento_id) -> tuple:
+    """(vínculos, vendas) de um ciclo já fechado: não muda, então guarda por mais tempo."""
+    vinculos = buscar_todos(
+        lambda: supabase.table("parcerias_fechamento_vendas")
+        .select("venda_id, valor_venda, percentual_comissao, valor_comissao")
+        .eq("fechamento_id", fechamento_id)
+        .order("id")
+    )
+    ids_vendas = [v["venda_id"] for v in vinculos]
+    vendas = []
+    for i in range(0, len(ids_vendas), CHUNK_IN):
+        bloco_ids = ids_vendas[i:i + CHUNK_IN]
+        vendas.extend(
+            buscar_todos(
+                lambda: supabase.table("vendas")
+                .select(
+                    "id, data_venda, cliente, valor_final, quantidade, "
+                    "produtos(descricao, codigo_interno), status_venda(nome)"
+                )
+                .in_("id", bloco_ids)
+                .order("id")
+            )
+        )
+    vendas.sort(key=lambda v: (str(v.get("data_venda") or ""), v["id"]))
+    return vinculos, vendas
+
+
+def _invalidar_cache_fechamento() -> None:
+    _buscar_fechamentos.clear()
+    _vendas_candidatas.clear()
+    _retiradas_por_fechamento.clear()
+    _detalhes_ciclo.clear()
+    _panorama_parceiros.clear()
+
+
+@_fragmento
 def _secao_parceiro_fechamento(parceiro: dict) -> None:
     """Fluxo de fechamento do parceiro:
 
@@ -1632,22 +1923,12 @@ def _secao_parceiro_fechamento(parceiro: dict) -> None:
       gravado nela (`comissao_percentual`/`comissao_valor`), não é
       recalculada aqui.
     """
+    _mostrar_flash()
     parceiro_id = parceiro["id"]
     canal_id = parceiro.get("canal_id")
 
     try:
-        fechamentos = (
-            supabase.table("parcerias_fechamentos")
-            .select(
-                "id, numero_ciclo, data_inicio, data_fim, percentual_comissao, "
-                "valor_total_vendas, valor_total_comissao, status"
-            )
-            .eq("parceiro_id", parceiro_id)
-            .order("numero_ciclo", desc=True)
-            .execute()
-            .data
-            or []
-        )
+        fechamentos = _buscar_fechamentos(parceiro_id)
     except Exception as e:
         st.error(f"Não foi possível carregar os fechamentos: {e}")
         return
@@ -1680,16 +1961,24 @@ def _secao_parceiro_fechamento(parceiro: dict) -> None:
 
         if st.button("▶️ Iniciar novo ciclo", key="parceiros_iniciar_ciclo"):
             try:
+                # A lista de parceiros fica em cache por até 30 s; o percentual que será
+                # gravado no ciclo é sempre lido na hora.
+                atual = (
+                    supabase.table("parceiros").select("percentual_comissao")
+                    .eq("id", parceiro_id).execute().data or [{}]
+                )[0]
                 supabase.table("parcerias_fechamentos").insert({
                     "parceiro_id": parceiro_id,
                     "numero_ciclo": proximo_numero,
                     "data_inicio": data_inicio_sugerida.isoformat(),
-                    "percentual_comissao": parceiro.get("percentual_comissao") or 0,
+                    "percentual_comissao": atual.get("percentual_comissao") or 0,
                     "status": "Aberto",
                 }).execute()
-                st.success(f"Ciclo #{proximo_numero} iniciado.")
+                _invalidar_cache_fechamento()
+                _flash("success", f"Ciclo #{proximo_numero} iniciado.")
                 st.rerun()
             except Exception as e:
+                _invalidar_cache_fechamento()
                 st.error(f"Não foi possível iniciar o ciclo: {e}")
 
     else:
@@ -1742,12 +2031,15 @@ def _secao_parceiro_fechamento(parceiro: dict) -> None:
                 supabase.table("parcerias_fechamentos").update({
                     "data_inicio": novo_inicio_ciclo.isoformat(),
                 }).eq("id", ciclo_aberto["id"]).execute()
-                st.success(
+                _invalidar_cache_fechamento()
+                _flash(
+                    "success",
                     f"Início do ciclo #{ciclo_aberto['numero_ciclo']} alterado para "
-                    f"{novo_inicio_ciclo.strftime('%d/%m/%Y')}."
+                    f"{novo_inicio_ciclo.strftime('%d/%m/%Y')}.",
                 )
                 st.rerun()
             except Exception as e:
+                _invalidar_cache_fechamento()
                 st.error(f"Não foi possível alterar o início do ciclo: {e}")
                 return
 
@@ -1756,36 +2048,9 @@ def _secao_parceiro_fechamento(parceiro: dict) -> None:
             return
 
         try:
-            ids_ja_incluidos = {
-                v["venda_id"]
-                for v in (
-                    supabase.table("parcerias_fechamento_vendas")
-                    .select("venda_id")
-                    .in_(
-                        "fechamento_id",
-                        [f["id"] for f in fechamentos],
-                    )
-                    .execute()
-                    .data
-                    or []
-                )
-            }
-            vendas_periodo = (
-                supabase.table("vendas")
-                .select(
-                    "id, data_venda, cliente, valor_final, "
-                    "comissao_percentual, comissao_valor, "
-                    "produtos(descricao), status_venda(nome)"
-                )
-                .eq("canal_venda_id", canal_id)
-                .gte("data_venda", data_inicio_ciclo.isoformat())
-                .lte("data_venda", data_fim_ciclo.isoformat())
-                .order("data_venda")
-                .execute()
-                .data
-                or []
+            candidatas = _vendas_candidatas(
+                canal_id, data_inicio_ciclo.isoformat(), data_fim_ciclo.isoformat()
             )
-            candidatas = [v for v in vendas_periodo if v["id"] not in ids_ja_incluidos]
         except Exception as e:
             st.error(f"Não foi possível carregar as vendas do período: {e}")
             return
@@ -1933,12 +2198,15 @@ def _secao_parceiro_fechamento(parceiro: dict) -> None:
                     "fechado_em": datetime.now().isoformat(),
                 }).eq("id", ciclo_aberto["id"]).execute()
 
-                st.success(
+                _invalidar_cache_fechamento()
+                _flash(
+                    "success",
                     f"Ciclo #{ciclo_aberto['numero_ciclo']} fechado com "
-                    f"{len(registros)} venda(s)."
+                    f"{len(registros)} venda(s).",
                 )
                 st.rerun()
             except Exception as e:
+                _invalidar_cache_fechamento()
                 st.error(f"Não foi possível fechar o ciclo: {e}")
 
     st.divider()
@@ -1947,49 +2215,19 @@ def _secao_parceiro_fechamento(parceiro: dict) -> None:
         st.caption("Nenhum ciclo de fechamento registrado ainda para este parceiro.")
         return
 
-    # Calcula o valor final de cada ciclo histórico usando a mesma regra
-    # da visualização do fechamento: comissão menos retiradas de peças.
+    # Valor final de cada ciclo histórico = comissão - retiradas de peças (mesma regra do
+    # fechamento). As retiradas vêm de 3 consultas guardadas em cache.
     valor_final_por_fechamento = {}
     try:
-        ids_fechamentos = [f["id"] for f in fechamentos if f.get("id") is not None]
-        vinculos_historico = []
-        if ids_fechamentos:
-            vinculos_historico = (
-                supabase.table("parcerias_fechamento_vendas")
-                .select("fechamento_id, venda_id, valor_comissao")
-                .in_("fechamento_id", ids_fechamentos)
-                .execute()
-                .data
-                or []
-            )
-
-        ids_vendas_historico = [v["venda_id"] for v in vinculos_historico if v.get("venda_id") is not None]
-        status_por_venda = {}
-        if ids_vendas_historico:
-            vendas_historico = (
-                supabase.table("vendas")
-                .select("id, status_venda(nome), valor_final")
-                .in_("id", ids_vendas_historico)
-                .execute()
-                .data
-                or []
-            )
-            status_por_venda = {v["id"]: v for v in vendas_historico}
-
+        ids_fechamentos = tuple(f["id"] for f in fechamentos if f.get("id") is not None)
+        retiradas = _retiradas_por_fechamento(ids_fechamentos, canal_id)
         for fechamento in fechamentos:
             fechamento_id = fechamento.get("id")
-            comissao = float(fechamento.get("valor_total_comissao") or 0)
-            retirada = 0.0
-            for vinculo in vinculos_historico:
-                if vinculo.get("fechamento_id") != fechamento_id:
-                    continue
-                venda = status_por_venda.get(vinculo.get("venda_id"), {})
-                if (venda.get("status_venda") or {}).get("nome") == "Retirada - Parceiros":
-                    retirada += float(venda.get("valor_final") or 0)
-            valor_final_por_fechamento[fechamento_id] = comissao - retirada
+            valor_final_por_fechamento[fechamento_id] = (
+                float(fechamento.get("valor_total_comissao") or 0) - retiradas.get(fechamento_id, 0.0)
+            )
     except Exception:
-        # Se não for possível carregar os vínculos históricos, mantém a
-        # comissão como fallback para não impedir a visualização do histórico.
+        # Sem os vínculos, mostra a comissão como alternativa para não esconder o histórico.
         for fechamento in fechamentos:
             valor_final_por_fechamento[fechamento.get("id")] = float(
                 fechamento.get("valor_total_comissao") or 0
@@ -2025,30 +2263,7 @@ def _secao_parceiro_fechamento(parceiro: dict) -> None:
         ciclo_visualizado = fechamentos[linhas_selecionadas[0]]
 
         try:
-            vinculos = (
-                supabase.table("parcerias_fechamento_vendas")
-                .select("venda_id, valor_venda, percentual_comissao, valor_comissao")
-                .eq("fechamento_id", ciclo_visualizado["id"])
-                .execute()
-                .data
-                or []
-            )
-            ids_vendas = [v["venda_id"] for v in vinculos]
-
-            vendas_fechamento = []
-            if ids_vendas:
-                vendas_fechamento = (
-                    supabase.table("vendas")
-                    .select(
-                        "id, data_venda, cliente, valor_final, quantidade, "
-                        "produtos(descricao, codigo_interno), status_venda(nome)"
-                    )
-                    .in_("id", ids_vendas)
-                    .order("data_venda")
-                    .execute()
-                    .data
-                    or []
-                )
+            vinculos, vendas_fechamento = _detalhes_ciclo(ciclo_visualizado["id"])
         except Exception as e:
             st.error(f"Não foi possível carregar os detalhes do ciclo: {e}")
             return
@@ -2130,24 +2345,185 @@ def _limpar_estado_parceiro() -> None:
             del st.session_state[chave]
 
 
-def _desmarcar_parceiro() -> None:
+def _selecionar_parceiro(nome) -> None:
     _limpar_estado_parceiro()
-    st.session_state.pop("parceiros_selecionado", None)
+    if nome:
+        st.session_state["parceiros_selecionado"] = nome
+
+
+def _desmarcar_parceiro() -> None:
+    _selecionar_parceiro(None)
+
+
+def _cb_escolher_parceiro(chave: str) -> None:
+    """on_change dos seletores de parceiro. Roda ANTES do rerun: a tela já abre no parceiro
+    novo, sem o 'rerun extra' que existia (selectbox -> st.rerun)."""
+    _selecionar_parceiro(st.session_state.get(chave))
+
+
+def _cb_escolher_do_painel() -> None:
+    estado = st.session_state.get("parceiros_painel")
+    nomes = st.session_state.get("parceiros_painel_nomes") or []
+    try:
+        linhas = estado["selection"]["rows"]
+    except Exception:
+        linhas = []
+    if linhas and linhas[0] < len(nomes):
+        _selecionar_parceiro(nomes[linhas[0]])
+
+
+# ---------------------------------------------------------------------------
+# Leituras da navegação (em cache)
+# ---------------------------------------------------------------------------
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _buscar_parceiros_ativos() -> list:
+    return (
+        supabase.table("parceiros")
+        .select(
+            "id, nome, canal_id, telefone, email, percentual_comissao, "
+            "observacao, ativo, canais_venda(nome)"
+        )
+        .eq("ativo", True)
+        .order("nome")
+        .execute()
+        .data
+        or []
+    )
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _panorama_parceiros() -> dict:
+    """{parceiro_id: {'ciclo': ciclo de comissão aberto, 'envio': maleta ativa}}.
+    Duas consultas para TODOS os parceiros; alimenta o painel inicial, os chips do
+    cabeçalho e os rótulos do menu sem consultar nada por parceiro."""
+    try:
+        ciclos = (
+            supabase.table("parcerias_fechamentos")
+            .select("parceiro_id, numero_ciclo, data_inicio")
+            .eq("status", "Aberto")
+            .execute().data or []
+        )
+        envios = (
+            supabase.table("parcerias_envios")
+            .select("parceiro_id, numero_envio, status, data_envio")
+            .in_("status", list(STATUS_ATIVOS))
+            .execute().data or []
+        )
+    except Exception:
+        return {}
+    panorama: dict = {}
+    for c in ciclos:
+        panorama.setdefault(c["parceiro_id"], {})["ciclo"] = c
+    for e in envios:
+        panorama.setdefault(e["parceiro_id"], {})["envio"] = e
+    return panorama
+
+
+def _dias_desde(valor) -> int:
+    d = _parse_data_segura(valor)
+    return max((date.today() - d).days, 0) if d else 0
+
+
+def _txt_ciclo(info: dict) -> str:
+    c = info.get("ciclo")
+    return f"#{c['numero_ciclo']} aberto desde {_fmt_data(c.get('data_inicio'))}" if c else "sem ciclo aberto"
+
+
+def _txt_maleta(info: dict) -> str:
+    e = info.get("envio")
+    if not e:
+        return "sem maleta ativa"
+    if e.get("status") == "Enviado":
+        dias = _dias_desde(e.get("data_envio"))
+        return f"#{e['numero_envio']} com o parceiro há {dias} dia(s)"
+    return f"#{e['numero_envio']} em montagem"
+
+
+# ---------------------------------------------------------------------------
+# Telas
+# ---------------------------------------------------------------------------
+
+def _render_escolha_parceiro(parceiros: list, panorama: dict) -> None:
+    st.markdown("### 🤝 Parceiros")
+    nomes = [p["nome"] for p in parceiros]
+    st.session_state["parceiros_painel_nomes"] = nomes
+
+    st.selectbox(
+        "Buscar parceiro",
+        options=nomes,
+        index=None,
+        placeholder="Digite ou escolha um parceiro...",
+        key="parceiros_selecao_dropdown",
+        on_change=_cb_escolher_parceiro,
+        args=("parceiros_selecao_dropdown",),
+    )
+
+    linhas = []
+    for p in parceiros:
+        info = panorama.get(p["id"], {})
+        comissao = p.get("percentual_comissao")
+        linhas.append({
+            "Parceiro": p["nome"],
+            "Comissão": f"{float(comissao):g}%" if comissao is not None else "-",
+            "Ciclo de comissão": _txt_ciclo(info),
+            "Maleta": _txt_maleta(info),
+        })
+
+    argumentos = dict(
+        use_container_width=True, hide_index=True,
+        selection_mode="single-row", key="parceiros_painel",
+    )
+    try:
+        st.dataframe(linhas, on_select=_cb_escolher_do_painel, **argumentos)
+    except Exception:  # Streamlit sem callback em on_select: usa o rerun (uma execução a mais)
+        selecao = st.dataframe(linhas, on_select="rerun", **argumentos)
+        if selecao.selection.rows:
+            _selecionar_parceiro(nomes[selecao.selection.rows[0]])
+            st.rerun()
+    st.caption("Clique em uma linha para abrir o parceiro.")
+
+
+def _render_cabecalho_nav(parceiro: dict, nomes: list, info: dict) -> None:
+    """Seletor para trocar de parceiro sem voltar à lista + situação atual em chips."""
+    col_sel, col_todos, col_atualizar = st.columns([6, 1.6, 0.9], vertical_alignment="center")
+    with col_sel:
+        st.selectbox(
+            "Parceiro",
+            options=nomes,
+            index=nomes.index(parceiro["nome"]),
+            key="parceiros_trocar",
+            on_change=_cb_escolher_parceiro,
+            args=("parceiros_trocar",),
+            label_visibility="collapsed",
+        )
+    with col_todos:
+        st.button(
+            "← Todos", key="parceiros_desmarcar", on_click=_desmarcar_parceiro,
+            help="Voltar ao painel com todos os parceiros",
+        )
+    with col_atualizar:
+        st.button(
+            "🔄", key="parceiros_atualizar_tudo", on_click=_atualizar_dados,
+            help="Recarregar os dados. Eles ficam guardados por até 1 minuto para a tela ser "
+                 "rápida; use após vendas, estoque ou cadastros alterados em outras telas.",
+        )
+
+    comissao = parceiro.get("percentual_comissao")
+    envio = info.get("envio") or {}
+    st.markdown(
+        _html_chips([
+            (f"💰 Comissão {float(comissao):g}%" if comissao is not None else "💰 Comissão -", ""),
+            (f"📑 Ciclo {_txt_ciclo(info)}", "ok" if info.get("ciclo") else ""),
+            (f"📦 Maleta {_txt_maleta(info)}", "ok" if envio.get("status") == "Enviado" else ""),
+        ]),
+        unsafe_allow_html=True,
+    )
 
 
 def secao_parceiros():
     try:
-        resp = (
-            supabase.table("parceiros")
-            .select(
-                "id, nome, canal_id, telefone, email, percentual_comissao, "
-                "observacao, ativo, canais_venda(nome)"
-            )
-            .eq("ativo", True)
-            .order("nome")
-            .execute()
-        )
-        parceiros = resp.data or []
+        parceiros = _buscar_parceiros_ativos()
     except Exception as e:
         st.markdown("### 🤝 Parceiros")
         st.error(f"Não foi possível carregar os parceiros: {e}")
@@ -2161,116 +2537,36 @@ def secao_parceiros():
         )
         return
 
+    panorama = _panorama_parceiros()
+    nomes = [p["nome"] for p in parceiros]
     nome_selecionado = st.session_state.get("parceiros_selecionado")
     parceiro = next((p for p in parceiros if p["nome"] == nome_selecionado), None)
 
-    # Parceiro salvo não existe mais (ou nada selecionado): mostra o dropdown.
+    # Nada selecionado (ou o parceiro salvo não existe mais): painel com todos.
     if parceiro is None:
         if nome_selecionado:
             _limpar_estado_parceiro()
-
-        st.markdown("### 🤝 Parceiros")
-        escolhido = st.selectbox(
-            "Selecione um parceiro",
-            options=[p["nome"] for p in parceiros],
-            index=None,
-            placeholder="Escolha um parceiro...",
-            key="parceiros_selecao_dropdown",
-        )
-        if escolhido:
-            # Primeira seleção: guarda o parceiro e recarrega sem o dropdown.
-            st.session_state["parceiros_selecionado"] = escolhido
-            st.rerun()
-
-        st.caption("Selecione um parceiro acima para ver o fechamento e os produtos enviados.")
+        _render_escolha_parceiro(parceiros, panorama)
         return
 
-    # Parceiro selecionado: título com nome, comissão e botão para desmarcar.
-    comissao = parceiro.get("percentual_comissao")
-    comissao_fmt = f"{float(comissao):g}%" if comissao is not None else "-"
-    titulo = f"Parceiros: {parceiro['nome']} (Comissão: {comissao_fmt})"
-
-    st.markdown(
-        """
-        <style>
-        .st-key-parceiros_desmarcar button {
-            min-height: 2rem;
-            height: 2rem;
-            width: 2rem;
-            min-width: 2rem;
-            padding: 0;
-            border-radius: 50%;
-            border: 1px solid rgba(220, 53, 69, 0.55);
-            color: #dc3545;
-            background: transparent;
-            font-size: 1rem;
-            font-weight: 700;
-            line-height: 1;
-        }
-        .st-key-parceiros_desmarcar button:hover {
-            background: #dc3545;
-            border-color: #dc3545;
-            color: #ffffff;
-        }
-        .st-key-parceiros_desmarcar button p { margin: 0; }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    # Título em uma linha só: as colunas desta linha se ajustam ao conteúdo
-    # (largura automática), então o ✕ fica colado ao texto, qualquer que seja
-    # o tamanho do nome do parceiro.
-    st.markdown(
-        """
-        <style>
-        .st-key-parceiros_titulo [data-testid="stHorizontalBlock"] {
-            flex-wrap: nowrap !important;
-            align-items: center !important;
-            gap: 0.75rem !important;
-        }
-        .st-key-parceiros_titulo [data-testid="stColumn"] {
-            width: auto !important;
-            flex: 0 0 auto !important;
-            min-width: 0 !important;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    # Larguras proporcionais só como reserva, caso o CSS acima não se aplique.
-    largura_titulo = max(len(titulo) * 1.5, 30)
-    espaco = max(100 - largura_titulo - 4, 1)
-    with _container_com_key("parceiros_titulo"):
-        try:
-            col_titulo, col_x, _ = st.columns(
-                [largura_titulo, 4, espaco], vertical_alignment="center", gap="small"
-            )
-        except TypeError:  # Streamlit mais antigo, sem vertical_alignment
-            col_titulo, col_x, _ = st.columns([largura_titulo, 4, espaco], gap="small")
-
-        with col_titulo:
-            st.markdown(
-                "<div style='font-size:1.65rem; font-weight:700; line-height:1.3; "
-                f"white-space:nowrap;'>🤝 {html.escape(titulo)}</div>",
-                unsafe_allow_html=True,
-            )
-        with col_x:
-            st.button(
-                "✕",
-                key="parceiros_desmarcar",
-                help="Desmarcar parceiro",
-                on_click=_desmarcar_parceiro,
-            )
+    _injetar_css()
+    info = panorama.get(parceiro["id"], {})
+    _render_cabecalho_nav(parceiro, nomes, info)
 
     # st.tabs executa o conteúdo de TODAS as abas a cada interação (e suas consultas).
-    # Com o seletor abaixo só a seção escolhida é executada.
-    abas = ["📑 Fechamento", "📦 Produtos Enviados"]
-    aba = st.radio(
-        "Seção", abas, horizontal=True, key="parceiros_aba", label_visibility="collapsed",
-    )
-    if aba == abas[0]:
+    # Com este menu só a seção escolhida é executada.
+    secoes = ["fechamento", "envios"]
+    rotulos = {
+        "fechamento": "📑 Fechamento" + (
+            f" · ciclo #{info['ciclo']['numero_ciclo']}" if info.get("ciclo") else ""
+        ),
+        "envios": "📦 Produtos enviados" + (
+            f" · maleta #{info['envio']['numero_envio']}" if info.get("envio") else ""
+        ),
+    }
+    secao = _menu("Seção", secoes, key="parceiros_aba", formatar=rotulos.get)
+
+    if secao == "fechamento":
         _secao_parceiro_fechamento(parceiro)
     else:
         _secao_parceiro_produtos_enviados(parceiro)
