@@ -58,3 +58,4 @@ Retirada Peças
 ## 1.9.2-melhoria Parceiros-11/10/2026
 ## 1.9.3-melhoria Parceiros:PDF-14/10/2026
 ## 2.0.0-App_Mobile-15/10/2026
+## 2.0.1-melhorias_App_Mobile-15/10/2026

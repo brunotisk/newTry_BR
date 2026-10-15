@@ -8,7 +8,7 @@ from datetime import date, timedelta
 import streamlit as st
 
 from db import supabase, buscar_todos
-from telas_mobile.comum import cadastros, fmt_data, fmt_moeda
+from telas_mobile.comum import cadastros, fmt_data, fmt_moeda, moeda_md
 
 LIMITE_PAGINA = 20
 TODOS_CANAIS = "Todos os canais"
@@ -89,7 +89,10 @@ def _card_venda(v: dict) -> None:
     with st.container(border=True):
         col_cli, col_valor = st.columns([3, 2], vertical_alignment="center")
         col_cli.markdown(f"**{v.get('cliente') or 'Sem cliente'}**")
-        col_valor.markdown(f"**{fmt_moeda(v.get('valor_final'))}**")
+        col_valor.markdown(
+            f"<div style='text-align:right;font-weight:700'>{fmt_moeda(v.get('valor_final'))}</div>",
+            unsafe_allow_html=True,
+        )
         st.caption(
             f"{float(v.get('quantidade') or 0):g}× {produto.get('descricao') or '-'} "
             f"({produto.get('codigo_interno') or '-'})"
@@ -97,7 +100,7 @@ def _card_venda(v: dict) -> None:
         linha = " · ".join(p for p in partes if p)
         desconto = float(v.get("valor_desconto") or 0)
         if desconto:
-            linha += f"{' · ' if linha else ''}desc. {fmt_moeda(desconto)}"
+            linha += f"{' · ' if linha else ''}desc. {moeda_md(desconto)}"
         if linha:
             st.caption(linha)
 
@@ -150,7 +153,7 @@ def tela_historico_vendas_mobile() -> None:
     col_itens.metric("Itens vendidos", totais["itens"])
     col_total.metric("Total vendido", fmt_moeda(totais["valor"]))
     if totais["comissao"]:
-        st.caption(f"Comissão no período: {fmt_moeda(totais['comissao'])}")
+        st.caption(f"Comissão no período: {moeda_md(totais['comissao'])}")
 
     vendas = resp.data or []
     total = resp.count if resp.count is not None else len(vendas)

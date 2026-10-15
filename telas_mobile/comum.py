@@ -27,6 +27,11 @@ def fmt_moeda(valor) -> str:
     return "R$ " + f"{v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
+def moeda_md(valor) -> str:
+    """Moeda para textos em markdown: escapa o '$' (dois cifrões na mesma linha viram fórmula)."""
+    return fmt_moeda(valor).replace("$", "\\$")
+
+
 def parse_data(valor):
     if not valor:
         return None

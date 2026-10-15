@@ -9,8 +9,8 @@ from servicos.vendas_import import (
     inserir_venda_e_baixar_estoque,
 )
 from telas_mobile.comum import (
-    cadastros, escolha, fmt_moeda, format_phone, limpar_caches_venda,
-    lista_clientes, produtos_em_estoque,
+    cadastros, escolha, format_phone, limpar_caches_venda,
+    lista_clientes, moeda_md, produtos_em_estoque,
 )
 
 MOTIVO_SAIDA = "Venda Manual"  # mesmo motivo da tela de vendas do sistema completo
@@ -64,7 +64,7 @@ def _form_item() -> None:
 
     desconto_valor = round(qtd * preco * desc / 100, 2) if tipo == "%" else desc
     valor_final = qtd * preco - desconto_valor
-    st.markdown(f"**Total do item: {fmt_moeda(valor_final)}**")
+    st.markdown(f"**Total do item: {moeda_md(valor_final)}**")
 
     if st.button("➕ Adicionar à venda", type="primary", use_container_width=True, key=f"m_add_{sufixo}"):
         if qtd > disponivel:
@@ -96,15 +96,15 @@ def _render_carrinho() -> None:
         with st.container(border=True):
             col_txt, col_rm = st.columns([5, 1], vertical_alignment="center")
             col_txt.markdown(f"**{p['codigo_interno']}** — {p['descricao']}")
-            detalhe = f"{item['quantidade']:g} × {fmt_moeda(item['valor_lista'])}"
+            detalhe = f"{item['quantidade']:g} × {moeda_md(item['valor_lista'])}"
             if item["valor_desconto"]:
-                detalhe += f" − desc. {fmt_moeda(item['valor_desconto'])}"
-            col_txt.caption(f"{detalhe} = **{fmt_moeda(item['valor_final'])}**")
+                detalhe += f" − desc. {moeda_md(item['valor_desconto'])}"
+            col_txt.caption(f"{detalhe} = **{moeda_md(item['valor_final'])}**")
             if col_rm.button("✕", key=f"m_rm_{item['uid']}", help="Remover item"):
                 ss["m_itens"] = [i for i in itens if i["uid"] != item["uid"]]
                 st.rerun()
     total = sum(i["valor_final"] for i in itens)
-    st.markdown(f"### Total: {fmt_moeda(total)}")
+    st.markdown(f"### Total: {moeda_md(total)}")
 
 
 def _resolver_cliente(sb, h: dict):
