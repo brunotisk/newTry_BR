@@ -1070,6 +1070,7 @@ def _secao_auditoria_fotos():
             baixar_catalogo, indexar_por_sku, auditar,
             testar_urls, processar_lote, enviar_foto_do_produto,
             gravar_descricao_site, gravar_descricoes_site_lote, diagnosticar_ambiente,
+            chave as chave_sku,
         )
     except Exception as e:
         st.error(
@@ -1153,7 +1154,7 @@ def _secao_auditoria_fotos():
             key="admin_fotos_limpar",
         )
 
-    col_cache, col_urls = st.columns(2)
+    col_cache, col_urls, col_escopo = st.columns(3)
     with col_cache:
         atualizar_catalogo = st.checkbox(
             "Baixar catálogo novamente (ignorar cache)",
@@ -1168,9 +1169,20 @@ def _secao_auditoria_fotos():
             key="admin_fotos_testar_urls",
             help="Faz requisições HTTP para cada URL de foto. Deixe desmarcado para uma auditoria mais rápida; você pode testar as URLs quando precisar.",
         )
+    with col_escopo:
+        somente_sem_foto = st.checkbox(
+            "Auditar só os produtos sem foto no banco",
+            value=False,
+            key="admin_fotos_somente_sem_foto",
+            help=(
+                "A busca ao site para assim que encontra todos esses códigos (menos páginas do "
+                "catálogo) e o resultado traz só esses produtos. Se algum código não existir no "
+                "site, o catálogo inteiro precisa ser lido do mesmo jeito."
+            ),
+        )
 
     if limpar_resultado:
-        for chave_estado in ("admin_fotos_auditoria", "admin_fotos_urls_testadas"):
+        for chave_estado in ("admin_fotos_auditoria", "admin_fotos_urls_testadas", "admin_fotos_auditoria_escopo"):
             st.session_state.pop(chave_estado, None)
         st.rerun()
 
@@ -1181,6 +1193,11 @@ def _secao_auditoria_fotos():
         try:
             with st.spinner("Consultando produtos do banco e catálogo do site..."):
                 produtos_db = _carregar_todos_produtos_fotos()
+                if somente_sem_foto:
+                    produtos_alvo = [p for p in produtos_db if not str(p.get("foto_url") or "").strip()]
+                    chaves_alvo = {chave_sku(p.get("codigo_interno")) for p in produtos_alvo}
+                else:
+                    produtos_alvo, chaves_alvo = produtos_db, None
                 progresso = st.progress(0, text="Preparando catálogo público...")
                 def _progresso(pagina, total):
                     progresso.progress(min(0.85, pagina / 100), text=f"Catálogo: página {pagina} — {total} produtos")
@@ -1198,8 +1215,50 @@ def _secao_auditoria_fotos():
                     catalogo = cache_catalogo
                     progresso.progress(0.85, text=f"Reutilizando catálogo em cache ({len(catalogo)} produtos)")
                 else:
-                    catalogo = baixar_catalogo(loja, progresso=_progresso, avisos=avisos_catalogo)
-                    if catalogo:
+                    # Estado da busca: se a última tentativa foi interrompida (HTTP 429), continua
+                    # da página em que parou, sem baixar de novo o que já veio.
+                    estado_catalogo = st.session_state.get("admin_fotos_catalogo_estado")
+                    if (
+                        atualizar_catalogo
+                        or not estado_catalogo
+                        or estado_catalogo.get("loja") != loja
+                        or estado_catalogo.get("completo")
+                    ):
+                        estado_catalogo = {"loja": loja}
+                    elif estado_catalogo.get("produtos"):
+                        st.info(
+                            f"Retomando a busca do catálogo na página {estado_catalogo.get('proxima_pagina', 1)} "
+                            f"({len(estado_catalogo['produtos'])} produtos já baixados)."
+                        )
+                    # Guardado ANTES de baixar: o progresso sobrevive mesmo se der erro no meio.
+                    st.session_state["admin_fotos_catalogo_estado"] = estado_catalogo
+
+                    def _aguardando(segundos, pagina, tentativa, total_tentativas):
+                        progresso.progress(
+                            min(0.85, pagina / 100),
+                            text=(
+                                f"A loja pediu para aguardar (HTTP 429): esperando {segundos:.0f}s para "
+                                f"tentar a página {pagina} de novo ({tentativa}/{total_tentativas})..."
+                            ),
+                        )
+
+                    catalogo = baixar_catalogo(
+                        loja, progresso=_progresso, avisos=avisos_catalogo,
+                        chaves_alvo=chaves_alvo, estado=estado_catalogo, aguardando=_aguardando,
+                    )
+                    if not estado_catalogo.get("completo"):
+                        # Catálogo incompleto: auditar agora marcaria como "não encontrado" códigos
+                        # que só estão nas páginas ainda não lidas.
+                        for aviso_catalogo in avisos_catalogo:
+                            st.warning(aviso_catalogo)
+                        st.info(
+                            "A auditoria não foi gerada para não mostrar resultados incompletos. "
+                            "Clique em **Auditar fotos agora** de novo em alguns minutos: a busca "
+                            f"continua da página {estado_catalogo.get('proxima_pagina', 1)}."
+                        )
+                        return
+                    # Só um catálogo lido por inteiro vai para o cache (nunca um parcial).
+                    if catalogo and not estado_catalogo.get("encerrado_por_alvos"):
                         st.session_state["admin_fotos_catalogo_cache"] = catalogo
                         st.session_state["admin_fotos_catalogo_cache_loja"] = loja
                         st.session_state["admin_fotos_catalogo_cache_em"] = datetime.now()
@@ -1213,7 +1272,7 @@ def _secao_auditoria_fotos():
                     )
                     return
                 indice_site = indexar_por_sku(catalogo, loja)
-                linhas = auditar(produtos_db, indice_site, bucket=bucket)
+                linhas = auditar(produtos_alvo, indice_site, bucket=bucket)
                 # Persiste o título do produto no site para os SKUs que tiveram correspondência.
                 # Um erro de gravação é mostrado sem descartar os resultados da auditoria.
                 atualizadas_descricao = 0
@@ -1275,9 +1334,11 @@ def _secao_auditoria_fotos():
                     if testar_todas_urls and linha.get("acao") == "ok" and url_atual and status_urls.get(url_atual) == "quebrada":
                         linha["acao"] = "verificar_url_storage"
                 st.session_state["admin_fotos_auditoria"] = linhas
+                st.session_state["admin_fotos_auditoria_escopo"] = "sem_foto" if somente_sem_foto else "todos"
                 st.session_state["admin_fotos_urls_testadas"] = status_urls
                 st.success(
-                    f"Auditoria concluída: {len(produtos_db)} produtos cadastrados auditados; "
+                    f"Auditoria concluída: {len(produtos_alvo)} produtos cadastrados auditados"
+                    f"{' (somente os sem foto no banco)' if somente_sem_foto else ''}; "
                     f"{atualizadas_descricao} descrição(ões) do site atualizada(s) no banco."
                 )
                 if not testar_todas_urls:
@@ -1296,6 +1357,8 @@ def _secao_auditoria_fotos():
     if linhas is None:
         st.caption("A auditoria do catálogo é opcional. Você já pode consultar os indicadores, listar produtos sem foto e fazer upload manual abaixo.")
     else:
+        if st.session_state.get("admin_fotos_auditoria_escopo") == "sem_foto":
+            st.caption("Auditoria parcial: só os produtos que estavam sem foto no banco quando ela foi gerada.")
         total = len(linhas)
         sem_foto = sum(1 for r in linhas if r.get("foto_atual_tipo") == "sem_foto")
         storage_ok = sum(1 for r in linhas if r.get("foto_atual_tipo") == "storage" and r.get("url_banco_testada") == "ok")

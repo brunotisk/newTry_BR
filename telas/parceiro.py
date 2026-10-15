@@ -9,7 +9,7 @@ import html
 import re
 import unicodedata
 import uuid
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
@@ -51,7 +51,14 @@ BUCKET_MALETAS = "fotos_maletas"
 LADO_MAX_FOTO_MALETA = 1600   # px: a foto é reduzida antes de enviar (celular gera 4000+ px)
 QUALIDADE_JPEG_MALETA = 82
 TIPOS_FOTO_MALETA = ["jpg", "jpeg", "png", "webp"]
+# PDFs de cada movimento da maleta (criação e ajustes): bucket PÚBLICO do Supabase Storage +
+# tabela parcerias_envio_pdfs (migracao_pdfs_maleta.sql cria a tabela, a coluna e as políticas).
+BUCKET_PDFS = "pdf_maletas"
 EXIGIR_FOTO_SAIDA = False     # True: só confirma a saída da maleta com pelo menos 1 foto
+
+# PDF da maleta (lista de itens para conferir/entregar): exige o pacote `reportlab`.
+PDF_FOTO_PX = 240             # lado da miniatura embutida (arquivo leve)
+PDF_FOTO_MM = 18              # tamanho da foto na página
 
 _CSS_TABELA_FOTOS = (
     "<style>"
@@ -410,6 +417,10 @@ def _iguais(a: float, b: float) -> bool:
 STATUS_ATIVOS = ("Aberto", "Enviado")
 TIPOS_MOVIMENTO = {"adicao": "➕ Adição", "remocao": "➖ Remoção"}
 ETAPAS_ENVIADO = ["📦 Maleta", "✏️ Ajustar maleta", "📥 Receber e fechar ciclo"]
+OPCOES_AJUSTE = ["1. Remover itens da maleta", "2. Adicionar itens à maleta"]
+# Escolha "descrição do site x descrição padrão": um valor único, compartilhado por todos os
+# campos de seleção de produtos (cada tela tem o seu interruptor, todos sincronizados).
+CHAVE_USAR_SITE = "parceiros_usar_descricao_site"
 
 
 def _flash(tipo: str, mensagem: str) -> None:
@@ -483,7 +494,8 @@ def _buscar_itens_dos_envios(ids_envios: tuple) -> dict:
         .select(
             "id, envio_id, produto_id, quantidade, valor_unitario, conferido_saida, "
             "qtd_vendida, qtd_devolvida, qtd_divergencia, "
-            "produtos(codigo_interno, descricao, foto_url)"
+            f"produtos(codigo_interno, descricao, foto_url"
+            ", produto_descricao_site)"
         )
         .in_("envio_id", list(ids_envios))
         .order("id")
@@ -503,6 +515,7 @@ def _buscar_movimentos(ids_envios: tuple) -> dict:
         lambda: supabase.table("parcerias_envio_movimentos")
         .select(
             "id, envio_id, produto_id, tipo, quantidade, motivo, criado_em, "
+            f"{'pdf_id, ' if _tem_pdfs_maleta() else ''}"
             "produtos(codigo_interno, descricao)"
         )
         .in_("envio_id", list(ids_envios))
@@ -511,6 +524,38 @@ def _buscar_movimentos(ids_envios: tuple) -> dict:
     por_envio: dict = {}
     for m in movs:
         por_envio.setdefault(m["envio_id"], []).append(m)
+    return por_envio
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _tem_pdfs_maleta() -> bool:
+    """True se a tabela parcerias_envio_pdfs e a coluna movimentos.pdf_id existem
+    (migracao_pdfs_maleta.sql). Sem elas a tela funciona como antes, só não guarda PDFs."""
+    try:
+        supabase.table("parcerias_envio_pdfs").select("id").limit(1).execute()
+        supabase.table("parcerias_envio_movimentos").select("pdf_id").limit(1).execute()
+        return True
+    except Exception:
+        return False
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _buscar_pdfs_maleta(ids_envios: tuple) -> dict:
+    """{envio_id: [PDFs guardados]} (criação e ajustes), do mais antigo ao mais novo."""
+    if not ids_envios or not _tem_pdfs_maleta():
+        return {}
+    linhas = buscar_todos(
+        lambda: supabase.table("parcerias_envio_pdfs")
+        .select(
+            "id, envio_id, evento, motivo, total_itens, total_pecas, "
+            "caminho_padrao, caminho_site, criado_em"
+        )
+        .in_("envio_id", list(ids_envios))
+        .order("id")
+    )
+    por_envio: dict = {}
+    for l in linhas:
+        por_envio.setdefault(l["envio_id"], []).append(l)
     return por_envio
 
 
@@ -543,6 +588,27 @@ def _norm(texto) -> str:
     """Minúsculas e sem acentos: 'Coração' e 'coracao' passam a ser a mesma busca."""
     base = unicodedata.normalize("NFKD", str(texto or ""))
     return "".join(c for c in base if not unicodedata.combining(c)).casefold().strip()
+
+
+def _toggle_descricao_site(chave_local: str) -> bool:
+    """Interruptor 'descrição do site' (produto_descricao_site) x descrição padrão (descricao).
+
+    Cada lista de produtos chama este helper com a sua própria key; o valor fica em
+    CHAVE_USAR_SITE e vale para todas. Devolve True quando deve usar a descrição do site."""
+    interruptor = getattr(st, "toggle", st.checkbox)
+
+    def _sincronizar():
+        st.session_state[CHAVE_USAR_SITE] = bool(st.session_state.get(chave_local))
+
+    st.session_state[chave_local] = bool(st.session_state.get(CHAVE_USAR_SITE, False))
+    usar = interruptor(
+        "Descrição do site",
+        key=chave_local,
+        on_change=_sincronizar,
+        help="Ligado: mostra produto_descricao_site (produtos sem esse texto continuam com a "
+             "descrição padrão). Desligado: mostra a descrição padrão (descricao).",
+    )
+    return bool(usar)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -578,7 +644,8 @@ def _carregar_produtos_disponiveis() -> dict:
         lambda: supabase.table("estoque")
         .select(
             "quantidade_atual, estoque_preco_venda_sugerida, "
-            "produtos(id, codigo_interno, descricao, foto_url, categoria_id)"
+            "produtos(id, codigo_interno, descricao, foto_url, categoria_id"
+            ", produto_descricao_site)"
         )
         .gt("quantidade_atual", 0)
         .order("produto_id")
@@ -633,6 +700,8 @@ def _carregar_produtos_disponiveis() -> dict:
             "banho": cat.get("banho", ""),
             "busca_cod": _norm(produto.get("codigo_interno")),
             "busca_desc": _norm(produto.get("descricao")),
+            "produto_descricao_site": (produto.get("produto_descricao_site") or "").strip(),
+            "busca_site": _norm(produto.get("produto_descricao_site")),
             "saldo": saldo,
             "comprometido": reservado,
             "disponivel": max(saldo - reservado, 0.0),
@@ -641,11 +710,12 @@ def _carregar_produtos_disponiveis() -> dict:
     return produtos
 
 
-def _registrar_movimentos(envio_id, movimentos: list, motivo: str = "") -> None:
-    """movimentos: lista de (produto_id, 'adicao'|'remocao', quantidade)."""
+def _registrar_movimentos(envio_id, movimentos: list, motivo: str = "", pdf_id=None) -> None:
+    """movimentos: lista de (produto_id, 'adicao'|'remocao', quantidade). `pdf_id` liga os
+    movimentos ao PDF guardado para esse ajuste (parcerias_envio_pdfs)."""
     if not movimentos:
         return
-    supabase.table("parcerias_envio_movimentos").insert([
+    linhas = [
         {
             "envio_id": envio_id,
             "produto_id": pid,
@@ -654,7 +724,11 @@ def _registrar_movimentos(envio_id, movimentos: list, motivo: str = "") -> None:
             "motivo": (motivo or "").strip() or None,
         }
         for pid, tipo, qtd in movimentos
-    ]).execute()
+    ]
+    if pdf_id is not None:
+        for linha in linhas:
+            linha["pdf_id"] = pdf_id
+    supabase.table("parcerias_envio_movimentos").insert(linhas).execute()
 
 
 def _invalidar_cache_envios() -> None:
@@ -663,6 +737,7 @@ def _invalidar_cache_envios() -> None:
     _buscar_envios.clear()
     _buscar_itens_dos_envios.clear()
     _buscar_movimentos.clear()
+    _buscar_pdfs_maleta.clear()
     _buscar_arquivos.clear()
     _carregar_produtos_disponiveis.clear()
     _panorama_parceiros.clear()
@@ -676,6 +751,7 @@ def _atualizar_dados() -> None:
     _vendido_por_produto.clear()
     _buscar_vendas_canal.clear()
     _buscar_parceiros_ativos.clear()
+    _tem_pdfs_maleta.clear()
 
 
 def _atualizar_vendas_fechamento() -> None:
@@ -854,6 +930,7 @@ def _secao_itens_envio(
         st.caption("Nenhum produto selecionado ainda. Use a seção abaixo para adicionar.")
         return False
 
+    usar_site = _toggle_descricao_site(f"parceiros_tg_itens_{envio_id}")
     _legenda_fotos([(it.get("produtos") or {}).get("foto_url") for it in itens])
     cols_itens = [0.9, 1.0, 1.4, 3.2, 1.3, 1.3, 1.3]
     linhas_editadas = []
@@ -879,7 +956,7 @@ def _secao_itens_envio(
             with c_foto:
                 _mostrar_foto(prod.get("foto_url"))
             c_cod.write(prod.get("codigo_interno") or "-")
-            c_prod.write(prod.get("descricao") or "-")
+            c_prod.write(_descricao_pdf(prod, usar_site))
             if vendido > 0:
                 c_prod.caption(f"já vendido: {_fmt_qtd(vendido)}")
             qtd = c_qtd.number_input(
@@ -952,6 +1029,13 @@ def _secao_itens_envio(
     return pendentes
 
 
+def _busca_desc(produto: dict, usar_site: bool) -> str:
+    """Texto (sem acentos) em que o filtro 'Produto' procura: a descrição padrão e, com o
+    interruptor ligado, também a descrição do site."""
+    base = produto.get("busca_desc") or ""
+    return f"{base} {produto.get('busca_site') or ''}" if usar_site else base
+
+
 def _cb_limpar_filtros(chaves: tuple) -> None:
     for chave in chaves:
         st.session_state[chave] = [] if chave.endswith(("_cat", "_banho")) else ""
@@ -965,6 +1049,8 @@ def _lista_candidatos(
     """Lista paginada (com fotos) para escolher novos produtos para a maleta."""
     envio_id = envio["id"]
     reset = st.session_state.get("parceiros_envio_reset", 0)
+
+    usar_site = _toggle_descricao_site(f"parceiros_tg_cand_{envio_id}")
 
     ja_no_envio = {it["produto_id"] for it in itens}
     disponiveis = [
@@ -1003,7 +1089,7 @@ def _lista_candidatos(
     candidatos = [
         (pid, p) for pid, p in disponiveis
         if (not tokens_cod or any(t in p["busca_cod"] for t in tokens_cod))
-        and all(w in p["busca_desc"] for w in palavras)
+        and all(w in _busca_desc(p, usar_site) for w in palavras)
         and (not cats_sel or (p.get("categoria") or SEM_CATEGORIA) in cats_sel)
         and (not banhos_sel or (p.get("banho") or SEM_BANHO) in banhos_sel)
     ]
@@ -1071,7 +1157,7 @@ def _lista_candidatos(
             with c_foto:
                 _mostrar_foto(p.get("foto_url"))
             c_cod.write(p["codigo"])
-            c_prod.write(p["descricao"])
+            c_prod.write(_descricao_pdf(p, usar_site))
             detalhe = " · ".join(x for x in (p.get("categoria"), p.get("banho")) if x)
             if detalhe:
                 c_prod.caption(detalhe)
@@ -1105,6 +1191,20 @@ def _lista_candidatos(
     ]
     if len(marcados) > sum(1 for pid, _ in visiveis if pid in sel):
         st.caption("A seleção inclui produtos de outras páginas ou buscas.")
+    if modo == "Ajuste":
+        # Ajuste da maleta com o parceiro: nada é gravado aqui. A seleção vai para a prévia
+        # "maleta como ficaria" (fora deste fragmento), que só é atualizada por um rerun completo.
+        st.caption(
+            f"{len(marcados)} produto(s) marcado(s) para entrar na maleta. Veja a prévia abaixo; "
+            "a alteração só é gravada ao salvar."
+        )
+        assinatura = tuple(sorted((str(k), float(v)) for k, v in sel.items()))
+        k_prev = f"{base}_sel_prev"
+        if st.session_state.get(k_prev, ()) != assinatura:
+            st.session_state[k_prev] = assinatura
+            st.rerun()
+        return
+
     if modo == "Enviado" and marcados and not liberado:
         st.info("Marque a conferência física acima para poder adicionar à maleta.")
 
@@ -1287,7 +1387,15 @@ def _grade_fotos(arquivos: list, editavel: bool = False) -> None:
 def _secao_fotos_maleta(envio_id, etapa: str = "saida") -> int:
     """Área de fotos da conferência: fotos já salvas + envio de novas. Retorna quantas existem."""
     st.markdown("**📷 Fotos da maleta**" + ("" if EXIGIR_FOTO_SAIDA else " (opcional)"))
-    existentes = [a for a in _buscar_arquivos((envio_id,)).get(envio_id, []) if a.get("etapa") == etapa]
+    try:
+        todas = _buscar_arquivos((envio_id,)).get(envio_id, [])
+    except Exception as e:
+        st.warning(
+            f"Não foi possível acessar as fotos da maleta ({e}). Execute o script "
+            "migracao_fotos_maleta.sql no Supabase para habilitar este recurso."
+        )
+        return 0
+    existentes = [a for a in todas if a.get("etapa") == etapa]
     if existentes:
         _grade_fotos(existentes, editavel=True)
 
@@ -1317,11 +1425,377 @@ def _secao_fotos_maleta(envio_id, etapa: str = "saida") -> int:
 
 
 def _mostrar_fotos_maleta(envio_id) -> None:
-    """Fotos da maleta somente para consulta (maleta enviada e histórico)."""
-    arquivos = _buscar_arquivos((envio_id,)).get(envio_id, [])
+    """Fotos da maleta somente para consulta (maleta enviada e histórico). Se a tabela de
+    fotos ainda não existe no banco, simplesmente não mostra nada."""
+    try:
+        arquivos = _buscar_arquivos((envio_id,)).get(envio_id, [])
+    except Exception:
+        return
     if arquivos:
         st.markdown("**📷 Fotos da maleta**")
         _grade_fotos(arquivos, editavel=False)
+
+
+# ---------------------------------------------------------------------------
+# PDF da maleta (conferência de saída e maleta com o parceiro)
+# ---------------------------------------------------------------------------
+
+_CACHE_FOTOS_PDF: dict = {}   # url -> (JPEG, largura, altura). Só guarda sucessos.
+MOTIVO_SEM_CADASTRO = "sem foto cadastrada"
+
+
+def _foto_para_pdf(url_foto):
+    """Baixa a foto do produto e a reduz para o PDF. Devolve (bytes, larg, alt) ou None
+    (sem foto, link quebrado, tempo esgotado...). Fica em memória: o 2º PDF não rebaixa."""
+    if not url_foto:
+        return None
+    url = _url_miniatura(str(url_foto))
+    if not url:
+        return None
+    if url in _CACHE_FOTOS_PDF:
+        return _CACHE_FOTOS_PDF[url]
+    try:
+        from io import BytesIO
+        import requests
+        from PIL import Image, ImageOps
+
+        resposta = requests.get(url, timeout=(3, 10))
+        resposta.raise_for_status()
+        if len(resposta.content) > 10_000_000:
+            return None
+        imagem = ImageOps.exif_transpose(Image.open(BytesIO(resposta.content)))
+        if imagem.mode in ("RGBA", "LA", "P"):
+            rgba = imagem.convert("RGBA")
+            fundo = Image.new("RGB", rgba.size, (255, 255, 255))
+            fundo.paste(rgba, mask=rgba.split()[3])
+            imagem = fundo
+        else:
+            imagem = imagem.convert("RGB")
+        imagem.thumbnail((PDF_FOTO_PX, PDF_FOTO_PX))
+        saida = BytesIO()
+        imagem.save(saida, format="JPEG", quality=80)
+        resultado = (saida.getvalue(), imagem.size[0], imagem.size[1])
+    except Exception:
+        return None
+    if len(_CACHE_FOTOS_PDF) > 2000:
+        _CACHE_FOTOS_PDF.clear()
+    _CACHE_FOTOS_PDF[url] = resultado
+    return resultado
+
+
+def _texto_pdf(valor, markup: bool = True) -> str:
+    """Texto seguro para as fontes padrão do PDF (cobrem o português) e, com markup=True,
+    para o XML dos Paragraph (escapa & < >)."""
+    texto = str(valor if valor is not None else "").encode("cp1252", "replace").decode("cp1252")
+    return html.escape(texto, quote=False) if markup else texto
+
+
+def _gerar_pdf_maleta(titulo: str, subtitulo: str, resumo: str, linhas: list, com_conferencia: bool = False):
+    """PDF A4 com Foto | Código | Produto | Qtd (e uma caixinha para marcar, na conferência).
+
+    linhas: [{'codigo', 'descricao', 'qtd', 'foto_url'}]. As fotos são baixadas em paralelo.
+    Retorna (pdf_em_bytes, sem_foto), onde sem_foto lista os produtos que saíram sem foto
+    ({'codigo', 'descricao', 'motivo'}). Levanta ImportError se o reportlab não estiver instalado."""
+    from concurrent.futures import ThreadPoolExecutor
+    from io import BytesIO
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import mm
+    from reportlab.platypus import (
+        Flowable, Image as RLImage, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle,
+    )
+
+    urls = sorted({l["foto_url"] for l in linhas if l.get("foto_url")})
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        fotos = dict(zip(urls, pool.map(_foto_para_pdf, urls)))
+
+    base = getSampleStyleSheet()["Normal"]
+    cinza = colors.HexColor("#555555")
+    est_titulo = ParagraphStyle("titulo", parent=base, fontName="Helvetica-Bold", fontSize=17, leading=21)
+    est_sub = ParagraphStyle("sub", parent=base, fontSize=9.5, leading=12.5, textColor=cinza)
+    est_cel = ParagraphStyle("cel", parent=base, fontSize=9.5, leading=12)
+    est_cab = ParagraphStyle("cab", parent=est_cel, fontName="Helvetica-Bold", textColor=colors.white)
+    est_cab_c = ParagraphStyle("cabc", parent=est_cab, alignment=1)
+    est_cod = ParagraphStyle("cod", parent=est_cel, fontName="Helvetica-Bold", fontSize=10.5)
+    est_qtd = ParagraphStyle("qtd", parent=est_cel, fontName="Helvetica-Bold", fontSize=13, leading=15, alignment=1)
+    est_sem = ParagraphStyle("sem", parent=est_cel, fontSize=7, textColor=colors.HexColor("#888888"), alignment=1)
+
+    class Caixa(Flowable):
+        """Quadradinho vazio para marcar o item conferido."""
+        def __init__(self, lado=5.5 * mm):
+            super().__init__()
+            self.lado, self.width, self.height, self.hAlign = lado, lado, lado, "CENTER"
+
+        def draw(self):
+            self.canv.setLineWidth(0.9)
+            self.canv.rect(0, 0, self.lado, self.lado)
+
+    caixa_mm = PDF_FOTO_MM * mm
+    cabecalho = [Paragraph("Foto", est_cab), Paragraph("Código", est_cab), Paragraph("Produto", est_cab),
+                 Paragraph("Qtd", est_cab_c)]
+    larguras = [24, 28, 110, 18]
+    if com_conferencia:
+        cabecalho.append(Paragraph("Conf.", est_cab_c))
+        larguras = [24, 28, 94, 18, 16]
+
+    dados, total = [cabecalho], 0.0
+    for linha in linhas:
+        foto = fotos.get(linha.get("foto_url"))
+        if foto:
+            conteudo, larg, alt = foto
+            escala = min(caixa_mm / larg, caixa_mm / alt)
+            celula_foto = RLImage(BytesIO(conteudo), width=larg * escala, height=alt * escala)
+        else:
+            celula_foto = Paragraph("sem foto", est_sem)
+        qtd = float(linha.get("qtd") or 0)
+        total += qtd
+        registro = [
+            celula_foto,
+            Paragraph(_texto_pdf(linha.get("codigo") or "-"), est_cod),
+            Paragraph(_texto_pdf(linha.get("descricao") or "-"), est_cel),
+            Paragraph(f"{qtd:g}", est_qtd),
+        ]
+        if com_conferencia:
+            registro.append(Caixa())
+        dados.append(registro)
+
+    rodape_total = ["", "", Paragraph("<b>Total de peças</b>", ParagraphStyle("tt", parent=est_cel, alignment=2)),
+                    Paragraph(f"{total:g}", est_qtd)]
+    if com_conferencia:
+        rodape_total.append("")
+    dados.append(rodape_total)
+
+    ultima = len(dados) - 1
+    # Altura fixa nas linhas de item (com ou sem foto): tabela uniforme. None = automática.
+    alturas = [None] + [caixa_mm + 8] * (ultima - 1) + [None]
+    tabela = Table(dados, colWidths=[l * mm for l in larguras], rowHeights=alturas, repeatRows=1)
+    tabela.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2F3E4E")),
+        ("ROWBACKGROUNDS", (0, 1), (-1, ultima - 1), [colors.white, colors.HexColor("#F4F5F7")]),
+        ("GRID", (0, 0), (-1, ultima - 1), 0.4, colors.HexColor("#C9CDD2")),
+        ("LINEABOVE", (0, ultima), (-1, ultima), 1.2, colors.HexColor("#2F3E4E")),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("ALIGN", (0, 1), (0, ultima - 1), "CENTER"),
+        ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ("LEFTPADDING", (0, 0), (-1, -1), 5), ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+    ] + (
+        # o total nunca fica sozinho numa página: acompanha a última linha de item
+        [("NOSPLIT", (0, ultima - 1), (-1, ultima))] if ultima >= 2 else []
+    )))
+
+    def rodape(canvas, doc):
+        canvas.saveState()
+        canvas.setFont("Helvetica", 8)
+        canvas.setFillColor(cinza)
+        canvas.drawString(15 * mm, 9 * mm, _texto_pdf(titulo, markup=False))
+        canvas.drawRightString(195 * mm, 9 * mm, f"Página {doc.page}")
+        canvas.restoreState()
+
+    sem_foto = []
+    for linha in linhas:
+        url = linha.get("foto_url")
+        if not url:
+            motivo = MOTIVO_SEM_CADASTRO
+        elif not fotos.get(url):
+            motivo = "foto cadastrada, mas não foi possível carregá-la"
+        else:
+            continue
+        sem_foto.append({"codigo": linha.get("codigo"), "descricao": linha.get("descricao"), "motivo": motivo})
+
+    buffer = BytesIO()
+    documento = SimpleDocTemplate(
+        buffer, pagesize=A4, leftMargin=15 * mm, rightMargin=15 * mm,
+        topMargin=14 * mm, bottomMargin=18 * mm, title=_texto_pdf(titulo, markup=False),
+    )
+    documento.build(
+        [Paragraph(_texto_pdf(titulo), est_titulo), Paragraph(_texto_pdf(subtitulo), est_sub),
+         Paragraph(_texto_pdf(resumo), est_sub), Spacer(1, 6 * mm), tabela],
+        onFirstPage=rodape, onLaterPages=rodape,
+    )
+    return buffer.getvalue(), sem_foto
+
+
+def _assinatura_itens(itens: list) -> str:
+    """Muda quando o conteúdo da maleta muda: o PDF guardado deixa de valer."""
+    base = "|".join(f"{i['id']}:{i['produto_id']}:{i.get('quantidade')}" for i in itens)
+    return hashlib.md5(base.encode("utf-8")).hexdigest()
+
+
+def _descricao_pdf(produto: dict, usar_site: bool) -> str:
+    """Descrição que vai ao PDF: a do site (se pedida e preenchida) ou a padrão."""
+    if usar_site:
+        texto = (produto.get("produto_descricao_site") or "").strip()
+        if texto:
+            return texto
+    return produto.get("descricao") or "-"
+
+
+def _resumir_lista(rotulos: list, limite: int = 8) -> str:
+    if len(rotulos) <= limite:
+        return ", ".join(rotulos)
+    return ", ".join(rotulos[:limite]) + f" e mais {len(rotulos) - limite}"
+
+
+def _rotulo_produto(produto: dict) -> str:
+    nome = (produto.get("descricao") or "").strip()
+    nome = nome if len(nome) <= 28 else nome[:27] + "…"
+    return f"{produto.get('codigo_interno') or '-'} ({nome})" if nome else str(produto.get("codigo_interno") or "-")
+
+
+def _conteudo_pdf_maleta(parceiro_nome: str, envio: dict, itens: list, variante: str) -> None:
+    """Conteúdo do popup: avisos, escolha da descrição, geração e download do PDF.
+    O PDF é gerado ao abrir (e de novo se a opção de descrição mudar) e fica guardado
+    enquanto a maleta não mudar."""
+    envio_id = envio["id"]
+    base = f"parceiros_pdfdlg_{envio_id}_{variante}"
+    produtos = [i.get("produtos") or {} for i in itens]
+    pecas = sum(float(i.get("quantidade") or 0) for i in itens)
+    st.markdown(
+        f"**Envio #{envio['numero_envio']}** · {parceiro_nome or '-'} · "
+        f"{len(itens)} produto(s) · {_fmt_qtd(pecas)} peça(s)"
+    )
+
+    # --- descrição: padrão ou do site ---
+    interruptor = getattr(st, "toggle", st.checkbox)
+    usar_site = bool(interruptor(
+        "Usar a descrição do site no PDF",
+        value=bool(st.session_state.get(CHAVE_USAR_SITE, False)),
+        key=f"{base}_site",
+        help="Ligado: usa a descrição do site (produto_descricao_site); produtos sem esse texto "
+             "saem com a descrição padrão. Desligado: usa a descrição padrão (descricao).",
+    ))
+    if usar_site:
+        sem_site = [_rotulo_produto(p) for p in produtos if not (p.get("produto_descricao_site") or "").strip()]
+        if sem_site:
+            st.info(
+                f"{len(sem_site)} produto(s) sem descrição do site; no PDF eles usam a descrição "
+                f"padrão: {_resumir_lista(sem_site)}."
+            )
+
+    # --- aviso de produtos sem foto (antes de gerar) ---
+    sem_cadastro = [_rotulo_produto(p) for p in produtos if not p.get("foto_url")]
+    if sem_cadastro:
+        st.warning(
+            f"⚠️ {len(sem_cadastro)} produto(s) sem foto cadastrada: "
+            f"{_resumir_lista(sem_cadastro)}. No PDF eles saem com “sem foto”."
+        )
+
+    # --- gera (ou reaproveita) o PDF ---
+    assinatura = _assinatura_itens(itens) + (":site" if usar_site else ":padrao")
+    chave = f"{base}_pdf"
+    pronto = st.session_state.get(chave)
+    if pronto is None or pronto.get("assinatura") != assinatura:
+        agora = datetime.now()
+        if variante == "conferencia":
+            situacao = "Conferência de saída"
+        elif variante == "ajuste":
+            situacao = "Maleta com o parceiro após os ajustes (prévia, ainda não salva)"
+        else:
+            situacao = f"Maleta com o parceiro desde {_fmt_data(envio.get('data_envio'))}"
+        try:
+            with st.spinner("Gerando o PDF (carregando as fotos)..."):
+                dados, sem_foto = _gerar_pdf_maleta(
+                    titulo=f"Maleta - Envio #{envio['numero_envio']}",
+                    subtitulo=f"Parceiro: {parceiro_nome or '-'}   |   {situacao}   |   "
+                              f"Emitido em {agora:%d/%m/%Y %H:%M}",
+                    resumo=f"{len(itens)} produto(s) · {_fmt_qtd(pecas)} peça(s)",
+                    linhas=[
+                        {
+                            "codigo": p.get("codigo_interno"),
+                            "descricao": _descricao_pdf(p, usar_site),
+                            "qtd": i.get("quantidade"),
+                            "foto_url": p.get("foto_url"),
+                        }
+                        for i, p in zip(itens, produtos)
+                    ],
+                    com_conferencia=(variante == "conferencia"),
+                )
+        except ImportError:
+            st.error("Para gerar o PDF, instale a biblioteca: pip install reportlab")
+            return
+        except Exception as e:
+            st.error(f"Não foi possível gerar o PDF: {e}")
+            return
+        nome_slug = re.sub(r"[^a-z0-9]+", "_", _norm(parceiro_nome)).strip("_") or "parceiro"
+        pronto = {
+            "assinatura": assinatura,
+            "bytes": dados,
+            "sem_foto": sem_foto,
+            "nome": (
+                f"{ {'conferencia': 'conferencia_saida', 'ajuste': 'maleta_ajustada'}.get(variante, 'maleta') }"
+                f"_envio_{envio['numero_envio']}_{nome_slug}_{agora:%Y%m%d}.pdf"
+            ),
+            "hora": agora.strftime("%H:%M"),
+        }
+        st.session_state[chave] = pronto
+
+    # --- resultado: fotos que, apesar de cadastradas, não puderam ser carregadas ---
+    falhas = [x for x in pronto["sem_foto"] if x["motivo"] != MOTIVO_SEM_CADASTRO]
+    if falhas:
+        st.warning(
+            f"⚠️ {len(falhas)} produto(s) têm foto cadastrada, mas ela não pôde ser carregada "
+            f"para o PDF: {_resumir_lista([str(x['codigo']) for x in falhas])}. Eles saem com “sem foto”."
+        )
+    elif not sem_cadastro:
+        st.success("Todas as fotos foram incluídas no PDF.")
+
+    argumentos = dict(
+        label="⬇️ Baixar PDF", data=pronto["bytes"], file_name=pronto["nome"],
+        mime="application/pdf", key=f"{chave}_baixar", type="primary", use_container_width=True,
+    )
+    try:
+        st.download_button(on_click="ignore", **argumentos)  # sem rerun ao baixar
+    except Exception:  # Streamlit mais antigo: não aceita on_click="ignore"
+        st.download_button(**argumentos)
+    col_info, col_refazer = st.columns([3, 1], vertical_alignment="center")
+    col_info.caption(f"PDF gerado às {pronto['hora']} · {pronto['nome']}")
+    col_refazer.button(
+        "Gerar de novo", key=f"{chave}_refazer",
+        on_click=lambda: st.session_state.pop(chave, None),
+    )
+
+
+def _criar_decorador_dialogo(titulo: str):
+    """st.dialog (Streamlit >= 1.37) ou st.experimental_dialog; None se não houver popup."""
+    for nome in ("dialog", "experimental_dialog"):
+        decorador = getattr(st, nome, None)
+        if decorador is not None:
+            try:
+                return decorador(titulo, width="large")
+            except TypeError:
+                return decorador(titulo)
+    return None
+
+
+_decorador_dialogo = _criar_decorador_dialogo("📄 PDF da maleta")
+_dialogo_pdf = _decorador_dialogo(_conteudo_pdf_maleta) if _decorador_dialogo else None
+
+
+def _botao_pdf_maleta(parceiro_nome: str, envio: dict, itens: list, variante: str) -> None:
+    """Botão que abre o popup do PDF. Chamar FORA de blocos @st.fragment (o popup não abre
+    de dentro de outro bloco independente). variante: 'conferencia' ou 'maleta'."""
+    if not itens:
+        return
+    chave = f"parceiros_pdf_{envio['id']}_{variante}"
+    if _dialogo_pdf is not None:
+        if st.button(
+            "📄 PDF da maleta", key=f"{chave}_abrir",
+            help="Abre uma janela para escolher a descrição, ver avisos e baixar o PDF.",
+        ):
+            _dialogo_pdf(parceiro_nome, envio, itens, variante)
+        return
+    # Streamlit sem popup: o mesmo conteúdo em um quadro na própria página.
+    aberto = f"{chave}_inline"
+    if st.session_state.get(aberto):
+        with st.container(border=True):
+            _conteudo_pdf_maleta(parceiro_nome, envio, itens, variante)
+            st.button("Fechar", key=f"{chave}_fechar", on_click=lambda: st.session_state.pop(aberto, None))
+    else:
+        st.button(
+            "📄 PDF da maleta", key=f"{chave}_abrir",
+            on_click=lambda: st.session_state.__setitem__(aberto, True),
+        )
 
 
 def _iniciar_confirmacao(chave: str) -> None:
@@ -1339,7 +1813,10 @@ def _cb_marcar_todos(chave_todos: str, chaves_itens: list) -> None:
 
 
 @_fragmento
-def _render_conferencia_saida(envio: dict, itens: list, total_pecas: float, total_valor: float, chave_conf: str) -> None:
+def _render_conferencia_saida(
+    envio: dict, itens: list, total_pecas: float, total_valor: float, chave_conf: str,
+    parceiro_nome: str = "",
+) -> None:
     envio_id = envio["id"]
     st.markdown("##### 📋 Conferência de saída")
     st.caption(
@@ -1347,6 +1824,7 @@ def _render_conferencia_saida(envio: dict, itens: list, total_pecas: float, tota
         "confirmado quando todos os itens estiverem marcados."
     )
 
+    usar_site = _toggle_descricao_site(f"parceiros_tg_conf_{envio_id}")
     chaves = [f"parceiros_conf_saida_{envio_id}_{it['id']}" for it in itens]
     chave_todos = f"parceiros_conf_saida_todos_{envio_id}"
     st.checkbox(
@@ -1371,7 +1849,7 @@ def _render_conferencia_saida(envio: dict, itens: list, total_pecas: float, tota
             with c_foto:
                 _mostrar_foto(prod.get("foto_url"))
             c_cod.write(prod.get("codigo_interno") or "-")
-            c_prod.write(prod.get("descricao") or "-")
+            c_prod.write(_descricao_pdf(prod, usar_site))
             c_qtd.write(_fmt_qtd(it.get("quantidade")))
             c_sub.write(_fmt_moeda(float(it.get("quantidade") or 0) * float(it.get("valor_unitario") or 0)))
 
@@ -1427,9 +1905,14 @@ def _render_conferencia_saida(envio: dict, itens: list, total_pecas: float, tota
                 "total_pecas": total_pecas,
                 "valor_total": total_valor,
             }).eq("id", envio_id).eq("status", "Aberto").execute()
+            with st.spinner("Gerando e guardando os PDFs da maleta..."):
+                _pdf_id, aviso = _guardar_pdfs_evento(
+                    parceiro_nome, {**envio, "data_envio": data_saida.isoformat()}, itens, "criacao",
+                )
             st.session_state.pop(chave_conf, None)
             _resetar_editores_envio()
-            _flash("success", f"Envio #{envio['numero_envio']} conferido e enviado. A maleta está com o parceiro.")
+            msg = f"Envio #{envio['numero_envio']} conferido e enviado. A maleta está com o parceiro."
+            _flash("warning", f"{msg} Atenção: {aviso}") if aviso else _flash("success", msg)
             st.rerun()
         except Exception as e:
             _invalidar_cache_envios()
@@ -1449,7 +1932,10 @@ def _render_envio_aberto(parceiro: dict, envio: dict, itens: list) -> None:
     # de adicionar produtos) saem de cena e só voltam ao clicar em "Voltar".
     if st.session_state.get(chave_conf) and itens:
         st.markdown(f"##### Envio #{envio['numero_envio']} — conferência de saída")
-        _render_conferencia_saida(envio, itens, total_pecas, total_valor, chave_conf)
+        _botao_pdf_maleta(parceiro.get("nome") or "", envio, itens, "conferencia")
+        _render_conferencia_saida(
+            envio, itens, total_pecas, total_valor, chave_conf, parceiro.get("nome") or "",
+        )
         return
 
     st.markdown(
@@ -1489,6 +1975,217 @@ def _render_envio_aberto(parceiro: dict, envio: dict, itens: list) -> None:
 # ---------------------------------------------------------------------------
 # Etapa 2: maleta com o parceiro (ajustes) e Etapa 3: fechamento do ciclo
 # ---------------------------------------------------------------------------
+
+def _fmt_data_hora(valor, converter_utc: bool = True) -> str:
+    """dd/mm/aaaa hh:mm. Horários gravados pelo banco (now()) vêm em UTC e são levados para
+    o horário de Brasília; `enviado_em` foi gravado pelo app com a hora local, sem conversão."""
+    texto = str(valor or "").strip()
+    if not texto:
+        return "-"
+    if len(texto) <= 10:
+        return _fmt_data(valor)
+    try:
+        dt = datetime.fromisoformat(texto.replace("Z", "+00:00"))
+    except ValueError:
+        return _fmt_data(valor)
+    if converter_utc and dt.tzinfo is not None:
+        dt = dt.astimezone(timezone(timedelta(hours=-3)))
+    return dt.strftime("%d/%m/%Y %H:%M")
+
+
+def _guardar_pdfs_evento(parceiro_nome: str, envio: dict, itens: list, evento: str, motivo=None):
+    """Gera os dois PDFs da maleta (descrição padrão e descrição do site), guarda no bucket
+    público `pdf_maletas` e registra em parcerias_envio_pdfs.
+
+    evento: 'criacao' (saída da maleta) ou 'ajuste' (adição/remoção). Nunca levanta exceção:
+    a gravação da maleta não pode falhar por causa do PDF. Retorna (pdf_id, aviso): pdf_id é
+    None se nada foi guardado e `aviso` explica o motivo."""
+    if not _tem_pdfs_maleta():
+        return None, (
+            "os PDFs não foram guardados (execute migracao_pdfs_maleta.sql no Supabase para habilitar)."
+        )
+    bucket = supabase.storage.from_(BUCKET_PDFS)
+    caminhos: dict = {}
+    try:
+        agora = datetime.now()
+        stamp = agora.strftime("%Y%m%d_%H%M%S")
+        produtos = [i.get("produtos") or {} for i in itens]
+        pecas = sum(float(i.get("quantidade") or 0) for i in itens)
+        rotulo = (
+            f"Criação da maleta (saída em {_fmt_data(envio.get('data_envio'))})"
+            if evento == "criacao" else "Ajuste da maleta (adição/remoção de itens)"
+        )
+        variantes = [("padrao", False), ("site", True)]
+        for nome_var, usar_site in variantes:
+            dados, _sem_foto = _gerar_pdf_maleta(
+                titulo=f"Maleta - Envio #{envio['numero_envio']}",
+                subtitulo=(
+                    f"Parceiro: {parceiro_nome or '-'}   |   {rotulo}   |   "
+                    f"Descrição: {'do site' if usar_site else 'padrão'}   |   "
+                    f"Emitido em {agora:%d/%m/%Y %H:%M}"
+                ),
+                resumo=f"{len(itens)} produto(s) · {_fmt_qtd(pecas)} peça(s)",
+                linhas=[
+                    {
+                        "codigo": p.get("codigo_interno"),
+                        "descricao": _descricao_pdf(p, usar_site),
+                        "qtd": i.get("quantidade"),
+                        "foto_url": p.get("foto_url"),
+                    }
+                    for i, p in zip(itens, produtos)
+                ],
+            )
+            caminho = f"envio_{envio['id']}/{stamp}_{evento}_{nome_var}.pdf"
+            bucket.upload(caminho, dados, {"content-type": "application/pdf"})
+            caminhos[nome_var] = caminho
+        resposta = supabase.table("parcerias_envio_pdfs").insert({
+            "envio_id": envio["id"],
+            "evento": evento,
+            "motivo": (motivo or "").strip() or None,
+            "total_itens": len(itens),
+            "total_pecas": pecas,
+            "caminho_padrao": caminhos.get("padrao"),
+            "caminho_site": caminhos.get("site"),
+        }).execute()
+        _buscar_pdfs_maleta.clear()
+        return resposta.data[0]["id"], None
+    except ImportError:
+        aviso = "os PDFs não foram gerados: instale a biblioteca com pip install reportlab."
+    except Exception as e:
+        aviso = f"não foi possível guardar os PDFs da maleta ({e})."
+    if caminhos:  # não deixa arquivo órfão no Storage se o registro falhou
+        try:
+            bucket.remove(list(caminhos.values()))
+        except Exception:
+            pass
+    return None, aviso
+
+
+def _url_pdf_maleta(caminho: str) -> str:
+    """URL pública do PDF com ?download=: o navegador baixa o arquivo em vez de só abri-lo."""
+    try:
+        url = str(supabase.storage.from_(BUCKET_PDFS).get_public_url(caminho)).rstrip("?")
+    except Exception:
+        return ""
+    nome = caminho.rsplit("/", 1)[-1]
+    return f"{url}{'&' if '?' in url else '?'}{urlencode({'download': nome})}"
+
+
+def _eventos_do_ciclo(envio: dict, movimentos: list, pdfs: list) -> list:
+    """Linha do tempo da maleta: a criação (saída) e cada ajuste (adições/remoções salvas de
+    uma vez). Os movimentos de um mesmo ajuste são agrupados pelo PDF (pdf_id); movimentos
+    antigos, sem PDF, são agrupados pelo horário de gravação."""
+    eventos = []
+    pdf_criacao = next((p for p in pdfs if p.get("evento") == "criacao"), None)
+    if envio.get("enviado_em") or envio.get("status") in ("Enviado", "Fechado"):
+        if pdf_criacao and pdf_criacao.get("total_itens") is not None:
+            resumo = f"{pdf_criacao['total_itens']} produto(s) · {_fmt_qtd(pdf_criacao.get('total_pecas'))} peça(s)"
+        elif envio.get("status") == "Enviado" and envio.get("total_itens") is not None:
+            # enquanto a maleta está com o parceiro, os totais do envio ainda são os da saída
+            resumo = f"{envio['total_itens']} produto(s) · {_fmt_qtd(envio.get('total_pecas'))} peça(s)"
+        else:
+            resumo = ""
+        eventos.append({
+            "titulo": "🆕 Criação da maleta",
+            "quando": _fmt_data_hora(envio.get("enviado_em") or envio.get("data_envio"), converter_utc=False),
+            "resumo": resumo,
+            "pdf": pdf_criacao,
+            "movs": [],
+        })
+
+    pdfs_por_id = {p["id"]: p for p in pdfs}
+    grupos: dict = {}
+    for m in movimentos:
+        if m.get("pdf_id") in pdfs_por_id:
+            chave = ("pdf", m["pdf_id"])
+        else:
+            chave = ("ts", str(m.get("criado_em"))[:19])
+        grupos.setdefault(chave, []).append(m)
+    for p in pdfs:
+        if p.get("evento") == "ajuste":
+            grupos.setdefault(("pdf", p["id"]), [])
+
+    ajustes = []
+    for chave, movs in grupos.items():
+        pdf = pdfs_por_id.get(chave[1]) if chave[0] == "pdf" else None
+        instante = (pdf or {}).get("criado_em") or (movs[0].get("criado_em") if movs else None)
+        motivo = (pdf or {}).get("motivo") or next((m.get("motivo") for m in movs if m.get("motivo")), None)
+        partes = []
+        if motivo:
+            partes.append(f"Motivo: {motivo}")
+        if pdf and pdf.get("total_itens") is not None:
+            partes.append(f"a maleta ficou com {pdf['total_itens']} produto(s) · {_fmt_qtd(pdf.get('total_pecas'))} peça(s)")
+        ajustes.append({
+            "ordem": str(instante or "")[:19],
+            "quando": _fmt_data_hora(instante),
+            "resumo": " · ".join(partes),
+            "pdf": pdf,
+            "movs": movs,
+        })
+    ajustes.sort(key=lambda a: a["ordem"])
+    for n, a in enumerate(ajustes, start=1):
+        a["titulo"] = f"✏️ Ajuste #{n}"
+    return eventos + ajustes
+
+
+def _botao_baixar_pdf(coluna, rotulo: str, caminho) -> None:
+    url = _url_pdf_maleta(caminho) if caminho else ""
+    if not url:
+        return
+    botao = getattr(coluna, "link_button", None)
+    if botao is not None:
+        botao(rotulo, url, use_container_width=True)
+    else:
+        coluna.markdown(f"[{rotulo}]({url})")
+
+
+def _render_movimentos_ciclo(envio: dict, movimentos: list, pdfs: list, ocultar_vazio: bool = False) -> None:
+    """'Movimentações durante o ciclo': criação da maleta e cada ajuste, com os botões para
+    baixar os PDFs guardados (descrição padrão e descrição do site)."""
+    eventos = _eventos_do_ciclo(envio, movimentos, pdfs)
+    if not eventos and ocultar_vazio:
+        return
+    st.markdown("**Movimentações durante o ciclo**")
+    if not eventos:
+        st.caption("Nenhuma movimentação registrada.")
+        return
+    if not _tem_pdfs_maleta():
+        st.caption(
+            "Para guardar e baixar o PDF de cada movimentação, execute migracao_pdfs_maleta.sql no Supabase."
+        )
+    elif len(eventos) == 1 and not eventos[0]["movs"]:
+        st.caption("Nenhuma adição ou remoção desde a saída da maleta.")
+
+    for ev in eventos:
+        with st.container(border=True):
+            c_info, c_padrao, c_site = st.columns([5, 1.5, 1.7], vertical_alignment="center")
+            c_info.markdown(f"**{ev['titulo']}** · {ev['quando']}")
+            if ev["resumo"]:
+                c_info.caption(ev["resumo"].replace("$", "\\$"))
+            pdf = ev["pdf"]
+            if pdf and (pdf.get("caminho_padrao") or pdf.get("caminho_site")):
+                _botao_baixar_pdf(c_padrao, "⬇️ PDF padrão", pdf.get("caminho_padrao"))
+                _botao_baixar_pdf(c_site, "⬇️ PDF do site", pdf.get("caminho_site"))
+            else:
+                c_padrao.caption("sem PDF")
+            if ev["movs"]:
+                st.markdown(
+                    _html_tabela(
+                        ["Tipo", "Código", "Produto", "Qtd"],
+                        [
+                            [
+                                TIPOS_MOVIMENTO.get(m.get("tipo"), m.get("tipo") or "-"),
+                                (m.get("produtos") or {}).get("codigo_interno") or "-",
+                                (m.get("produtos") or {}).get("descricao") or "-",
+                                _fmt_qtd(m.get("quantidade")),
+                            ]
+                            for m in ev["movs"]
+                        ],
+                        colunas_num={3},
+                    ),
+                    unsafe_allow_html=True,
+                )
+
 
 def _tabela_movimentos(movimentos: list) -> str:
     return _html_tabela(
@@ -1673,7 +2370,292 @@ def _render_fechamento_envio(parceiro: dict, envio: dict, itens: list) -> None:
             st.error(f"Não foi possível fechar o ciclo: {e}")
 
 
-def _render_envio_enviado(parceiro: dict, envio: dict, itens: list, movimentos: list) -> None:
+def _tabela_maleta_atual(itens: list, vendidos: dict, usar_site: bool) -> str:
+    """Tabela somente leitura da maleta que está com o parceiro."""
+    linhas = []
+    for i in itens:
+        prod = i.get("produtos") or {}
+        enviado = float(i.get("quantidade") or 0)
+        vendido = min(float(vendidos.get(i["produto_id"], 0.0)), enviado)
+        linhas.append([
+            ("foto", prod.get("foto_url")),
+            prod.get("codigo_interno") or "-",
+            _descricao_pdf(prod, usar_site),
+            _fmt_qtd(enviado),
+            _fmt_qtd(vendido),
+            _fmt_qtd(enviado - vendido),
+            _fmt_moeda(i.get("valor_unitario")),
+        ])
+    return _html_tabela(
+        ["Foto", "Código", "Produto", "Enviado", "Vendido (sistema)", "Na maleta", "Valor unit."],
+        linhas,
+        colunas_num={3, 4, 5, 6},
+    )
+
+
+def _ui_remover_itens(itens: list, vendidos: dict, base: str, rem: dict) -> None:
+    """Opção 1: lista da maleta com 'Remover' e quantidade. Nada é gravado aqui: as escolhas
+    ficam em `rem` ({item_id: {'remover', 'qtd'}}) e vão para a prévia. Guardar em `rem`
+    (e não só nos widgets) mantém a escolha ao alternar entre as opções 1 e 2."""
+    if not itens:
+        st.info("A maleta está vazia: não há itens para remover.")
+        return
+    usar_site = _toggle_descricao_site(f"{base}_tg_rem")
+    st.caption(
+        "Marque os produtos que saem da maleta. Para tirar só algumas peças, reduza a quantidade. "
+        "Produtos com venda registrada não podem ser removidos nem ficar abaixo do vendido."
+    )
+    _legenda_fotos([(it.get("produtos") or {}).get("foto_url") for it in itens])
+    cols = [0.9, 1.0, 1.4, 3.2, 1.3, 1.3, 1.3]
+    with st.container(border=True):
+        for col, titulo in zip(
+            st.columns(cols, vertical_alignment="center"),
+            ["Remover", "Foto", "Código", "Produto", "Qtd", "Valor unit.", "Subtotal"],
+        ):
+            col.markdown(f"**{titulo}**")
+
+        for it in itens:
+            prod = it.get("produtos") or {}
+            atual = float(it.get("quantidade") or 0)
+            valor_unit = float(it.get("valor_unitario") or 0)
+            vendido = min(float(vendidos.get(it["produto_id"], 0.0)), atual)
+            estado = rem.get(it["id"], {})
+            k_chk, k_qtd = f"{base}_rmchk_{it['id']}", f"{base}_rmqtd_{it['id']}"
+            if k_chk not in st.session_state:  # widgets fora da tela perdem o estado
+                st.session_state[k_chk] = bool(estado.get("remover")) and vendido <= 0
+            if k_qtd not in st.session_state:
+                st.session_state[k_qtd] = float(estado.get("qtd", atual))
+            st.session_state[k_qtd] = min(max(float(st.session_state[k_qtd]), vendido), atual)
+
+            c_rm, c_foto, c_cod, c_prod, c_qtd, c_val, c_sub = st.columns(cols, vertical_alignment="center")
+            marcado = c_rm.checkbox(
+                "Remover", key=k_chk, label_visibility="collapsed", disabled=vendido > 0,
+            )
+            with c_foto:
+                _mostrar_foto(prod.get("foto_url"))
+            c_cod.write(prod.get("codigo_interno") or "-")
+            c_prod.write(_descricao_pdf(prod, usar_site))
+            if vendido > 0:
+                c_prod.caption(f"já vendido: {_fmt_qtd(vendido)}")
+            qtd = c_qtd.number_input(
+                "Qtd", min_value=vendido, max_value=atual, step=1.0, format="%g",
+                key=k_qtd, label_visibility="collapsed", disabled=bool(marcado),
+            )
+            c_val.write(_fmt_moeda(valor_unit))
+            c_sub.write(_fmt_moeda(0.0 if marcado else qtd * valor_unit))
+
+            if marcado or not _iguais(qtd, atual):
+                rem[it["id"]] = {"remover": bool(marcado), "qtd": float(qtd)}
+            else:
+                rem.pop(it["id"], None)
+
+
+def _render_ajuste_maleta(parceiro: dict, envio: dict, itens: list, vendidos: dict) -> None:
+    """Etapa 'Ajustar maleta' (maleta com o parceiro).
+
+    Itens atuais recolhidos -> opção 1 (remover) ou 2 (adicionar) -> prévia da maleta como
+    ficaria (com PDF) -> salvar. Sem conferência física: as alterações só dependem do botão
+    de salvar e ficam registradas nas movimentações.
+
+    Não é um @st.fragment: o botão do PDF abre um popup e não funciona dentro de fragmento."""
+    envio_id = envio["id"]
+    reset = st.session_state.get("parceiros_envio_reset", 0)
+    base = f"parceiros_adj_{envio_id}_{reset}"
+    try:
+        disp = _carregar_produtos_disponiveis()
+    except Exception as e:
+        st.error(f"Não foi possível carregar os produtos em estoque: {e}")
+        return
+
+    st.caption(
+        "Escolha uma das opções para tirar ou colocar produtos na maleta. As alterações aparecem "
+        "na prévia abaixo e só são gravadas ao clicar em salvar; cada uma fica registrada nas movimentações."
+    )
+
+    # --- itens atuais: recolhidos ---
+    pecas_atuais = sum(float(i.get("quantidade") or 0) for i in itens)
+    valor_atual = sum(float(i.get("quantidade") or 0) * float(i.get("valor_unitario") or 0) for i in itens)
+    usar_site = bool(st.session_state.get(CHAVE_USAR_SITE, False))
+    with st.expander(
+        f"📦 Itens da maleta atual ({len(itens)} produto(s) · {_fmt_qtd(pecas_atuais)} peça(s))",
+        expanded=False,
+    ):
+        if itens:
+            _legenda_fotos([(i.get("produtos") or {}).get("foto_url") for i in itens])
+            st.markdown(_tabela_maleta_atual(itens, vendidos, usar_site), unsafe_allow_html=True)
+        else:
+            st.caption("A maleta está vazia.")
+
+    # --- as duas opções ---
+    opcao = _menu("Opção", OPCOES_AJUSTE, key=f"parceiros_ajuste_op_{envio_id}")
+    rem = st.session_state.setdefault(f"{base}_rem", {})
+    if opcao == OPCOES_AJUSTE[0]:
+        _ui_remover_itens(itens, vendidos, base, rem)
+    else:
+        # fragmento: filtros e páginas não refazem a tela; a seleção muda -> rerun completo
+        _lista_candidatos(envio, itens, disp, "Ajuste")
+
+    # --- o que mudou (remoções e reduções + adições) ---
+    linhas_editadas = [
+        {
+            "id": it["id"],
+            "Remover": rem.get(it["id"], {}).get("remover", False),
+            "Qtd": rem.get(it["id"], {}).get("qtd", float(it.get("quantidade") or 0)),
+        }
+        for it in itens
+    ]
+    minimos = {
+        it["produto_id"]: min(float(vendidos.get(it["produto_id"], 0.0)), float(it.get("quantidade") or 0))
+        for it in itens
+    }
+    remover, atualizar, erros = _classificar_alteracoes(itens, linhas_editadas, disp, minimos)
+
+    sel = st.session_state.get(f"parceiros_cand_{envio_id}_{reset}_sel", {})
+    novos = []
+    for pid, qtd in sel.items():
+        p = disp.get(pid)
+        if not p or p["disponivel"] <= 0:
+            continue
+        if qtd <= 0 or qtd > p["disponivel"]:
+            erros.append(
+                f"{p['codigo']}: quantidade {_fmt_qtd(qtd)} maior que o disponível ({_fmt_qtd(p['disponivel'])})."
+            )
+            continue
+        novos.append((pid, float(qtd), p))
+
+    st.divider()
+    st.markdown("##### 🧾 Maleta como ficaria")
+    for erro in erros:
+        st.error(erro)
+    if erros:
+        return
+    if not (remover or atualizar or novos):
+        st.caption(
+            "Nenhuma alteração ainda. Marque itens para remover (opção 1) ou escolha produtos "
+            "para adicionar (opção 2)."
+        )
+        return
+
+    por_remover, nova_qtd = set(remover), dict(atualizar)
+    projetados, linhas_prev = [], []
+    for it in itens:
+        if it["id"] in por_remover:
+            continue
+        atual = float(it.get("quantidade") or 0)
+        qtd = nova_qtd.get(it["id"], atual)
+        projetados.append({**it, "quantidade": qtd})
+        prod = it.get("produtos") or {}
+        linhas_prev.append([
+            ("foto", prod.get("foto_url")),
+            prod.get("codigo_interno") or "-",
+            _descricao_pdf(prod, usar_site),
+            _fmt_qtd(qtd),
+            f"✏️ {_fmt_qtd(atual)} → {_fmt_qtd(qtd)}" if it["id"] in nova_qtd else "—",
+        ])
+    for pid, qtd, p in novos:
+        prod = {
+            "codigo_interno": p["codigo"],
+            "descricao": p["descricao"],
+            "foto_url": p.get("foto_url"),
+            "produto_descricao_site": p.get("produto_descricao_site") or "",
+        }
+        projetados.append({
+            "id": f"novo_{pid}", "produto_id": pid, "quantidade": qtd,
+            "valor_unitario": p["preco"], "produtos": prod,
+        })
+        linhas_prev.append([
+            ("foto", prod["foto_url"]), prod["codigo_interno"],
+            _descricao_pdf(prod, usar_site), _fmt_qtd(qtd), "➕ novo",
+        ])
+
+    pecas_novas = sum(float(i.get("quantidade") or 0) for i in projetados)
+    valor_novo = sum(float(i.get("quantidade") or 0) * float(i.get("valor_unitario") or 0) for i in projetados)
+
+    def _delta(novo: float, antigo: float, formato) -> str:
+        dif = novo - antigo
+        return None if _iguais(dif, 0.0) else f"{'+' if dif > 0 else '-'}{formato(abs(dif))}"
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Produtos", len(projetados), delta=_delta(len(projetados), len(itens), _fmt_qtd))
+    m2.metric("Peças", _fmt_qtd(pecas_novas), delta=_delta(pecas_novas, pecas_atuais, _fmt_qtd))
+    m3.metric("Valor (preço sugerido)", _fmt_moeda(valor_novo), delta=_delta(valor_novo, valor_atual, _fmt_moeda))
+
+    if linhas_prev:
+        _legenda_fotos([l[0][1] for l in linhas_prev])
+        st.markdown(
+            _html_tabela(["Foto", "Código", "Produto", "Qtd", "Alteração"], linhas_prev, colunas_num={3}),
+            unsafe_allow_html=True,
+        )
+    else:
+        st.info("A maleta ficaria vazia.")
+    removidos = [_rotulo_produto(it.get("produtos") or {}) for it in itens if it["id"] in por_remover]
+    if removidos:
+        st.caption(f"➖ Removidos: {_resumir_lista(removidos)}")
+
+    motivo = st.text_input("Motivo (opcional)", key=f"parceiros_ajuste_motivo_{envio_id}_{reset}")
+    col_pdf, col_salvar, _ = st.columns([1.2, 2, 2])
+    with col_pdf:
+        _botao_pdf_maleta(parceiro.get("nome") or "", envio, projetados, "ajuste")
+    with col_salvar:
+        salvar = st.button(
+            "💾 Salvar alterações na maleta", type="primary", key="parceiros_ajuste_salvar",
+        )
+    st.caption("O PDF mostra a maleta como ficaria. Salve para gravar a alteração e atualizar o estoque reservado.")
+
+    if not salvar:
+        return
+
+    # A tela usa dados em cache (até 30 s); ao gravar, confere de novo com o estoque atual.
+    _carregar_produtos_disponiveis.clear()
+    disp_agora = _carregar_produtos_disponiveis()
+    remover_a, atualizar_a, erros_a = _classificar_alteracoes(itens, linhas_editadas, disp_agora, minimos)
+    for pid, qtd, p in novos:
+        maximo = float(disp_agora.get(pid, {}).get("disponivel", 0.0))
+        if qtd > maximo:
+            erros_a.append(f"{p['codigo']}: quantidade {_fmt_qtd(qtd)} maior que o disponível ({_fmt_qtd(maximo)}).")
+    try:
+        if erros_a:
+            raise ValueError(" | ".join(erros_a))
+        por_id = {it["id"]: it for it in itens}
+        movimentos = []
+        if remover_a:
+            for item_id in remover_a:
+                movimentos.append(
+                    (por_id[item_id]["produto_id"], "remocao", float(por_id[item_id]["quantidade"] or 0))
+                )
+            supabase.table("parcerias_envio_itens").delete().in_("id", remover_a).execute()
+        for item_id, nova in atualizar_a:
+            atual = float(por_id[item_id]["quantidade"] or 0)
+            supabase.table("parcerias_envio_itens").update({"quantidade": nova}).eq("id", item_id).execute()
+            movimentos.append((
+                por_id[item_id]["produto_id"], "adicao" if nova > atual else "remocao", abs(nova - atual),
+            ))
+        if novos:
+            supabase.table("parcerias_envio_itens").insert([
+                {
+                    "envio_id": envio_id,
+                    "produto_id": pid,
+                    "quantidade": qtd,
+                    "valor_unitario": float(disp_agora[pid]["preco"]),
+                }
+                for pid, qtd, _p in novos
+            ]).execute()
+            movimentos += [(pid, "adicao", qtd) for pid, qtd, _p in novos]
+        with st.spinner("Gerando e guardando os PDFs da maleta..."):
+            pdf_id, aviso = _guardar_pdfs_evento(
+                parceiro.get("nome") or "", envio, projetados, "ajuste", motivo,
+            )
+        _registrar_movimentos(envio_id, movimentos, motivo, pdf_id)
+        _resetar_editores_envio()
+        msg = "Alterações salvas e registradas nas movimentações. A maleta foi atualizada."
+        _flash("warning", f"{msg} Atenção: {aviso}") if aviso else _flash("success", msg)
+        st.rerun()
+    except Exception as e:
+        _invalidar_cache_envios()
+        st.error(f"Não foi possível salvar as alterações: {e}")
+
+
+def _render_envio_enviado(parceiro: dict, envio: dict, itens: list, movimentos: list, pdfs: list = None) -> None:
     envio_id = envio["id"]
     reset = st.session_state.get("parceiros_envio_reset", 0)
 
@@ -1708,61 +2690,18 @@ def _render_envio_enviado(parceiro: dict, envio: dict, itens: list, movimentos: 
     etapa = _menu("Etapa", ETAPAS_ENVIADO, key=f"parceiros_etapa_{envio_id}")
 
     if etapa == ETAPAS_ENVIADO[0]:
+        _botao_pdf_maleta(parceiro.get("nome") or "", envio, itens, "maleta")
         if itens:
+            usar_site = _toggle_descricao_site(f"parceiros_tg_maleta_{envio_id}")
             _legenda_fotos([(i.get("produtos") or {}).get("foto_url") for i in itens])
-            linhas = []
-            for i in itens:
-                prod = i.get("produtos") or {}
-                enviado = float(i.get("quantidade") or 0)
-                vendido = min(float(vendidos.get(i["produto_id"], 0.0)), enviado)
-                linhas.append([
-                    ("foto", prod.get("foto_url")),
-                    prod.get("codigo_interno") or "-",
-                    prod.get("descricao") or "-",
-                    _fmt_qtd(enviado),
-                    _fmt_qtd(vendido),
-                    _fmt_qtd(enviado - vendido),
-                    _fmt_moeda(i.get("valor_unitario")),
-                ])
-            st.markdown(
-                _html_tabela(
-                    ["Foto", "Código", "Produto", "Enviado", "Vendido (sistema)", "Na maleta", "Valor unit."],
-                    linhas,
-                    colunas_num={3, 4, 5, 6},
-                ),
-                unsafe_allow_html=True,
-            )
+            st.markdown(_tabela_maleta_atual(itens, vendidos, usar_site), unsafe_allow_html=True)
         else:
             st.info("A maleta está vazia. Use 'Ajustar maleta' para adicionar produtos.")
-        st.markdown("**Movimentações durante o ciclo**")
-        if movimentos:
-            st.markdown(_tabela_movimentos(movimentos), unsafe_allow_html=True)
-        else:
-            st.caption("Nenhuma adição ou remoção desde a saída da maleta.")
+        _render_movimentos_ciclo(envio, movimentos, pdfs or [])
         _mostrar_fotos_maleta(envio_id)
 
     elif etapa == ETAPAS_ENVIADO[1]:
-        st.caption(
-            "Use esta etapa para acrescentar ou retirar produtos enquanto a maleta está com o "
-            "parceiro. Cada alteração fica registrada nas movimentações."
-        )
-        try:
-            disp = _carregar_produtos_disponiveis()
-        except Exception as e:
-            st.error(f"Não foi possível carregar os produtos em estoque: {e}")
-            return
-        col_motivo, col_conf = st.columns([3, 2])
-        with col_motivo:
-            motivo = st.text_input("Motivo (opcional)", key=f"parceiros_ajuste_motivo_{envio_id}_{reset}")
-        with col_conf:
-            conferi = st.checkbox(
-                "Conferi fisicamente os produtos desta alteração",
-                key=f"parceiros_ajuste_conf_{envio_id}_{reset}",
-            )
-        _secao_itens_envio(
-            envio, itens, disp, modo="Enviado", vendidos=vendidos, liberado=conferi, motivo=motivo,
-        )
-        _secao_adicionar_produtos(envio, itens, disp, modo="Enviado", liberado=conferi, motivo=motivo)
+        _render_ajuste_maleta(parceiro, envio, itens, vendidos)
 
     else:
         _render_fechamento_envio(parceiro, envio, itens)
@@ -1895,9 +2834,8 @@ def _render_historico_envios(parceiro: dict, envios: list, itens_por_envio: dict
         movimentos = movimentos_por_envio[envio["id"]]
     else:
         movimentos = _buscar_movimentos((envio["id"],)).get(envio["id"], [])
-    if movimentos:
-        st.markdown("**Movimentações durante o ciclo**")
-        st.markdown(_tabela_movimentos(movimentos), unsafe_allow_html=True)
+    pdfs = _buscar_pdfs_maleta((envio["id"],)).get(envio["id"], [])
+    _render_movimentos_ciclo(envio, movimentos, pdfs, ocultar_vazio=True)
     _mostrar_fotos_maleta(envio["id"])
 
 
@@ -1905,8 +2843,8 @@ def _secao_parceiro_produtos_enviados(parceiro: dict) -> None:
     """Aba 'Produtos Enviados': ciclo da maleta do parceiro.
 
     montagem -> conferência de saída -> maleta com o parceiro (ajustes) ->
-    recebimento e fechamento do ciclo -> novo envio. As vendas do canal continuam
-    disponíveis no expander ao final."""
+    recebimento e fechamento do ciclo -> novo envio. O histórico de envios fica na aba
+    'Históricos'."""
     _mostrar_flash()
     try:
         envios = _buscar_envios(parceiro["id"])
@@ -1919,10 +2857,9 @@ def _secao_parceiro_produtos_enviados(parceiro: dict) -> None:
         else:
             ids_itens = (envios[0]["id"],) if envios else ()
         itens_por_envio = _buscar_itens_dos_envios(ids_itens)
-        movimentos_por_envio = (
-            _buscar_movimentos((ativo["id"],))
-            if ativo is not None and ativo.get("status") == "Enviado" else {}
-        )
+        enviado = ativo is not None and ativo.get("status") == "Enviado"
+        movimentos_por_envio = _buscar_movimentos((ativo["id"],)) if enviado else {}
+        pdfs_por_envio = _buscar_pdfs_maleta((ativo["id"],)) if enviado else {}
     except Exception as e:
         st.error(f"Não foi possível carregar os envios: {e}")
         st.caption(
@@ -1931,9 +2868,6 @@ def _secao_parceiro_produtos_enviados(parceiro: dict) -> None:
         )
         return
 
-    # em_foco: etapa de trabalho (conferência, ajuste, recebimento). Nela só aparece o conteúdo
-    # da própria etapa; o histórico e as vendas do canal voltam ao sair dela.
-    em_foco = False
     if ativo is None:
         passo = -1
     elif ativo.get("status") == "Aberto":
@@ -1941,11 +2875,10 @@ def _secao_parceiro_produtos_enviados(parceiro: dict) -> None:
             st.session_state.get(f"parceiros_envio_conferindo_{ativo['id']}")
             and itens_por_envio.get(ativo["id"])
         )
-        passo, em_foco = (1, True) if conferindo else (0, False)
+        passo = 1 if conferindo else 0
     else:
         etapa = st.session_state.get(f"parceiros_etapa_{ativo['id']}")
         passo = 3 if etapa == ETAPAS_ENVIADO[2] else 2
-        em_foco = etapa in (ETAPAS_ENVIADO[1], ETAPAS_ENVIADO[2])
     st.markdown(
         _html_passos(["Montagem", "Conferência de saída", "Maleta com o parceiro", "Recebimento e fechamento"], passo),
         unsafe_allow_html=True,
@@ -1959,18 +2892,8 @@ def _secao_parceiro_produtos_enviados(parceiro: dict) -> None:
         _render_envio_enviado(
             parceiro, ativo, itens_por_envio.get(ativo["id"], []),
             movimentos_por_envio.get(ativo["id"], []),
+            pdfs_por_envio.get(ativo["id"], []),
         )
-
-    if em_foco:
-        return
-
-    st.divider()
-    _render_historico_envios(parceiro, envios, itens_por_envio, movimentos_por_envio)
-
-    st.divider()
-    # Só consulta as vendas quando o usuário pede (antes rodava a cada clique, mesmo fechado).
-    if st.checkbox("📈 Ver vendas do canal deste parceiro (por período)", key="parceiros_ver_vendas_canal"):
-        _secao_parceiro_vendas_canal(parceiro)
 
 
 CHUNK_IN = 400  # tamanho dos blocos em consultas .in_() (URLs enormes falham no PostgREST)
@@ -2391,7 +3314,19 @@ def _secao_parceiro_fechamento(parceiro: dict) -> None:
                 _invalidar_cache_fechamento()
                 st.error(f"Não foi possível fechar o ciclo: {e}")
 
-    st.divider()
+
+@_fragmento
+def _secao_historico_comissoes(parceiro: dict) -> None:
+    """Histórico dos ciclos de comissão do parceiro. Clicar em um ciclo mostra o detalhe,
+    somente para consulta (as vendas do ciclo, a comissão e a retirada de peças)."""
+    parceiro_id = parceiro["id"]
+    canal_id = parceiro.get("canal_id")
+    try:
+        fechamentos = _buscar_fechamentos(parceiro_id)
+    except Exception as e:
+        st.error(f"Não foi possível carregar os ciclos de comissão: {e}")
+        return
+
     st.markdown("##### Histórico de ciclos")
     if not fechamentos:
         st.caption("Nenhum ciclo de fechamento registrado ainda para este parceiro.")
@@ -2517,6 +3452,35 @@ def _secao_parceiro_fechamento(parceiro: dict) -> None:
             )
         else:
             st.info("Este ciclo não possui vendas vinculadas.")
+
+
+def _secao_historico_envios(parceiro: dict) -> None:
+    """Histórico das maletas (envios) do parceiro, com o detalhe de cada uma ao clicar."""
+    try:
+        envios = _buscar_envios(parceiro["id"])
+        ativo = next((e for e in envios if e.get("status") in STATUS_ATIVOS), None)
+        # Só o envio ativo precisa dos itens de antemão (para o resumo da linha); os
+        # envios antigos são buscados quando o usuário clica neles.
+        itens_por_envio = _buscar_itens_dos_envios((ativo["id"],)) if ativo else {}
+    except Exception as e:
+        st.error(f"Não foi possível carregar os envios: {e}")
+        return
+    _render_historico_envios(parceiro, envios, itens_por_envio, {})
+
+
+HISTORICOS = ["comissoes", "envios"]
+ROTULOS_HISTORICO = {"comissoes": "💰 Ciclos de comissão", "envios": "📦 Envios (maletas)"}
+
+
+def _secao_historicos(parceiro: dict) -> None:
+    """Aba 'Históricos': ciclos de comissão e envios já realizados. Só o histórico escolhido
+    é consultado e desenhado."""
+    _mostrar_flash()
+    escolhido = _menu("Histórico", HISTORICOS, key="parceiros_hist_sub", formatar=ROTULOS_HISTORICO.get)
+    if escolhido == "comissoes":
+        _secao_historico_comissoes(parceiro)
+    else:
+        _secao_historico_envios(parceiro)
 
 
 def _limpar_estado_parceiro() -> None:
@@ -2737,7 +3701,7 @@ def secao_parceiros():
 
     # st.tabs executa o conteúdo de TODAS as abas a cada interação (e suas consultas).
     # Com este menu só a seção escolhida é executada.
-    secoes = ["fechamento", "envios"]
+    secoes = ["fechamento", "envios", "historicos"]
     rotulos = {
         "fechamento": "📑 Fechamento" + (
             f" · ciclo #{info['ciclo']['numero_ciclo']}" if info.get("ciclo") else ""
@@ -2745,10 +3709,13 @@ def secao_parceiros():
         "envios": "📦 Produtos enviados" + (
             f" · maleta #{info['envio']['numero_envio']}" if info.get("envio") else ""
         ),
+        "historicos": "🗂️ Históricos",
     }
     secao = _menu("Seção", secoes, key="parceiros_aba", formatar=rotulos.get)
 
     if secao == "fechamento":
         _secao_parceiro_fechamento(parceiro)
-    else:
+    elif secao == "envios":
         _secao_parceiro_produtos_enviados(parceiro)
+    else:
+        _secao_historicos(parceiro)

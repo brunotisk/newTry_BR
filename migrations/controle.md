@@ -21,6 +21,7 @@ Projeto: **Projeto AC**
 | 013    | criar_tabelas_envio_parceiros         | ✅ Aplicada     | ✅ Aplicada  |
 | 015    | adicionar_retirada_pessoal            | ✅ Aplicada     | ✅ Aplicada  |
 | 016    | migracao_fotos_maleta                 | ✅ Aplicada     | ✅ Aplicada  |
+| 017    | migracao_pdfs_maleta                  | ✅ Aplicada     | ✅ Aplicada  |
 ------------------------------------------------------------------------------------
 
 
@@ -84,3 +85,7 @@ Descrição: inclusão do campo custo_unitario na tabela public.estoque_moviment
 **Arquivo**: migrations/016_migracao_fotos_maleta.sql  
 Data: 11/10/2026  
 Descrição: Cria a tabela `public.parcerias_envio_arquivos` para registrar fotos de saída e retorno das maletas, configura o bucket público `fotos_maletas` no Supabase Storage com limite de 10 MB por arquivo e restringe os tipos permitidos a JPEG, PNG e WebP. Adiciona índice por envio, desabilita RLS na tabela e configura políticas de envio, leitura e exclusão para o bucket.
+
+**Arquivo**: migrations/017_migracao_pdfs_maleta.sql  
+Data: 15/10/2026  
+Descrição: Cria a tabela `public.parcerias_envio_pdfs` para registrar os PDFs gerados na criação e nos ajustes das maletas, incluindo caminhos dos arquivos padrão e de descrição do site, motivo e totais de itens e peças. Adiciona índice por envio, relaciona os movimentos ao PDF por meio da coluna `pdf_id`, habilita RLS com política para usuários autenticados e configura o bucket público `pdf_maletas`, permitindo envio e exclusão por usuários autenticados.

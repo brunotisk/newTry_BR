@@ -55,5 +55,5 @@ Melhoria Performance Maleta envio Parceiro
 Retirada Peças
 
 ## 1.9.1-Gráficos e Retiradas-11/10/2026
-
 ## 1.9.2-melhoria Parceiros-11/10/2026
+## 1.9.3-melhoria Parceiros:PDF-15/10/2026

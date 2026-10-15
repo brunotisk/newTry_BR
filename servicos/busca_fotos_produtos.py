@@ -29,6 +29,9 @@ BUCKET = "fotos_produtos"
 
 POR_PAGINA = 250
 MAX_PAGINAS = 100
+PAUSA_ENTRE_PAGINAS = 1.0   # s entre uma página e outra (antes 0,3: estourava o limite da loja)
+MAX_TENTATIVAS_429 = 5      # quantas vezes esperar e tentar de novo uma página limitada (HTTP 429)
+ESPERA_MAXIMA_429 = 120     # s: teto da espera por tentativa
 LADO_MAX = 1200            # px: maior lado da foto gravada no Storage
 TAMANHO_MAX_DOWNLOAD = 25 * 1024 * 1024
 UA = {"User-Agent": "Mozilla/5.0 (auditoria de fotos do catálogo)"}
@@ -85,38 +88,106 @@ def tipo_foto_atual(foto_url, bucket: str = BUCKET) -> str:
 # ----------------------------------------------------------------------
 # Catálogo do site
 # ----------------------------------------------------------------------
-def baixar_catalogo(loja: str = LOJA_PADRAO, progresso=None, avisos: list | None = None) -> list:
-    """Lê /products.json página a página. Se houver HTTP 429, encerra e retorna o que já baixou.
+def _espera_429(resposta, tentativa: int) -> float:
+    """Segundos a esperar depois de um HTTP 429: usa o cabeçalho Retry-After da loja quando
+    existe; senão recuo exponencial (5, 10, 20, 40, 80 s). Nunca passa de ESPERA_MAXIMA_429."""
+    try:
+        return min(float(resposta.headers.get("Retry-After")), ESPERA_MAXIMA_429)
+    except (TypeError, ValueError):
+        return min(5 * 2 ** tentativa, ESPERA_MAXIMA_429)
 
-    `progresso(pagina, total_produtos)` atualiza o andamento; `avisos`, quando fornecido,
-    recebe uma mensagem se a loja limitar as requisições (HTTP 429).
+
+def _obter_pagina(url: str, pagina: int, aguardando=None):
+    """GET da página do catálogo; se a loja responder 429, espera e tenta de novo."""
+    for tentativa in range(MAX_TENTATIVAS_429 + 1):
+        resposta = requests.get(url, headers=UA, timeout=30)
+        if resposta.status_code != 429 or tentativa == MAX_TENTATIVAS_429:
+            return resposta
+        espera = _espera_429(resposta, tentativa)
+        if aguardando:
+            aguardando(espera, pagina, tentativa + 1, MAX_TENTATIVAS_429)
+        time.sleep(espera)
+
+
+def _skus_do_lote(produtos: list) -> set:
+    return {
+        chave(v.get("sku"))
+        for p in produtos for v in (p.get("variants") or [])
+        if chave(v.get("sku"))
+    }
+
+
+def baixar_catalogo(
+    loja: str = LOJA_PADRAO,
+    progresso=None,
+    avisos: list | None = None,
+    chaves_alvo: set | None = None,
+    estado: dict | None = None,
+    aguardando=None,
+    pausa: float = PAUSA_ENTRE_PAGINAS,
+) -> list:
+    """Lê /products.json página a página, aguentando o limite de requisições da loja.
+
+    - **HTTP 429**: espera (Retry-After ou recuo exponencial) e tenta a mesma página de novo,
+      até MAX_TENTATIVAS_429 vezes. `aguardando(segundos, pagina, tentativa, total)` informa a espera.
+    - **Retomada**: se ainda assim não passar, o progresso fica em `estado` ("produtos" e
+      "proxima_pagina"). Chamar de novo com o mesmo `estado` continua de onde parou, sem baixar
+      de novo as páginas anteriores. `estado["completo"]` diz se o catálogo foi lido por inteiro.
+    - **Só alguns códigos**: com `chaves_alvo` (códigos já normalizados com `chave`), a leitura
+      termina assim que todos forem encontrados (`estado["encerrado_por_alvos"] = True`).
+      Códigos que não existem no site obrigam a ler o catálogo inteiro.
+
+    Devolve a lista de produtos baixados (a mesma de `estado["produtos"]`).
     """
     loja = loja.rstrip("/")
-    produtos = []
-    for pagina in range(1, MAX_PAGINAS + 1):
+    estado = estado if estado is not None else {}
+    produtos = estado.setdefault("produtos", [])
+    pagina = estado.get("proxima_pagina", 1)
+    estado.update(completo=False, encerrado_por_alvos=False, motivo=None)
+
+    pendentes = None
+    if chaves_alvo:
+        pendentes = set(chaves_alvo) - _skus_do_lote(produtos)
+        if produtos and not pendentes:        # retomada em que tudo já tinha sido encontrado
+            estado.update(completo=True, encerrado_por_alvos=True)
+            return produtos
+
+    while pagina <= MAX_PAGINAS:
         url = f"{loja}/products.json?limit={POR_PAGINA}&page={pagina}"
-        resp = requests.get(url, headers=UA, timeout=30)
+        resp = _obter_pagina(url, pagina, aguardando)
         if resp.status_code == 429:
-            mensagem = (
-                f"A loja limitou as consultas (HTTP 429) na página {pagina}. "
-                f"A busca foi encerrada e a auditoria usará os {len(produtos)} produtos "
-                "já baixados. Portanto, os resultados podem estar incompletos."
-            )
+            estado.update(proxima_pagina=pagina, motivo="429")
             if avisos is not None:
-                avisos.append(mensagem)
-            break
+                avisos.append(
+                    f"A loja continuou limitando as consultas (HTTP 429) na página {pagina}, mesmo "
+                    f"após {MAX_TENTATIVAS_429} esperas. O progresso foi guardado "
+                    f"({len(produtos)} produtos já baixados): tente de novo em alguns minutos e a "
+                    f"busca continua da página {pagina}."
+                )
+            return produtos
         if resp.status_code != 200:
+            estado["proxima_pagina"] = pagina
             raise RuntimeError(
                 f"A loja respondeu HTTP {resp.status_code} em {url}. "
                 "A lista pública de produtos pode estar desativada."
             )
         lote = resp.json().get("products") or []
         if not lote:
+            estado["completo"] = True
             break
         produtos.extend(lote)
+        estado["proxima_pagina"] = pagina + 1
         if progresso:
             progresso(pagina, len(produtos))
-        time.sleep(0.3)
+        if pendentes is not None:
+            pendentes -= _skus_do_lote(lote)
+            if not pendentes:
+                estado.update(completo=True, encerrado_por_alvos=True)
+                break
+        pagina += 1
+        time.sleep(pausa)
+    else:
+        estado["completo"] = True   # chegou ao limite de páginas
     return produtos
 
 
