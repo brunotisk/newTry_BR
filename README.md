@@ -1,4 +1,6 @@
 streamlit run app.py
+streamlit run app_mobile.py
+
 
 https://github.com/brunotisk/newTry_BR
 https://share.streamlit.io/deploy
