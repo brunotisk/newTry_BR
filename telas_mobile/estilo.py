@@ -12,9 +12,10 @@ CSS = """
   --m-accent: #b08d57;
   --m-accent-soft: rgba(176, 141, 87, .16);
   --m-line: rgba(128, 128, 128, .28);
+  --m-accent-text: #8a6a35;   /* dourado mais escuro: texto legível sobre fundo claro */
   --m-bar-bg: #ffffff;
 }
-@media (prefers-color-scheme: dark) { :root { --m-bar-bg: #0e1117; } }
+@media (prefers-color-scheme: dark) { :root { --m-bar-bg: #0e1117; --m-accent-text: #c9a46b; } }
 
 /* --- some o que denuncia o Streamlit --- */
 header[data-testid="stHeader"], [data-testid="stToolbar"], [data-testid="stDecoration"],
@@ -52,13 +53,14 @@ button[kind="primary"], button[data-testid="stBaseButton-primary"] {
   background: var(--m-accent) !important; border-color: var(--m-accent) !important; color: #fff !important;
 }
 
-/* --- cabeçalho: título da tela + Sair, sempre na mesma linha --- */
-.st-key-m_topo [data-testid="stHorizontalBlock"] { flex-direction: row !important; flex-wrap: nowrap !important; align-items: center; }
-.st-key-m_topo [data-testid="stColumn"] { min-width: 0 !important; width: auto !important; }
-.st-key-m_topo [data-testid="stColumn"]:first-child { flex: 1 1 auto !important; }
-.st-key-m_topo [data-testid="stColumn"]:last-child { flex: 0 0 auto !important; }
-.st-key-m_topo h3 { margin: 0; padding: 0; font-size: 1.35rem; }
-.st-key-m_topo button { min-height: 2.4rem; padding: .1rem .8rem; background: transparent; border: 1px solid var(--m-line); }
+/* --- cabeçalho: marca + título da tela --- */
+.m-topo { margin: 0 0 1rem; }
+.m-marca {
+  font-size: .7rem; font-weight: 700; letter-spacing: .16em; text-transform: uppercase;
+  color: var(--m-accent-text); line-height: 1; margin: .1rem 0 .3rem;
+}
+.m-titulo { font-size: 1.55rem; font-weight: 700; letter-spacing: -.01em; line-height: 1.15; margin: 0; }
+.m-topo-linha { width: 2.2rem; height: 3px; border-radius: 3px; background: var(--m-accent); margin-top: .55rem; }
 
 /* --- barra de navegação fixa embaixo --- */
 .st-key-m_nav {
@@ -73,17 +75,29 @@ button[kind="primary"], button[data-testid="stBaseButton-primary"] {
   max-width: 640px; margin: 0 auto;
 }
 .st-key-m_nav [data-testid="stColumn"] { min-width: 0 !important; width: auto !important; flex: 1 1 0 !important; }
-.st-key-m_nav button {
+
+/* Cores da barra. O prefixo "html body .stApp" reforça os seletores para valerem sobre as
+   regras genéricas do tema.py (--m-nav-text e --m-accent-text são definidos lá; sem tema
+   escolhido, o texto herda a cor do Streamlit). */
+html body .stApp .st-key-m_nav .stButton button {
   min-height: 3.6rem; padding: .25rem .1rem; border: none !important; box-shadow: none !important;
-  background: transparent !important; color: inherit !important; border-radius: 12px; opacity: .65;
+  background: transparent !important; color: var(--m-nav-text, inherit) !important;
+  border-radius: 12px; opacity: .72;
 }
-.st-key-m_nav button:hover { opacity: 1; }
+html body .stApp .st-key-m_nav .stButton button * { color: var(--m-nav-text, inherit) !important; }
+html body .stApp .st-key-m_nav .stButton button:hover { opacity: 1; }
 /* ícone em cima, rótulo embaixo */
 .st-key-m_nav button > div > span { flex-direction: column; gap: .05rem; }
 .st-key-m_nav [data-testid="stIconEmoji"] { font-size: 1.35rem; line-height: 1.2; }
 .st-key-m_nav [data-testid="stMarkdownContainer"] p { font-size: .72rem; line-height: 1.1; margin: 0; }
-.st-key-m_nav button[kind="primary"], .st-key-m_nav button[data-testid="stBaseButton-primary"] {
-  background: var(--m-accent-soft) !important; color: var(--m-accent) !important; opacity: 1; font-weight: 700;
+/* aba ativa */
+html body .stApp .st-key-m_nav .stButton button[kind="primary"],
+html body .stApp .st-key-m_nav .stButton button[data-testid="stBaseButton-primary"] {
+  background: var(--m-accent-soft) !important; opacity: 1; font-weight: 700;
+}
+html body .stApp .st-key-m_nav .stButton button[kind="primary"] *,
+html body .stApp .st-key-m_nav .stButton button[data-testid="stBaseButton-primary"] * {
+  color: var(--m-accent-text) !important;
 }
 </style>
 """
