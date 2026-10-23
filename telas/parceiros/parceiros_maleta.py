@@ -1,32 +1,36 @@
-"""Tela de Parceiros: fechamento de comissões e ciclo da maleta (envio de produtos).
+"""Parceiros > Maleta: montagem, conferência de saída, ajustes, recebimento e histórico de envios.
 
-Arquivo independente de vendas.py (sem import circular): os helpers usados aqui
-(_fmt_moeda, _parse_data_segura, _container_com_key) foram replicados abaixo.
-Ponto de entrada: secao_parceiros().
-"""
+Ponto de entrada: secao_maleta(parceiro)."""
+from datetime import date, datetime, timedelta, timezone
+from functools import lru_cache
 import hashlib
 import html
 import re
-import unicodedata
-import uuid
-from datetime import date, datetime, timedelta, timezone
-from functools import lru_cache
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+import uuid
 
-import pandas as pd
 import streamlit as st
 
-from db import supabase, buscar_todos
+from db import buscar_todos, supabase
 
+from telas.parceiros.parceiros_comum import (
+    STATUS_ATIVOS,
+    TAM_FOTO,
+    _flash,
+    _fmt_data,
+    _fmt_moeda,
+    _fmt_qtd,
+    _fmt_qtd_ou_traco,
+    _fragmento,
+    _html_passos,
+    _iguais,
+    _menu,
+    _mostrar_flash,
+    _norm,
+    _panorama_parceiros,
+    _parse_data_segura,
+)
 
-def _fragmento(func):
-    """@st.fragment quando disponível (Streamlit >= 1.37; antes, experimental_fragment).
-
-    Um fragmento reexecuta SÓ a si mesmo quando um widget dentro dele muda, sem
-    refazer o resto da página nem suas consultas ao banco. Em versões sem suporte
-    a função roda normalmente (apenas mais lenta)."""
-    deco = getattr(st, "fragment", None) or getattr(st, "experimental_fragment", None)
-    return deco(func) if deco else func
 
 # ----------------------------------------------------------------------
 # Fotos dos produtos (coluna produtos.foto_url; bucket público do Supabase)
@@ -36,8 +40,9 @@ def _fragmento(func):
 # mantendo o mesmo caminho do arquivo. URLs da Shopify continuam com miniatura reduzida.
 # As imagens são renderizadas como <img> comuns do navegador.
 BUCKET_FOTOS = "fotos_produtos"
+
 LARGURA_MINIATURA = 160   # largura solicitada à CDN da Shopify
-TAM_FOTO = 56             # px de exibição
+
 # Fotos no bucket do Supabase costumam estar em tamanho original (pesadas para uma
 # miniatura de 56 px). Com plano que inclui "Image Transformations" (Pro), troque
 # para True: o navegador passa a baixar uma versão reduzida de cada foto.
@@ -48,102 +53,23 @@ TRANSFORMAR_NO_SUPABASE = False
 # parcerias_envio_arquivos (migracao_fotos_maleta.sql cria os dois).
 # ----------------------------------------------------------------------
 BUCKET_MALETAS = "fotos_maletas"
+
 LADO_MAX_FOTO_MALETA = 1600   # px: a foto é reduzida antes de enviar (celular gera 4000+ px)
+
 QUALIDADE_JPEG_MALETA = 82
+
 TIPOS_FOTO_MALETA = ["jpg", "jpeg", "png", "webp"]
+
 # PDFs de cada movimento da maleta (criação e ajustes): bucket PÚBLICO do Supabase Storage +
 # tabela parcerias_envio_pdfs (migracao_pdfs_maleta.sql cria a tabela, a coluna e as políticas).
 BUCKET_PDFS = "pdf_maletas"
+
 EXIGIR_FOTO_SAIDA = False     # True: só confirma a saída da maleta com pelo menos 1 foto
 
 # PDF da maleta (lista de itens para conferir/entregar): exige o pacote `reportlab`.
 PDF_FOTO_PX = 240             # lado da miniatura embutida (arquivo leve)
+
 PDF_FOTO_MM = 18              # tamanho da foto na página
-
-_CSS_TABELA_FOTOS = (
-    "<style>"
-    ".tab-fotos{width:100%;border-collapse:collapse;font-size:0.9rem}"
-    ".tab-fotos th{text-align:left;padding:6px 8px;border-bottom:1px solid rgba(128,128,128,.45);font-weight:600}"
-    ".tab-fotos td{padding:6px 8px;border-bottom:1px solid rgba(128,128,128,.2);vertical-align:middle}"
-    ".tab-fotos .num{text-align:right;white-space:nowrap}"
-    f".tab-fotos img{{width:{TAM_FOTO}px;height:{TAM_FOTO}px;object-fit:cover;border-radius:6px;display:block}}"
-    f".tab-fotos .sem-foto{{width:{TAM_FOTO}px;height:{TAM_FOTO}px;border-radius:6px;display:flex;"
-    "align-items:center;justify-content:center;font-size:0.7rem;opacity:.6;"
-    "border:1px dashed rgba(128,128,128,.6)}"
-    "</style>"
-)
-
-_CSS_NAVEGACAO = (
-    "<style>"
-    ".nav-chips{display:flex;flex-wrap:wrap;gap:.4rem;margin:.1rem 0 .7rem}"
-    ".nav-chip{display:inline-flex;align-items:center;padding:.2rem .7rem;border-radius:999px;"
-    "font-size:.82rem;border:1px solid rgba(128,128,128,.35);background:rgba(128,128,128,.08)}"
-    ".nav-chip.ok{border-color:rgba(40,167,69,.55);background:rgba(40,167,69,.10)}"
-    ".nav-chip.atencao{border-color:rgba(255,160,0,.65);background:rgba(255,193,7,.14)}"
-    ".nav-passos{display:flex;gap:.3rem;margin:.2rem 0 .9rem;flex-wrap:wrap}"
-    ".nav-passo{flex:1 1 0;min-width:8rem;text-align:center;padding:.35rem .5rem;border-radius:8px;"
-    "font-size:.8rem;border:1px solid rgba(128,128,128,.3);opacity:.55}"
-    ".nav-passo.feito{opacity:.9;border-color:rgba(40,167,69,.55);background:rgba(40,167,69,.10)}"
-    ".nav-passo.atual{opacity:1;font-weight:700;border-color:rgba(0,123,255,.75);background:rgba(0,123,255,.14)}"
-    "</style>"
-)
-
-
-def _injetar_css() -> None:
-    """CSS das tabelas com foto e da navegação, enviado UMA vez por execução (antes cada
-    tabela HTML repetia o bloco <style> inteiro)."""
-    st.markdown(_CSS_TABELA_FOTOS + _CSS_NAVEGACAO, unsafe_allow_html=True)
-
-
-def _html_chips(chips: list) -> str:
-    """chips: lista de (texto, classe) com classe '', 'ok' ou 'atencao'."""
-    itens = "".join(
-        f'<span class="nav-chip {classe}">{html.escape(texto)}</span>' for texto, classe in chips
-    )
-    return f'<div class="nav-chips">{itens}</div>'
-
-
-def _html_passos(passos: list, atual: int) -> str:
-    """Indicador de etapas: as anteriores à atual aparecem concluídas (atual=-1: nenhuma)."""
-    itens = []
-    for i, nome in enumerate(passos):
-        classe = "atual" if i == atual else ("feito" if 0 <= atual and i < atual else "")
-        marca = "✓ " if classe == "feito" else f"{i + 1}. "
-        itens.append(f'<div class="nav-passo {classe}">{marca}{html.escape(nome)}</div>')
-    return f'<div class="nav-passos">{"".join(itens)}</div>'
-
-
-def _menu(rotulo: str, opcoes: list, key: str, formatar=None) -> str:
-    """Menu de navegação: controle segmentado (Streamlit >= 1.40) ou, se não existir,
-    radio horizontal. Sempre devolve uma opção válida (não deixa 'desmarcar')."""
-    formatar = formatar or str
-    ultimo = f"{key}__ultimo"
-    padrao = st.session_state.get(ultimo, opcoes[0])
-    segmentado = getattr(st, "segmented_control", None)
-    if segmentado is None:
-        if st.session_state.get(key) not in opcoes:
-            st.session_state[key] = padrao if padrao in opcoes else opcoes[0]
-        escolhida = st.radio(
-            rotulo, opcoes, horizontal=True, key=key,
-            format_func=formatar, label_visibility="collapsed",
-        )
-    else:
-        if st.session_state.get(key) not in opcoes:
-            st.session_state[key] = padrao if padrao in opcoes else opcoes[0]
-
-        def _nao_desmarcar():
-            if st.session_state.get(key) is None:  # clicar na opção ativa a desmarcaria
-                st.session_state[key] = st.session_state.get(ultimo, opcoes[0])
-
-        escolhida = segmentado(
-            rotulo, opcoes, selection_mode="single", key=key, format_func=formatar,
-            on_change=_nao_desmarcar, label_visibility="collapsed",
-        )
-        if escolhida not in opcoes:
-            escolhida = padrao if padrao in opcoes else opcoes[0]
-    st.session_state[ultimo] = escolhida
-    return escolhida
-
 
 def _url_miniatura_base(url: str) -> str:
     """Resolve fotos para o bucket público fotos_produtos quando possível.
@@ -185,7 +111,6 @@ def _url_miniatura_base(url: str) -> str:
     except Exception:
         return texto
 
-
 @lru_cache(maxsize=4096)
 def _url_miniatura(url: str) -> str:
     """URL final da miniatura. O resultado é memorizado por URL: sem isso cada foto
@@ -205,7 +130,6 @@ def _url_miniatura(url: str) -> str:
         ))
     return final
 
-
 def _mostrar_foto(url) -> None:
     """Foto de uma linha (st.image = <img> do navegador); 'sem foto' se não houver URL."""
     url = str(url).strip() if url else ""
@@ -214,12 +138,10 @@ def _mostrar_foto(url) -> None:
     else:
         st.caption("sem foto")
 
-
 def _legenda_fotos(urls: list) -> None:
     """Ajuda a distinguir 'produto sem foto cadastrada' de 'foto que não carregou'."""
     com_foto = sum(1 for u in urls if u and str(u).strip())
     st.caption(f"📷 {com_foto} de {len(urls)} produtos listados têm foto cadastrada.")
-
 
 def _html_tabela_produtos(linhas: list) -> str:
     """Tabela HTML (somente leitura) com miniatura. `linhas`: dicts com foto, codigo,
@@ -245,202 +167,21 @@ def _html_tabela_produtos(linhas: list) -> str:
     )
     return '<table class="tab-fotos">' + cabecalho + "".join(corpo) + "</table>"
 
-
-
-def _fmt_moeda(valor) -> str:
-    return (
-        f"R$ {float(valor or 0):,.2f}"
-        .replace(",", "X")
-        .replace(".", ",")
-        .replace("X", ".")
-    )
-
-
-def _parse_data_segura(valor):
-    """Converte 'YYYY-MM-DD...' (ou vazio/None/inválido) em date, sem lançar exceção."""
-    texto = str(valor or "")[:10]
-    if not texto:
-        return None
-    try:
-        return datetime.strptime(texto, "%Y-%m-%d").date()
-    except ValueError:
-        return None
-
-
-def _container_com_key(key: str, **opcoes):
-    try:
-        return st.container(key=key, **opcoes)
-    except TypeError:  # Streamlit antigo, sem `key` no container
-        return st.container(**opcoes)
-
-
-def _render_cabecalho_parceiro(parceiro: dict) -> None:
-    canal_nome = (parceiro.get("canais_venda") or {}).get("nome") or "-"
-    telefone = parceiro.get("telefone") or "-"
-    email = parceiro.get("email") or "-"
-    comissao = parceiro.get("percentual_comissao")
-    comissao_fmt = f"{float(comissao):g}%" if comissao is not None else "-"
-    observacao = (parceiro.get("observacao") or "").strip()
-
-    observacao_html = (
-        f'<div style="margin-top:0.5rem; font-size:0.85rem; opacity:0.75;">'
-        f'{html.escape(observacao)}</div>'
-        if observacao else ""
-    )
-
-    st.markdown(
-        f"""
-        <div style="border:1px solid rgba(128,128,128,0.35); border-radius:0.5rem;
-                     padding:1rem 1.2rem; margin-bottom:1rem;">
-            <div style="font-size:1.1rem; font-weight:700; margin-bottom:0.5rem;">
-                {html.escape(parceiro.get('nome') or '')}
-            </div>
-            <div style="display:flex; gap:2rem; flex-wrap:wrap; font-size:0.9rem;">
-                <div><span style="opacity:0.7;">Canal:</span> {html.escape(canal_nome)}</div>
-                <div><span style="opacity:0.7;">Comissão padrão:</span> {comissao_fmt}</div>
-                <div><span style="opacity:0.7;">Telefone:</span> {html.escape(telefone)}</div>
-                <div><span style="opacity:0.7;">E-mail:</span> {html.escape(email)}</div>
-            </div>
-            {observacao_html}
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-@st.cache_data(ttl=60, show_spinner=False)
-def _buscar_vendas_canal(canal_id, data_ini: str, data_fim: str) -> list:
-    return buscar_todos(
-        lambda: supabase.table("vendas")
-        .select(
-            "id, data_venda, cliente, quantidade, valor_final, "
-            "comissao_percentual, comissao_valor, "
-            "produtos(codigo_interno, descricao), status_venda(nome)"
-        )
-        .eq("canal_venda_id", canal_id)
-        .gte("data_venda", data_ini)
-        .lte("data_venda", data_fim)
-        .order("data_venda", desc=True)
-        .order("id", desc=True)
-    )
-
-
-@_fragmento
-def _secao_parceiro_vendas_canal(parceiro: dict) -> None:
-    """Lista as vendas feitas através do canal deste parceiro, em um período
-    selecionável. Puramente de leitura — não depende de nenhuma regra de
-    fechamento."""
-    canal_id = parceiro.get("canal_id")
-    if not canal_id:
-        st.warning("Este parceiro não possui um canal de venda vinculado.")
-        return
-
-    col_ini, col_fim = st.columns(2)
-    with col_ini:
-        data_ini = st.date_input(
-            "De", value=date.today().replace(day=1), key="parceiros_produtos_data_ini"
-        )
-    with col_fim:
-        data_fim = st.date_input("Até", value=date.today(), key="parceiros_produtos_data_fim")
-
-    if data_ini > data_fim:
-        st.error("A data inicial não pode ser depois da data final.")
-        return
-
-    try:
-        vendas = _buscar_vendas_canal(canal_id, data_ini.isoformat(), data_fim.isoformat())
-    except Exception as e:
-        st.error(f"Não foi possível carregar os produtos enviados: {e}")
-        return
-
-    if not vendas:
-        st.info("Nenhuma venda deste canal no período selecionado.")
-        return
-
-    linhas = []
-    total_valor = 0.0
-    total_comissao = 0.0
-    for v in vendas:
-        produto = v.get("produtos") or {}
-        valor_final = float(v.get("valor_final") or 0)
-        comissao_valor = float(v.get("comissao_valor") or 0)
-        total_valor += valor_final
-        total_comissao += comissao_valor
-        linhas.append({
-            "Data": v.get("data_venda"),
-            "Cliente": v.get("cliente") or "-",
-            "Produto": produto.get("descricao") or "-",
-            "Código": produto.get("codigo_interno") or "-",
-            "Qtd": v.get("quantidade"),
-            "Valor": valor_final,
-            "Comissão %": v.get("comissao_percentual"),
-            "Comissão R$": comissao_valor,
-            "Status": (v.get("status_venda") or {}).get("nome") or "-",
-        })
-
-    col_m1, col_m2, col_m3 = st.columns(3)
-    col_m1.metric("Vendas no período", len(linhas))
-    col_m2.metric("Valor total", _fmt_moeda(total_valor))
-    col_m3.metric("Comissão total", _fmt_moeda(total_comissao))
-
-    st.dataframe(linhas, use_container_width=True, hide_index=True)
-
-
-# ---------------------------------------------------------------------------
-# Produtos enviados (envios de produtos ao parceiro)
-# ---------------------------------------------------------------------------
-
-def _fmt_data(valor) -> str:
-    d = _parse_data_segura(valor)
-    return d.strftime("%d/%m/%Y") if d else "-"
-
-
-def _fmt_qtd(valor) -> str:
-    return f"{float(valor or 0):g}"
-
-
-def _fmt_qtd_ou_traco(valor) -> str:
-    """'-' quando não há valor gravado (ex.: envios fechados na versão anterior)."""
-    return "-" if valor is None else _fmt_qtd(valor)
-
-
-def _iguais(a: float, b: float) -> bool:
-    return abs(float(a) - float(b)) < 1e-9
-
-
-# Ciclo de vida de um envio (parcerias_envios.status):
-#   Aberto   -> montagem da maleta: escolher produtos/quantidades e conferir a saída.
-#   Enviado  -> maleta com o parceiro; dá para adicionar/remover produtos (cada mudança
-#               vira uma movimentação) até a maleta voltar.
-#   Fechado  -> maleta recebida e conferida (enviado x vendido x devolvido).
-# Existe no máximo UM envio ativo (Aberto ou Enviado) por parceiro.
-STATUS_ATIVOS = ("Aberto", "Enviado")
 TIPOS_MOVIMENTO = {"adicao": "➕ Adição", "remocao": "➖ Remoção"}
+
 ETAPAS_ENVIADO = ["📦 Maleta", "✏️ Ajustar maleta", "📥 Receber e fechar ciclo"]
+
 OPCOES_AJUSTE = ["1. Remover itens da maleta", "2. Adicionar itens à maleta"]
+
 # Escolha "descrição do site x descrição padrão": um valor único, compartilhado por todos os
 # campos de seleção de produtos (cada tela tem o seu interruptor, todos sincronizados).
 CHAVE_USAR_SITE = "parceiros_usar_descricao_site"
-
-
-def _flash(tipo: str, mensagem: str) -> None:
-    """Mensagem que sobrevive ao st.rerun() (aparece no topo da aba)."""
-    st.session_state["parceiros_flash"] = (tipo, mensagem)
-
-
-def _mostrar_flash() -> None:
-    flash = st.session_state.pop("parceiros_flash", None)
-    if flash:
-        tipo, mensagem = flash
-        getattr(st, tipo, st.info)(mensagem)
-
 
 def _celula_foto(url) -> str:
     url = str(url or "").strip()
     if url:
         return f'<img src="{html.escape(_url_miniatura(url), quote=True)}" loading="lazy" alt="">'
     return '<div class="sem-foto">sem foto</div>'
-
 
 def _html_tabela(cabecalhos: list, linhas: list, colunas_num=()) -> str:
     """Tabela HTML somente leitura. Cada linha é uma lista de células: texto
@@ -462,7 +203,6 @@ def _html_tabela(cabecalhos: list, linhas: list, colunas_num=()) -> str:
         trs.append("<tr>" + "".join(tds) + "</tr>")
     return '<table class="tab-fotos"><tr>' + ths + "</tr>" + "".join(trs) + "</table>"
 
-
 # ---------------------------------------------------------------------------
 # Acesso a dados
 # ---------------------------------------------------------------------------
@@ -483,7 +223,6 @@ def _buscar_envios(parceiro_id) -> list:
         or []
     )
 
-
 @st.cache_data(ttl=60, show_spinner=False)
 def _buscar_itens_dos_envios(ids_envios: tuple) -> dict:
     """Devolve {envio_id: [itens]} em uma única consulta."""
@@ -494,7 +233,7 @@ def _buscar_itens_dos_envios(ids_envios: tuple) -> dict:
         .select(
             "id, envio_id, produto_id, quantidade, valor_unitario, conferido_saida, "
             "qtd_vendida, qtd_devolvida, qtd_divergencia, "
-            f"produtos(codigo_interno, descricao, foto_url"
+            "produtos(codigo_interno, descricao, foto_url"
             ", produto_descricao_site)"
         )
         .in_("envio_id", list(ids_envios))
@@ -504,7 +243,6 @@ def _buscar_itens_dos_envios(ids_envios: tuple) -> dict:
     for item in itens:
         por_envio.setdefault(item["envio_id"], []).append(item)
     return por_envio
-
 
 @st.cache_data(ttl=60, show_spinner=False)
 def _buscar_movimentos(ids_envios: tuple) -> dict:
@@ -526,7 +264,6 @@ def _buscar_movimentos(ids_envios: tuple) -> dict:
         por_envio.setdefault(m["envio_id"], []).append(m)
     return por_envio
 
-
 @st.cache_data(ttl=300, show_spinner=False)
 def _tem_pdfs_maleta() -> bool:
     """True se a tabela parcerias_envio_pdfs e a coluna movimentos.pdf_id existem
@@ -537,7 +274,6 @@ def _tem_pdfs_maleta() -> bool:
         return True
     except Exception:
         return False
-
 
 @st.cache_data(ttl=60, show_spinner=False)
 def _buscar_pdfs_maleta(ids_envios: tuple) -> dict:
@@ -557,7 +293,6 @@ def _buscar_pdfs_maleta(ids_envios: tuple) -> dict:
     for l in linhas:
         por_envio.setdefault(l["envio_id"], []).append(l)
     return por_envio
-
 
 @st.cache_data(ttl=30, show_spinner=False)
 def _vendido_por_produto(canal_id, desde) -> dict:
@@ -579,16 +314,9 @@ def _vendido_por_produto(canal_id, desde) -> dict:
         total[pid] = total.get(pid, 0.0) + float(v.get("quantidade") or 0)
     return total
 
-
 SEM_CATEGORIA = "(sem categoria)"
+
 SEM_BANHO = "(sem banho)"
-
-
-def _norm(texto) -> str:
-    """Minúsculas e sem acentos: 'Coração' e 'coracao' passam a ser a mesma busca."""
-    base = unicodedata.normalize("NFKD", str(texto or ""))
-    return "".join(c for c in base if not unicodedata.combining(c)).casefold().strip()
-
 
 def _toggle_descricao_site(chave_local: str) -> bool:
     """Interruptor 'descrição do site' (produto_descricao_site) x descrição padrão (descricao).
@@ -610,7 +338,6 @@ def _toggle_descricao_site(chave_local: str) -> bool:
     )
     return bool(usar)
 
-
 @st.cache_data(ttl=300, show_spinner=False)
 def _buscar_categorias() -> dict:
     """{categoria_id: {'categoria', 'banho'}} de categorias_produtos (cadastro pequeno).
@@ -627,7 +354,6 @@ def _buscar_categorias() -> dict:
         l["id"]: {"categoria": (l.get("categoria") or "").strip(), "banho": (l.get("banho") or "").strip()}
         for l in linhas
     }
-
 
 @st.cache_data(ttl=30, show_spinner=False)
 def _carregar_produtos_disponiveis() -> dict:
@@ -709,7 +435,6 @@ def _carregar_produtos_disponiveis() -> dict:
         }
     return produtos
 
-
 def _registrar_movimentos(envio_id, movimentos: list, motivo: str = "", pdf_id=None) -> None:
     """movimentos: lista de (produto_id, 'adicao'|'remocao', quantidade). `pdf_id` liga os
     movimentos ao PDF guardado para esse ajuste (parcerias_envio_pdfs)."""
@@ -730,7 +455,6 @@ def _registrar_movimentos(envio_id, movimentos: list, motivo: str = "", pdf_id=N
             linha["pdf_id"] = pdf_id
     supabase.table("parcerias_envio_movimentos").insert(linhas).execute()
 
-
 def _invalidar_cache_envios() -> None:
     """Descarta as leituras em cache que dependem dos envios. Chamada após qualquer
     gravação (e também quando uma gravação falha, que pode ter sido parcial)."""
@@ -742,23 +466,10 @@ def _invalidar_cache_envios() -> None:
     _carregar_produtos_disponiveis.clear()
     _panorama_parceiros.clear()
 
-
-def _atualizar_dados() -> None:
-    """Botão 🔄 do cabeçalho: descarta TODAS as leituras em cache (inclusive o que foi
-    alterado em outras telas: parceiros, vendas, estoque)."""
-    _invalidar_cache_envios()
-    _invalidar_cache_fechamento()
-    _vendido_por_produto.clear()
-    _buscar_vendas_canal.clear()
-    _buscar_parceiros_ativos.clear()
-    _tem_pdfs_maleta.clear()
-
-
 def _atualizar_vendas_fechamento() -> None:
     """Dentro do fechamento: recarrega as vendas do sistema e refaz os campos."""
     _vendido_por_produto.clear()
     _resetar_editores_envio()
-
 
 def _resetar_editores_envio() -> None:
     """Força os campos de edição a recomeçarem do zero (troca a key deles)."""
@@ -766,7 +477,6 @@ def _resetar_editores_envio() -> None:
     st.session_state["parceiros_envio_reset"] = (
         st.session_state.get("parceiros_envio_reset", 0) + 1
     )
-
 
 # ---------------------------------------------------------------------------
 # Novo envio
@@ -858,7 +568,6 @@ def _render_novo_envio(parceiro: dict, envios: list, itens_por_envio: dict) -> N
             _invalidar_cache_envios()
             st.error(f"Não foi possível gerar o envio: {e}")
 
-
 # ---------------------------------------------------------------------------
 # Edição dos itens e adição de produtos (montagem e ajustes durante o ciclo)
 # ---------------------------------------------------------------------------
@@ -909,7 +618,6 @@ def _classificar_alteracoes(itens: list, linhas_editadas: list, disp: dict, mini
             continue
         atualizar.append((item["id"], nova))
     return remover, atualizar, erros
-
 
 def _secao_itens_envio(
     envio: dict, itens: list, disp: dict, modo: str,
@@ -1028,18 +736,15 @@ def _secao_itens_envio(
 
     return pendentes
 
-
 def _busca_desc(produto: dict, usar_site: bool) -> str:
     """Texto (sem acentos) em que o filtro 'Produto' procura: a descrição padrão e, com o
     interruptor ligado, também a descrição do site."""
     base = produto.get("busca_desc") or ""
     return f"{base} {produto.get('busca_site') or ''}" if usar_site else base
 
-
 def _cb_limpar_filtros(chaves: tuple) -> None:
     for chave in chaves:
         st.session_state[chave] = [] if chave.endswith(("_cat", "_banho")) else ""
-
 
 @_fragmento
 def _lista_candidatos(
@@ -1253,7 +958,6 @@ def _lista_candidatos(
                 _invalidar_cache_envios()
                 st.error(f"Não foi possível adicionar os produtos: {e}")
 
-
 # ---------------------------------------------------------------------------
 # Etapa 1: montagem da maleta + conferência de saída
 # ---------------------------------------------------------------------------
@@ -1274,7 +978,6 @@ def _secao_adicionar_produtos(
     if aberto:
         _lista_candidatos(envio, itens, disp, modo, liberado, motivo)
 
-
 @st.cache_data(ttl=60, show_spinner=False)
 def _buscar_arquivos(ids_envios: tuple) -> dict:
     """{envio_id: [arquivos]} (fotos da maleta), mais antigas primeiro."""
@@ -1291,12 +994,10 @@ def _buscar_arquivos(ids_envios: tuple) -> dict:
         por_envio.setdefault(a["envio_id"], []).append(a)
     return por_envio
 
-
 @lru_cache(maxsize=2048)
 def _url_arquivo(caminho: str) -> str:
     """URL pública da foto no bucket (calculada uma vez por arquivo)."""
     return str(supabase.storage.from_(BUCKET_MALETAS).get_public_url(caminho))
-
 
 def _preparar_imagem(conteudo: bytes, nome: str):
     """Corrige a rotação do celular, reduz para LADO_MAX_FOTO_MALETA px e converte para JPEG.
@@ -1324,7 +1025,6 @@ def _preparar_imagem(conteudo: bytes, nome: str):
         return saida.getvalue(), "image/jpeg", ".jpg"
     except Exception as e:
         raise ValueError(f"não é uma imagem válida ({e.__class__.__name__})")
-
 
 def _salvar_fotos_maleta(envio_id, etapa: str, arquivos: list):
     """Envia as fotos ao Storage e registra cada uma em parcerias_envio_arquivos.
@@ -1355,7 +1055,6 @@ def _salvar_fotos_maleta(envio_id, etapa: str, arquivos: list):
                     pass
     return salvas, erros
 
-
 def _remover_foto_maleta(arquivo: dict) -> None:
     try:
         supabase.storage.from_(BUCKET_MALETAS).remove([arquivo["caminho_storage"]])
@@ -1365,7 +1064,6 @@ def _remover_foto_maleta(arquivo: dict) -> None:
     except Exception as e:
         _buscar_arquivos.clear()
         _flash("warning", f"Não foi possível remover a foto: {e}")
-
 
 def _grade_fotos(arquivos: list, editavel: bool = False) -> None:
     """Miniaturas em grade; clicar na imagem abre em tela cheia."""
@@ -1382,7 +1080,6 @@ def _grade_fotos(arquivos: list, editavel: bool = False) -> None:
                 if editavel and st.button("🗑 Remover", key=f"parceiros_foto_rm_{a['id']}"):
                     _remover_foto_maleta(a)
                     st.rerun()
-
 
 def _secao_fotos_maleta(envio_id, etapa: str = "saida") -> int:
     """Área de fotos da conferência: fotos já salvas + envio de novas. Retorna quantas existem."""
@@ -1423,7 +1120,6 @@ def _secao_fotos_maleta(envio_id, etapa: str = "saida") -> int:
         st.rerun()
     return len(existentes)
 
-
 def _mostrar_fotos_maleta(envio_id) -> None:
     """Fotos da maleta somente para consulta (maleta enviada e histórico). Se a tabela de
     fotos ainda não existe no banco, simplesmente não mostra nada."""
@@ -1435,14 +1131,13 @@ def _mostrar_fotos_maleta(envio_id) -> None:
         st.markdown("**📷 Fotos da maleta**")
         _grade_fotos(arquivos, editavel=False)
 
-
 # ---------------------------------------------------------------------------
 # PDF da maleta (conferência de saída e maleta com o parceiro)
 # ---------------------------------------------------------------------------
 
 _CACHE_FOTOS_PDF: dict = {}   # url -> (JPEG, largura, altura). Só guarda sucessos.
-MOTIVO_SEM_CADASTRO = "sem foto cadastrada"
 
+MOTIVO_SEM_CADASTRO = "sem foto cadastrada"
 
 def _foto_para_pdf(url_foto):
     """Baixa a foto do produto e a reduz para o PDF. Devolve (bytes, larg, alt) ou None
@@ -1482,13 +1177,11 @@ def _foto_para_pdf(url_foto):
     _CACHE_FOTOS_PDF[url] = resultado
     return resultado
 
-
 def _texto_pdf(valor, markup: bool = True) -> str:
     """Texto seguro para as fontes padrão do PDF (cobrem o português) e, com markup=True,
     para o XML dos Paragraph (escapa & < >)."""
     texto = str(valor if valor is not None else "").encode("cp1252", "replace").decode("cp1252")
     return html.escape(texto, quote=False) if markup else texto
-
 
 def _gerar_pdf_maleta(titulo: str, subtitulo: str, resumo: str, linhas: list, com_conferencia: bool = False):
     """PDF A4 com Foto | Código | Produto | Qtd (e uma caixinha para marcar, na conferência).
@@ -1615,12 +1308,10 @@ def _gerar_pdf_maleta(titulo: str, subtitulo: str, resumo: str, linhas: list, co
     )
     return buffer.getvalue(), sem_foto
 
-
 def _assinatura_itens(itens: list) -> str:
     """Muda quando o conteúdo da maleta muda: o PDF guardado deixa de valer."""
     base = "|".join(f"{i['id']}:{i['produto_id']}:{i.get('quantidade')}" for i in itens)
     return hashlib.md5(base.encode("utf-8")).hexdigest()
-
 
 def _descricao_pdf(produto: dict, usar_site: bool) -> str:
     """Descrição que vai ao PDF: a do site (se pedida e preenchida) ou a padrão."""
@@ -1630,18 +1321,15 @@ def _descricao_pdf(produto: dict, usar_site: bool) -> str:
             return texto
     return produto.get("descricao") or "-"
 
-
 def _resumir_lista(rotulos: list, limite: int = 8) -> str:
     if len(rotulos) <= limite:
         return ", ".join(rotulos)
     return ", ".join(rotulos[:limite]) + f" e mais {len(rotulos) - limite}"
 
-
 def _rotulo_produto(produto: dict) -> str:
     nome = (produto.get("descricao") or "").strip()
     nome = nome if len(nome) <= 28 else nome[:27] + "…"
     return f"{produto.get('codigo_interno') or '-'} ({nome})" if nome else str(produto.get("codigo_interno") or "-")
-
 
 def _conteudo_pdf_maleta(parceiro_nome: str, envio: dict, itens: list, variante: str) -> None:
     """Conteúdo do popup: avisos, escolha da descrição, geração e download do PDF.
@@ -1755,7 +1443,6 @@ def _conteudo_pdf_maleta(parceiro_nome: str, envio: dict, itens: list, variante:
         on_click=lambda: st.session_state.pop(chave, None),
     )
 
-
 def _criar_decorador_dialogo(titulo: str):
     """st.dialog (Streamlit >= 1.37) ou st.experimental_dialog; None se não houver popup."""
     for nome in ("dialog", "experimental_dialog"):
@@ -1767,10 +1454,9 @@ def _criar_decorador_dialogo(titulo: str):
                 return decorador(titulo)
     return None
 
-
 _decorador_dialogo = _criar_decorador_dialogo("📄 PDF da maleta")
-_dialogo_pdf = _decorador_dialogo(_conteudo_pdf_maleta) if _decorador_dialogo else None
 
+_dialogo_pdf = _decorador_dialogo(_conteudo_pdf_maleta) if _decorador_dialogo else None
 
 def _botao_pdf_maleta(parceiro_nome: str, envio: dict, itens: list, variante: str) -> None:
     """Botão que abre o popup do PDF. Chamar FORA de blocos @st.fragment (o popup não abre
@@ -1797,20 +1483,16 @@ def _botao_pdf_maleta(parceiro_nome: str, envio: dict, itens: list, variante: st
             on_click=lambda: st.session_state.__setitem__(aberto, True),
         )
 
-
 def _iniciar_confirmacao(chave: str) -> None:
     st.session_state[chave] = True
 
-
 def _cancelar_confirmacao(chave: str) -> None:
     st.session_state.pop(chave, None)
-
 
 def _cb_marcar_todos(chave_todos: str, chaves_itens: list) -> None:
     valor = bool(st.session_state.get(chave_todos))
     for chave in chaves_itens:
         st.session_state[chave] = valor
-
 
 @_fragmento
 def _render_conferencia_saida(
@@ -1918,7 +1600,6 @@ def _render_conferencia_saida(
             _invalidar_cache_envios()
             st.error(f"Não foi possível confirmar o envio: {e}")
 
-
 def _render_envio_aberto(parceiro: dict, envio: dict, itens: list) -> None:
     envio_id = envio["id"]
     chave_conf = f"parceiros_envio_conferindo_{envio_id}"
@@ -1971,7 +1652,6 @@ def _render_envio_aberto(parceiro: dict, envio: dict, itens: list) -> None:
         args=(chave_conf,),
     )
 
-
 # ---------------------------------------------------------------------------
 # Etapa 2: maleta com o parceiro (ajustes) e Etapa 3: fechamento do ciclo
 # ---------------------------------------------------------------------------
@@ -1991,7 +1671,6 @@ def _fmt_data_hora(valor, converter_utc: bool = True) -> str:
     if converter_utc and dt.tzinfo is not None:
         dt = dt.astimezone(timezone(timedelta(hours=-3)))
     return dt.strftime("%d/%m/%Y %H:%M")
-
 
 def _guardar_pdfs_evento(parceiro_nome: str, envio: dict, itens: list, evento: str, motivo=None):
     """Gera os dois PDFs da maleta (descrição padrão e descrição do site), guarda no bucket
@@ -2060,7 +1739,6 @@ def _guardar_pdfs_evento(parceiro_nome: str, envio: dict, itens: list, evento: s
             pass
     return None, aviso
 
-
 def _url_pdf_maleta(caminho: str) -> str:
     """URL pública do PDF com ?download=: o navegador baixa o arquivo em vez de só abri-lo."""
     try:
@@ -2069,7 +1747,6 @@ def _url_pdf_maleta(caminho: str) -> str:
         return ""
     nome = caminho.rsplit("/", 1)[-1]
     return f"{url}{'&' if '?' in url else '?'}{urlencode({'download': nome})}"
-
 
 def _eventos_do_ciclo(envio: dict, movimentos: list, pdfs: list) -> list:
     """Linha do tempo da maleta: a criação (saída) e cada ajuste (adições/remoções salvas de
@@ -2127,7 +1804,6 @@ def _eventos_do_ciclo(envio: dict, movimentos: list, pdfs: list) -> list:
         a["titulo"] = f"✏️ Ajuste #{n}"
     return eventos + ajustes
 
-
 def _botao_baixar_pdf(coluna, rotulo: str, caminho) -> None:
     url = _url_pdf_maleta(caminho) if caminho else ""
     if not url:
@@ -2137,7 +1813,6 @@ def _botao_baixar_pdf(coluna, rotulo: str, caminho) -> None:
         botao(rotulo, url, use_container_width=True)
     else:
         coluna.markdown(f"[{rotulo}]({url})")
-
 
 def _render_movimentos_ciclo(envio: dict, movimentos: list, pdfs: list, ocultar_vazio: bool = False) -> None:
     """'Movimentações durante o ciclo': criação da maleta e cada ajuste, com os botões para
@@ -2187,33 +1862,13 @@ def _render_movimentos_ciclo(envio: dict, movimentos: list, pdfs: list, ocultar_
                 )
 
 
-def _tabela_movimentos(movimentos: list) -> str:
-    return _html_tabela(
-        ["Data", "Tipo", "Código", "Produto", "Qtd", "Motivo"],
-        [
-            [
-                _fmt_data(m.get("criado_em")),
-                TIPOS_MOVIMENTO.get(m.get("tipo"), m.get("tipo") or "-"),
-                (m.get("produtos") or {}).get("codigo_interno") or "-",
-                (m.get("produtos") or {}).get("descricao") or "-",
-                _fmt_qtd(m.get("quantidade")),
-                m.get("motivo") or "",
-            ]
-            for m in movimentos
-        ],
-        colunas_num={4},
-    )
-
-
 def _cb_vendido_alterado(k_v: str, k_r: str, k_auto: str, enviado: float) -> None:
     """Enquanto o 'recebido' não foi mexido à mão, ele acompanha enviado - vendido."""
     if st.session_state.get(k_auto, True):
         st.session_state[k_r] = max(enviado - float(st.session_state.get(k_v) or 0), 0.0)
 
-
 def _cb_recebido_alterado(k_auto: str) -> None:
     st.session_state[k_auto] = False
-
 
 @_fragmento
 def _render_fechamento_envio(parceiro: dict, envio: dict, itens: list) -> None:
@@ -2369,7 +2024,6 @@ def _render_fechamento_envio(parceiro: dict, envio: dict, itens: list) -> None:
             _invalidar_cache_envios()
             st.error(f"Não foi possível fechar o ciclo: {e}")
 
-
 def _tabela_maleta_atual(itens: list, vendidos: dict, usar_site: bool) -> str:
     """Tabela somente leitura da maleta que está com o parceiro."""
     linhas = []
@@ -2391,7 +2045,6 @@ def _tabela_maleta_atual(itens: list, vendidos: dict, usar_site: bool) -> str:
         linhas,
         colunas_num={3, 4, 5, 6},
     )
-
 
 def _ui_remover_itens(itens: list, vendidos: dict, base: str, rem: dict) -> None:
     """Opção 1: lista da maleta com 'Remover' e quantidade. Nada é gravado aqui: as escolhas
@@ -2448,7 +2101,6 @@ def _ui_remover_itens(itens: list, vendidos: dict, base: str, rem: dict) -> None
                 rem[it["id"]] = {"remover": bool(marcado), "qtd": float(qtd)}
             else:
                 rem.pop(it["id"], None)
-
 
 def _render_ajuste_maleta(parceiro: dict, envio: dict, itens: list, vendidos: dict) -> None:
     """Etapa 'Ajustar maleta' (maleta com o parceiro).
@@ -2654,10 +2306,8 @@ def _render_ajuste_maleta(parceiro: dict, envio: dict, itens: list, vendidos: di
         _invalidar_cache_envios()
         st.error(f"Não foi possível salvar as alterações: {e}")
 
-
 def _render_envio_enviado(parceiro: dict, envio: dict, itens: list, movimentos: list, pdfs: list = None) -> None:
     envio_id = envio["id"]
-    reset = st.session_state.get("parceiros_envio_reset", 0)
 
     st.markdown(
         f"##### 📦 Envio #{envio['numero_envio']} — maleta com o parceiro desde "
@@ -2705,7 +2355,6 @@ def _render_envio_enviado(parceiro: dict, envio: dict, itens: list, movimentos: 
 
     else:
         _render_fechamento_envio(parceiro, envio, itens)
-
 
 # ---------------------------------------------------------------------------
 # Histórico
@@ -2838,7 +2487,6 @@ def _render_historico_envios(parceiro: dict, envios: list, itens_por_envio: dict
     _render_movimentos_ciclo(envio, movimentos, pdfs, ocultar_vazio=True)
     _mostrar_fotos_maleta(envio["id"])
 
-
 def _secao_parceiro_produtos_enviados(parceiro: dict) -> None:
     """Aba 'Produtos Enviados': ciclo da maleta do parceiro.
 
@@ -2895,565 +2543,6 @@ def _secao_parceiro_produtos_enviados(parceiro: dict) -> None:
             pdfs_por_envio.get(ativo["id"], []),
         )
 
-
-CHUNK_IN = 400  # tamanho dos blocos em consultas .in_() (URLs enormes falham no PostgREST)
-STATUS_RETIRADA = "Retirada - Parceiros"
-
-
-@st.cache_data(ttl=60, show_spinner=False)
-def _buscar_fechamentos(parceiro_id) -> list:
-    return buscar_todos(
-        lambda: supabase.table("parcerias_fechamentos")
-        .select(
-            "id, numero_ciclo, data_inicio, data_fim, percentual_comissao, "
-            "valor_total_vendas, valor_total_comissao, status"
-        )
-        .eq("parceiro_id", parceiro_id)
-        .order("numero_ciclo", desc=True)
-    )
-
-
-@st.cache_data(ttl=30, show_spinner=False)
-def _vendas_candidatas(canal_id, data_ini: str, data_fim: str) -> list:
-    """Vendas do canal no período que ainda não entraram em nenhum fechamento.
-    Só consulta os vínculos das vendas do período (antes lia os de TODOS os ciclos,
-    com o limite padrão de 1000 linhas, o que truncaria o resultado)."""
-    vendas = buscar_todos(
-        lambda: supabase.table("vendas")
-        .select(
-            "id, data_venda, cliente, valor_final, "
-            "comissao_percentual, comissao_valor, "
-            "produtos(descricao), status_venda(nome)"
-        )
-        .eq("canal_venda_id", canal_id)
-        .gte("data_venda", data_ini)
-        .lte("data_venda", data_fim)
-        .order("data_venda")
-        .order("id")
-    )
-    ids = [v["id"] for v in vendas]
-    incluidos = set()
-    for i in range(0, len(ids), CHUNK_IN):
-        bloco_ids = ids[i:i + CHUNK_IN]
-        incluidos.update(
-            r["venda_id"]
-            for r in buscar_todos(
-                lambda: supabase.table("parcerias_fechamento_vendas")
-                .select("venda_id")
-                .in_("venda_id", bloco_ids)
-                .order("id")
-            )
-        )
-    return [v for v in vendas if v["id"] not in incluidos]
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def _retiradas_por_fechamento(ids_fechamentos: tuple, canal_id) -> dict:
-    """{fechamento_id: valor das retiradas de peças}. Três consultas no total, em vez de
-    uma por bloco de ids: vínculos, id do status e só as vendas de retirada do canal."""
-    if not ids_fechamentos:
-        return {}
-    vinculos = buscar_todos(
-        lambda: supabase.table("parcerias_fechamento_vendas")
-        .select("fechamento_id, venda_id")
-        .in_("fechamento_id", list(ids_fechamentos))
-        .order("id")
-    )
-    retirada_por_venda = {}
-    status = (
-        supabase.table("status_venda").select("id").eq("nome", STATUS_RETIRADA).execute().data or []
-    )
-    if status and canal_id:
-        retiradas = buscar_todos(
-            lambda: supabase.table("vendas")
-            .select("id, valor_final")
-            .eq("canal_venda_id", canal_id)
-            .eq("status_id", status[0]["id"])
-            .order("id")
-        )
-        retirada_por_venda = {v["id"]: float(v.get("valor_final") or 0) for v in retiradas}
-    total = {fid: 0.0 for fid in ids_fechamentos}
-    for v in vinculos:
-        total[v["fechamento_id"]] = total.get(v["fechamento_id"], 0.0) + retirada_por_venda.get(v["venda_id"], 0.0)
-    return total
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def _detalhes_ciclo(fechamento_id) -> tuple:
-    """(vínculos, vendas) de um ciclo já fechado: não muda, então guarda por mais tempo."""
-    vinculos = buscar_todos(
-        lambda: supabase.table("parcerias_fechamento_vendas")
-        .select("venda_id, valor_venda, percentual_comissao, valor_comissao")
-        .eq("fechamento_id", fechamento_id)
-        .order("id")
-    )
-    ids_vendas = [v["venda_id"] for v in vinculos]
-    vendas = []
-    for i in range(0, len(ids_vendas), CHUNK_IN):
-        bloco_ids = ids_vendas[i:i + CHUNK_IN]
-        vendas.extend(
-            buscar_todos(
-                lambda: supabase.table("vendas")
-                .select(
-                    "id, data_venda, cliente, valor_final, quantidade, "
-                    "produtos(descricao, codigo_interno), status_venda(nome)"
-                )
-                .in_("id", bloco_ids)
-                .order("id")
-            )
-        )
-    vendas.sort(key=lambda v: (str(v.get("data_venda") or ""), v["id"]))
-    return vinculos, vendas
-
-
-def _invalidar_cache_fechamento() -> None:
-    _buscar_fechamentos.clear()
-    _vendas_candidatas.clear()
-    _retiradas_por_fechamento.clear()
-    _detalhes_ciclo.clear()
-    _panorama_parceiros.clear()
-
-
-@_fragmento
-def _secao_parceiro_fechamento(parceiro: dict) -> None:
-    """Fluxo de fechamento do parceiro:
-
-    - Sem ciclo aberto: botão para iniciar um novo ciclo. `data_inicio` é
-      automática (dia seguinte ao `data_fim` do último ciclo fechado); no
-      primeiro ciclo do parceiro, pede a data manualmente.
-    - Com ciclo aberto: o usuário escolhe a data final, vê as vendas do
-      canal do parceiro nesse período que ainda não entraram em nenhum
-      fechamento, pode desmarcar alguma (ela fica disponível para o próximo
-      ciclo) e fecha o ciclo. A comissão de cada venda vem do que já está
-      gravado nela (`comissao_percentual`/`comissao_valor`), não é
-      recalculada aqui.
-    """
-    _mostrar_flash()
-    parceiro_id = parceiro["id"]
-    canal_id = parceiro.get("canal_id")
-
-    try:
-        fechamentos = _buscar_fechamentos(parceiro_id)
-    except Exception as e:
-        st.error(f"Não foi possível carregar os fechamentos: {e}")
-        return
-
-    ciclo_aberto = next((f for f in fechamentos if f.get("status") == "Aberto"), None)
-    ultimo_fechamento = fechamentos[0] if fechamentos else None
-
-    if not canal_id:
-        st.warning("Este parceiro não possui um canal de venda vinculado.")
-        return
-
-    if not ciclo_aberto:
-        proximo_numero = (ultimo_fechamento["numero_ciclo"] + 1) if ultimo_fechamento else 1
-
-        if ultimo_fechamento and ultimo_fechamento.get("data_fim"):
-            data_inicio_sugerida = (
-                _parse_data_segura(ultimo_fechamento["data_fim"]) + timedelta(days=1)
-            )
-            st.info(
-                f"Próximo ciclo: **#{proximo_numero}**, a partir de "
-                f"**{data_inicio_sugerida.strftime('%d/%m/%Y')}** "
-                "(dia seguinte ao fim do último ciclo)."
-            )
-        else:
-            data_inicio_sugerida = st.date_input(
-                "Data de início do 1º ciclo",
-                value=date.today().replace(day=1),
-                key="parceiros_fechamento_data_inicio_manual",
-            )
-
-        if st.button("▶️ Iniciar novo ciclo", key="parceiros_iniciar_ciclo"):
-            try:
-                # A lista de parceiros fica em cache por até 30 s; o percentual que será
-                # gravado no ciclo é sempre lido na hora.
-                atual = (
-                    supabase.table("parceiros").select("percentual_comissao")
-                    .eq("id", parceiro_id).execute().data or [{}]
-                )[0]
-                supabase.table("parcerias_fechamentos").insert({
-                    "parceiro_id": parceiro_id,
-                    "numero_ciclo": proximo_numero,
-                    "data_inicio": data_inicio_sugerida.isoformat(),
-                    "percentual_comissao": atual.get("percentual_comissao") or 0,
-                    "status": "Aberto",
-                }).execute()
-                _invalidar_cache_fechamento()
-                _flash("success", f"Ciclo #{proximo_numero} iniciado.")
-                st.rerun()
-            except Exception as e:
-                _invalidar_cache_fechamento()
-                st.error(f"Não foi possível iniciar o ciclo: {e}")
-
-    else:
-        data_inicio_ciclo = _parse_data_segura(ciclo_aberto["data_inicio"])
-
-        # Permite ajustar o início do ciclo enquanto ele estiver aberto.
-        # Evita sobreposição com o ciclo finalizado anterior.
-        anteriores = [
-            f for f in fechamentos
-            if f.get("id") != ciclo_aberto.get("id")
-            and f.get("status") == "Finalizado"
-            and f.get("data_fim")
-        ]
-        ultimo_anterior = max(
-            anteriores,
-            key=lambda f: f.get("numero_ciclo", 0),
-            default=None,
-        )
-        data_min_inicio = None
-        if ultimo_anterior:
-            fim_anterior = _parse_data_segura(ultimo_anterior.get("data_fim"))
-            if fim_anterior:
-                data_min_inicio = fim_anterior + timedelta(days=1)
-
-        if data_inicio_ciclo is None:
-            data_inicio_ciclo = data_min_inicio or date.today()
-        if data_min_inicio and data_inicio_ciclo < data_min_inicio:
-            data_inicio_ciclo = data_min_inicio
-
-        col_inicio, col_fim = st.columns(2)
-        with col_inicio:
-            novo_inicio_ciclo = st.date_input(
-                "Início do ciclo",
-                value=data_inicio_ciclo,
-                min_value=data_min_inicio,
-                key=f"parceiros_fechamento_data_inicio_{ciclo_aberto['id']}",
-                help="A data inicial pode ser ajustada enquanto o ciclo estiver aberto.",
-            )
-
-        with col_fim:
-            data_fim_ciclo = st.date_input(
-                "Fechar com vendas até",
-                value=max(date.today(), novo_inicio_ciclo),
-                min_value=novo_inicio_ciclo,
-                key=f"parceiros_fechamento_data_fim_{ciclo_aberto['id']}",
-            )
-
-        if novo_inicio_ciclo != data_inicio_ciclo:
-            try:
-                supabase.table("parcerias_fechamentos").update({
-                    "data_inicio": novo_inicio_ciclo.isoformat(),
-                }).eq("id", ciclo_aberto["id"]).execute()
-                _invalidar_cache_fechamento()
-                _flash(
-                    "success",
-                    f"Início do ciclo #{ciclo_aberto['numero_ciclo']} alterado para "
-                    f"{novo_inicio_ciclo.strftime('%d/%m/%Y')}.",
-                )
-                st.rerun()
-            except Exception as e:
-                _invalidar_cache_fechamento()
-                st.error(f"Não foi possível alterar o início do ciclo: {e}")
-                return
-
-        if data_inicio_ciclo and data_fim_ciclo < data_inicio_ciclo:
-            st.error("A data final não pode ser antes do início do ciclo.")
-            return
-
-        try:
-            candidatas = _vendas_candidatas(
-                canal_id, data_inicio_ciclo.isoformat(), data_fim_ciclo.isoformat()
-            )
-        except Exception as e:
-            st.error(f"Não foi possível carregar as vendas do período: {e}")
-            return
-
-        if not candidatas:
-            st.info("Nenhuma venda pendente neste período para incluir no fechamento.")
-
-        # A tabela-resumo fica visualmente acima da tabela de vendas.
-        # Usamos um placeholder para preencher o resumo depois de calcular as
-        # vendas selecionadas, mantendo a ordem visual desejada.
-        resumo_container = st.container()
-
-        linhas_editor = [
-            {
-                "Incluir": True,
-                "id": v["id"],
-                "Data": v.get("data_venda"),
-                "Cliente": v.get("cliente") or "-",
-                "Produto": (v.get("produtos") or {}).get("descricao") or "-",
-                "Valor": float(v.get("valor_final") or 0),
-                "Comissão R$": float(v.get("comissao_valor") or 0),
-            }
-            for v in candidatas
-        ]
-
-        if candidatas:
-            editado = st.data_editor(
-                linhas_editor,
-                key=f"parceiros_fechamento_editor_{ciclo_aberto['id']}",
-                use_container_width=True,
-                hide_index=True,
-                disabled=["id", "Data", "Cliente", "Produto", "Valor", "Comissão R$"],
-                column_order=["Incluir", "Data", "Cliente", "Produto", "Valor", "Comissão R$"],
-                column_config={
-                    "Incluir": st.column_config.CheckboxColumn("Incluir", width="small"),
-                    "Data": st.column_config.TextColumn("Data", width="small"),
-                    "Cliente": st.column_config.TextColumn("Cliente"),
-                    "Produto": st.column_config.TextColumn("Produto"),
-                    "Valor": st.column_config.NumberColumn("Valor", format="R$ %.2f", disabled=True),
-                    "Comissão R$": st.column_config.NumberColumn("Comissão R$", format="R$ %.2f", disabled=True),
-                },
-            )
-        else:
-            editado = []
-
-        selecionadas = [linha for linha in editado if linha["Incluir"]]
-        valor_total = sum(float(l.get("Valor") or 0) for l in selecionadas)
-
-        venda_por_id = {v["id"]: v for v in candidatas}
-        comissao_total = sum(
-            float(linha.get("Comissão R$") or 0)
-            for linha in selecionadas
-            if (venda_por_id.get(linha["id"], {}).get("status_venda") or {}).get("nome") != "Retirada - Parceiros"
-        )
-
-        retiradas_parceiros = [
-            venda_por_id[linha["id"]]
-            for linha in selecionadas
-            if (venda_por_id.get(linha["id"], {}).get("status_venda") or {}).get("nome") == "Retirada - Parceiros"
-        ]
-        retirada_automatica = sum(float(v.get("valor_final") or 0) for v in retiradas_parceiros)
-
-        # A seção de ajustes foi removida. A linha permanece no resumo para
-        # deixar explícita a composição do fechamento, atualmente sem ajustes.
-        ajustes_total = 0.0
-        observacoes_ajustes = []
-        valor_final_fechamento = comissao_total - retirada_automatica
-
-        obs_auto_key = f"retirada_auto_obs_{ciclo_aberto['id']}"
-        if obs_auto_key not in st.session_state:
-            st.session_state[obs_auto_key] = "Retirada - Parceiros"
-
-        # Preenche o resumo antes da tabela de produtos/vendas.
-        with resumo_container:
-            st.markdown(
-                f"##### Resumo do fechamento - de {data_inicio_ciclo.strftime('%d/%m/%Y')} até {data_fim_ciclo.strftime('%d/%m/%Y')}"
-            )
-            resumo_df = pd.DataFrame([
-                {"Descrição": "Vendas no período", "Valor": _fmt_moeda(valor_total), "Observação": ""},
-                {"Descrição": "Comissão Total (+)", "Valor": _fmt_moeda(comissao_total), "Observação": ""},
-                {"Descrição": "Retirada Peças (-)", "Valor": _fmt_moeda(-retirada_automatica), "Observação": st.session_state.get(obs_auto_key, "")},
-                {"Descrição": "Ajustes", "Valor": _fmt_moeda(ajustes_total), "Observação": ""},
-                {"Descrição": "Valor Final", "Valor": _fmt_moeda(valor_final_fechamento), "Observação": ""},
-            ])
-            styled_resumo = resumo_df.style.apply(
-                lambda row: [
-                    "font-weight: 700; background-color: rgba(0, 123, 255, 0.16);"
-                    if row["Descrição"] == "Valor Final" else ""
-                    for _ in row
-                ],
-                axis=1,
-            )
-            st.dataframe(styled_resumo, use_container_width=True, hide_index=True)
-
-        if candidatas:
-            st.caption(
-                "Desmarque alguma venda para deixá-la de fora deste ciclo — ela "
-                "continua disponível para um fechamento futuro."
-            )
-
-        # Informações/KPIs do ciclo aberto ficam abaixo da tabela de vendas.
-        st.info(
-            f"Ciclo **#{ciclo_aberto['numero_ciclo']}** aberto desde "
-            f"**{data_inicio_ciclo.strftime('%d/%m/%Y')}**."
-        )
-
-        # Os componentes visuais de retirada de peças e os KPIs
-        # foram removidos. Os valores continuam sendo calculados acima
-        # porque são utilizados no fechamento do ciclo.
-
-        if st.button(
-            f"✅ Fechar ciclo #{ciclo_aberto['numero_ciclo']}",
-            type="primary",
-            disabled=not selecionadas,
-            key="parceiros_fechar_ciclo",
-        ):
-            try:
-                venda_por_id = {v["id"]: v for v in candidatas}
-                registros = []
-                for linha in selecionadas:
-                    venda = venda_por_id[linha["id"]]
-                    eh_retirada_parceiro = (
-                        (venda.get("status_venda") or {}).get("nome")
-                        == "Retirada - Parceiros"
-                    )
-                    registros.append({
-                        "fechamento_id": ciclo_aberto["id"],
-                        "venda_id": venda["id"],
-                        "valor_venda": float(venda.get("valor_final") or 0),
-                        "percentual_comissao": 0
-                        if eh_retirada_parceiro
-                        else float(venda.get("comissao_percentual") or 0),
-                        "valor_comissao": 0
-                        if eh_retirada_parceiro
-                        else float(venda.get("comissao_valor") or 0),
-                    })
-                if registros:
-                    supabase.table("parcerias_fechamento_vendas").insert(registros).execute()
-
-                supabase.table("parcerias_fechamentos").update({
-                    "data_fim": data_fim_ciclo.isoformat(),
-                    "valor_total_vendas": valor_total,
-                    "valor_total_comissao": comissao_total,
-                    "status": "Finalizado",
-                    "fechado_em": datetime.now().isoformat(),
-                }).eq("id", ciclo_aberto["id"]).execute()
-
-                _invalidar_cache_fechamento()
-                _flash(
-                    "success",
-                    f"Ciclo #{ciclo_aberto['numero_ciclo']} fechado com "
-                    f"{len(registros)} venda(s).",
-                )
-                st.rerun()
-            except Exception as e:
-                _invalidar_cache_fechamento()
-                st.error(f"Não foi possível fechar o ciclo: {e}")
-
-
-@_fragmento
-def _secao_historico_comissoes(parceiro: dict) -> None:
-    """Histórico dos ciclos de comissão do parceiro. Clicar em um ciclo mostra o detalhe,
-    somente para consulta (as vendas do ciclo, a comissão e a retirada de peças)."""
-    parceiro_id = parceiro["id"]
-    canal_id = parceiro.get("canal_id")
-    try:
-        fechamentos = _buscar_fechamentos(parceiro_id)
-    except Exception as e:
-        st.error(f"Não foi possível carregar os ciclos de comissão: {e}")
-        return
-
-    st.markdown("##### Histórico de ciclos")
-    if not fechamentos:
-        st.caption("Nenhum ciclo de fechamento registrado ainda para este parceiro.")
-        return
-
-    # Valor final de cada ciclo histórico = comissão - retiradas de peças (mesma regra do
-    # fechamento). As retiradas vêm de 3 consultas guardadas em cache.
-    valor_final_por_fechamento = {}
-    try:
-        ids_fechamentos = tuple(f["id"] for f in fechamentos if f.get("id") is not None)
-        retiradas = _retiradas_por_fechamento(ids_fechamentos, canal_id)
-        for fechamento in fechamentos:
-            fechamento_id = fechamento.get("id")
-            valor_final_por_fechamento[fechamento_id] = (
-                float(fechamento.get("valor_total_comissao") or 0) - retiradas.get(fechamento_id, 0.0)
-            )
-    except Exception:
-        # Sem os vínculos, mostra a comissão como alternativa para não esconder o histórico.
-        for fechamento in fechamentos:
-            valor_final_por_fechamento[fechamento.get("id")] = float(
-                fechamento.get("valor_total_comissao") or 0
-            )
-
-    linhas_fechamento = [
-        {
-            "Ciclo": f["numero_ciclo"],
-            "Início": f.get("data_inicio"),
-            "Fim": f.get("data_fim") or "-",
-            "Status": f.get("status"),
-            "Comissão %": f.get("percentual_comissao"),
-            "Valor vendas": _fmt_moeda(f.get("valor_total_vendas")),
-            "Valor comissão": _fmt_moeda(f.get("valor_total_comissao")),
-            "Valor final": _fmt_moeda(valor_final_por_fechamento.get(f.get("id"), 0)),
-        }
-        for f in fechamentos
-    ]
-
-    selecao_historico = st.dataframe(
-        linhas_fechamento,
-        use_container_width=True,
-        hide_index=True,
-        on_select="rerun",
-        selection_mode="single-row",
-        key=f"historico_ciclos_{parceiro_id}",
-    )
-
-    # Ao clicar em um ciclo finalizado, abre a mesma visão do fechamento,
-    # porém somente para consulta: sem campos editáveis e sem botão de fechar.
-    linhas_selecionadas = selecao_historico.selection.rows
-    if linhas_selecionadas:
-        ciclo_visualizado = fechamentos[linhas_selecionadas[0]]
-
-        try:
-            vinculos, vendas_fechamento = _detalhes_ciclo(ciclo_visualizado["id"])
-        except Exception as e:
-            st.error(f"Não foi possível carregar os detalhes do ciclo: {e}")
-            return
-
-        vinculo_por_venda = {v["venda_id"]: v for v in vinculos}
-        retirada_visualizacao = sum(
-            float(v.get("valor_final") or 0)
-            for v in vendas_fechamento
-            if (v.get("status_venda") or {}).get("nome") == "Retirada - Parceiros"
-        )
-        comissao_visualizacao = sum(
-            float(vinculo_por_venda.get(v["id"], {}).get("valor_comissao") or 0)
-            for v in vendas_fechamento
-            if (v.get("status_venda") or {}).get("nome") != "Retirada - Parceiros"
-        )
-        valor_vendas_visualizacao = sum(
-            float(v.get("valor_final") or 0) for v in vendas_fechamento
-        )
-        ajustes_visualizacao = 0.0
-        valor_final_visualizacao = comissao_visualizacao - retirada_visualizacao
-
-        st.divider()
-        inicio_visualizacao = _parse_data_segura(ciclo_visualizado.get("data_inicio"))
-        fim_visualizacao = _parse_data_segura(ciclo_visualizado.get("data_fim"))
-        inicio_txt = inicio_visualizacao.strftime("%d/%m/%Y") if inicio_visualizacao else str(ciclo_visualizado.get("data_inicio") or "-")
-        fim_txt = fim_visualizacao.strftime("%d/%m/%Y") if fim_visualizacao else str(ciclo_visualizado.get("data_fim") or "-")
-
-        st.markdown(
-            f"##### Visualização do ciclo #{ciclo_visualizado['numero_ciclo']} - "
-            f"de {inicio_txt} até {fim_txt}"
-        )
-
-        resumo_visualizacao = pd.DataFrame([
-            {"Descrição": "Vendas no período", "Valor": _fmt_moeda(valor_vendas_visualizacao), "Observação": ""},
-            {"Descrição": "Comissão Total (+)", "Valor": _fmt_moeda(comissao_visualizacao), "Observação": ""},
-            {"Descrição": "Retirada Peças (-)", "Valor": _fmt_moeda(-retirada_visualizacao), "Observação": "Retirada - Parceiros" if retirada_visualizacao else ""},
-            {"Descrição": "Ajustes", "Valor": _fmt_moeda(ajustes_visualizacao), "Observação": ""},
-            {"Descrição": "Valor Final", "Valor": _fmt_moeda(valor_final_visualizacao), "Observação": ""},
-        ])
-        styled_visualizacao = resumo_visualizacao.style.apply(
-            lambda row: [
-                "font-weight: 700; background-color: rgba(0, 123, 255, 0.16);"
-                if row["Descrição"] == "Valor Final" else ""
-                for _ in row
-            ],
-            axis=1,
-        )
-        st.dataframe(styled_visualizacao, use_container_width=True, hide_index=True)
-
-        linhas_vendas_visualizacao = [
-            {
-                "Data": v.get("data_venda"),
-                "Cliente": v.get("cliente") or "-",
-                "Produto": (v.get("produtos") or {}).get("descricao") or "-",
-                "Código": (v.get("produtos") or {}).get("codigo_interno") or "-",
-                "Qtd": v.get("quantidade"),
-                "Valor": float(v.get("valor_final") or 0),
-                "Comissão R$": float(vinculo_por_venda.get(v["id"], {}).get("valor_comissao") or 0),
-                "Status": (v.get("status_venda") or {}).get("nome") or "-",
-            }
-            for v in vendas_fechamento
-        ]
-
-        if linhas_vendas_visualizacao:
-            st.dataframe(
-                linhas_vendas_visualizacao,
-                use_container_width=True,
-                hide_index=True,
-            )
-        else:
-            st.info("Este ciclo não possui vendas vinculadas.")
-
-
 def _secao_historico_envios(parceiro: dict) -> None:
     """Histórico das maletas (envios) do parceiro, com o detalhe de cada uma ao clicar."""
     try:
@@ -3467,255 +2556,15 @@ def _secao_historico_envios(parceiro: dict) -> None:
         return
     _render_historico_envios(parceiro, envios, itens_por_envio, {})
 
-
-HISTORICOS = ["comissoes", "envios"]
-ROTULOS_HISTORICO = {"comissoes": "💰 Ciclos de comissão", "envios": "📦 Envios (maletas)"}
-
-
-def _secao_historicos(parceiro: dict) -> None:
-    """Aba 'Históricos': ciclos de comissão e envios já realizados. Só o histórico escolhido
-    é consultado e desenhado."""
-    _mostrar_flash()
-    escolhido = _menu("Histórico", HISTORICOS, key="parceiros_hist_sub", formatar=ROTULOS_HISTORICO.get)
-    if escolhido == "comissoes":
-        _secao_historico_comissoes(parceiro)
-    else:
-        _secao_historico_envios(parceiro)
+MALETA_SUBSECOES = ["atual", "historico"]
+MALETA_ROTULOS = {"atual": "📦 Maleta atual", "historico": "🗂️ Histórico de envios"}
 
 
-def _limpar_estado_parceiro() -> None:
-    """Remove do session_state tudo que pertence ao parceiro atualmente selecionado."""
-    prefixos = ("parceiros_", "historico_ciclos_", "retirada_auto_obs_")
-    for chave in list(st.session_state.keys()):
-        if isinstance(chave, str) and chave.startswith(prefixos):
-            del st.session_state[chave]
-
-
-def _selecionar_parceiro(nome) -> None:
-    _limpar_estado_parceiro()
-    if nome:
-        st.session_state["parceiros_selecionado"] = nome
-
-
-def _desmarcar_parceiro() -> None:
-    _selecionar_parceiro(None)
-
-
-def _cb_escolher_parceiro(chave: str) -> None:
-    """on_change dos seletores de parceiro. Roda ANTES do rerun: a tela já abre no parceiro
-    novo, sem o 'rerun extra' que existia (selectbox -> st.rerun)."""
-    _selecionar_parceiro(st.session_state.get(chave))
-
-
-def _cb_escolher_do_painel() -> None:
-    estado = st.session_state.get("parceiros_painel")
-    nomes = st.session_state.get("parceiros_painel_nomes") or []
-    try:
-        linhas = estado["selection"]["rows"]
-    except Exception:
-        linhas = []
-    if linhas and linhas[0] < len(nomes):
-        _selecionar_parceiro(nomes[linhas[0]])
-
-
-# ---------------------------------------------------------------------------
-# Leituras da navegação (em cache)
-# ---------------------------------------------------------------------------
-
-@st.cache_data(ttl=30, show_spinner=False)
-def _buscar_parceiros_ativos() -> list:
-    return (
-        supabase.table("parceiros")
-        .select(
-            "id, nome, canal_id, telefone, email, percentual_comissao, "
-            "observacao, ativo, canais_venda(nome)"
-        )
-        .eq("ativo", True)
-        .order("nome")
-        .execute()
-        .data
-        or []
-    )
-
-
-@st.cache_data(ttl=60, show_spinner=False)
-def _panorama_parceiros() -> dict:
-    """{parceiro_id: {'ciclo': ciclo de comissão aberto, 'envio': maleta ativa}}.
-    Duas consultas para TODOS os parceiros; alimenta o painel inicial, os chips do
-    cabeçalho e os rótulos do menu sem consultar nada por parceiro."""
-    try:
-        ciclos = (
-            supabase.table("parcerias_fechamentos")
-            .select("parceiro_id, numero_ciclo, data_inicio")
-            .eq("status", "Aberto")
-            .execute().data or []
-        )
-        envios = (
-            supabase.table("parcerias_envios")
-            .select("parceiro_id, numero_envio, status, data_envio")
-            .in_("status", list(STATUS_ATIVOS))
-            .execute().data or []
-        )
-    except Exception:
-        return {}
-    panorama: dict = {}
-    for c in ciclos:
-        panorama.setdefault(c["parceiro_id"], {})["ciclo"] = c
-    for e in envios:
-        panorama.setdefault(e["parceiro_id"], {})["envio"] = e
-    return panorama
-
-
-def _dias_desde(valor) -> int:
-    d = _parse_data_segura(valor)
-    return max((date.today() - d).days, 0) if d else 0
-
-
-def _txt_ciclo(info: dict) -> str:
-    c = info.get("ciclo")
-    return f"#{c['numero_ciclo']} aberto desde {_fmt_data(c.get('data_inicio'))}" if c else "sem ciclo aberto"
-
-
-def _txt_maleta(info: dict) -> str:
-    e = info.get("envio")
-    if not e:
-        return "sem maleta ativa"
-    if e.get("status") == "Enviado":
-        dias = _dias_desde(e.get("data_envio"))
-        return f"#{e['numero_envio']} com o parceiro há {dias} dia(s)"
-    return f"#{e['numero_envio']} em montagem"
-
-
-# ---------------------------------------------------------------------------
-# Telas
-# ---------------------------------------------------------------------------
-
-def _render_escolha_parceiro(parceiros: list, panorama: dict) -> None:
-    st.markdown("### 🤝 Parceiros")
-    nomes = [p["nome"] for p in parceiros]
-    st.session_state["parceiros_painel_nomes"] = nomes
-
-    st.selectbox(
-        "Buscar parceiro",
-        options=nomes,
-        index=None,
-        placeholder="Digite ou escolha um parceiro...",
-        key="parceiros_selecao_dropdown",
-        on_change=_cb_escolher_parceiro,
-        args=("parceiros_selecao_dropdown",),
-    )
-
-    linhas = []
-    for p in parceiros:
-        info = panorama.get(p["id"], {})
-        comissao = p.get("percentual_comissao")
-        linhas.append({
-            "Parceiro": p["nome"],
-            "Comissão": f"{float(comissao):g}%" if comissao is not None else "-",
-            "Ciclo de comissão": _txt_ciclo(info),
-            "Maleta": _txt_maleta(info),
-        })
-
-    argumentos = dict(
-        use_container_width=True, hide_index=True,
-        selection_mode="single-row", key="parceiros_painel",
-    )
-    try:
-        st.dataframe(linhas, on_select=_cb_escolher_do_painel, **argumentos)
-    except Exception:  # Streamlit sem callback em on_select: usa o rerun (uma execução a mais)
-        selecao = st.dataframe(linhas, on_select="rerun", **argumentos)
-        if selecao.selection.rows:
-            _selecionar_parceiro(nomes[selecao.selection.rows[0]])
-            st.rerun()
-    st.caption("Clique em uma linha para abrir o parceiro.")
-
-
-def _render_cabecalho_nav(parceiro: dict, nomes: list, info: dict) -> None:
-    """Seletor para trocar de parceiro sem voltar à lista + situação atual em chips."""
-    col_sel, col_todos, col_atualizar = st.columns([6, 1.6, 0.9], vertical_alignment="center")
-    with col_sel:
-        st.selectbox(
-            "Parceiro",
-            options=nomes,
-            index=nomes.index(parceiro["nome"]),
-            key="parceiros_trocar",
-            on_change=_cb_escolher_parceiro,
-            args=("parceiros_trocar",),
-            label_visibility="collapsed",
-        )
-    with col_todos:
-        st.button(
-            "← Todos", key="parceiros_desmarcar", on_click=_desmarcar_parceiro,
-            help="Voltar ao painel com todos os parceiros",
-        )
-    with col_atualizar:
-        st.button(
-            "🔄", key="parceiros_atualizar_tudo", on_click=_atualizar_dados,
-            help="Recarregar os dados. Eles ficam guardados por até 1 minuto para a tela ser "
-                 "rápida; use após vendas, estoque ou cadastros alterados em outras telas.",
-        )
-
-    comissao = parceiro.get("percentual_comissao")
-    envio = info.get("envio") or {}
-    st.markdown(
-        _html_chips([
-            (f"💰 Comissão {float(comissao):g}%" if comissao is not None else "💰 Comissão -", ""),
-            (f"📑 Ciclo {_txt_ciclo(info)}", "ok" if info.get("ciclo") else ""),
-            (f"📦 Maleta {_txt_maleta(info)}", "ok" if envio.get("status") == "Enviado" else ""),
-        ]),
-        unsafe_allow_html=True,
-    )
-
-
-def secao_parceiros():
-    try:
-        parceiros = _buscar_parceiros_ativos()
-    except Exception as e:
-        st.markdown("### 🤝 Parceiros")
-        st.error(f"Não foi possível carregar os parceiros: {e}")
-        return
-
-    if not parceiros:
-        st.markdown("### 🤝 Parceiros")
-        st.info(
-            "Nenhum parceiro cadastrado ainda. Cadastre um parceiro na aba "
-            "**Cadastros Auxiliares** para começar."
-        )
-        return
-
-    panorama = _panorama_parceiros()
-    nomes = [p["nome"] for p in parceiros]
-    nome_selecionado = st.session_state.get("parceiros_selecionado")
-    parceiro = next((p for p in parceiros if p["nome"] == nome_selecionado), None)
-
-    # Nada selecionado (ou o parceiro salvo não existe mais): painel com todos.
-    if parceiro is None:
-        if nome_selecionado:
-            _limpar_estado_parceiro()
-        _render_escolha_parceiro(parceiros, panorama)
-        return
-
-    _injetar_css()
-    info = panorama.get(parceiro["id"], {})
-    _render_cabecalho_nav(parceiro, nomes, info)
-
-    # st.tabs executa o conteúdo de TODAS as abas a cada interação (e suas consultas).
-    # Com este menu só a seção escolhida é executada.
-    secoes = ["fechamento", "envios", "historicos"]
-    rotulos = {
-        "fechamento": "📑 Fechamento" + (
-            f" · ciclo #{info['ciclo']['numero_ciclo']}" if info.get("ciclo") else ""
-        ),
-        "envios": "📦 Produtos enviados" + (
-            f" · maleta #{info['envio']['numero_envio']}" if info.get("envio") else ""
-        ),
-        "historicos": "🗂️ Históricos",
-    }
-    secao = _menu("Seção", secoes, key="parceiros_aba", formatar=rotulos.get)
-
-    if secao == "fechamento":
-        _secao_parceiro_fechamento(parceiro)
-    elif secao == "envios":
+def secao_maleta(parceiro: dict) -> None:
+    """Grupo 'Maleta' do parceiro: ciclo físico da maleta e histórico de envios."""
+    sub = _menu("Maleta", MALETA_SUBSECOES, key="parceiros_maleta_sub", formatar=MALETA_ROTULOS.get)
+    if sub == "atual":
         _secao_parceiro_produtos_enviados(parceiro)
     else:
-        _secao_historicos(parceiro)
+        _mostrar_flash()
+        _secao_historico_envios(parceiro)

@@ -22,6 +22,7 @@ Projeto: **Projeto AC**
 | 015    | adicionar_retirada_pessoal            | ✅ Aplicada     | ✅ Aplicada  |
 | 016    | migracao_fotos_maleta                 | ✅ Aplicada     | ✅ Aplicada  |
 | 017    | migracao_pdfs_maleta                  | ✅ Aplicada     | ✅ Aplicada  |
+| 018    | migracao_conciliacao_parcerias        | ✅ Aplicada     | ✅ Aplicada  |
 ------------------------------------------------------------------------------------
 
 

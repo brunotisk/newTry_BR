@@ -26,7 +26,7 @@ from servicos.vendas_import import (
     _normalizar_nome,
 )
 from telas.cadastros_gerais import tela_cadastros_gerais
-from telas.parceiro import secao_parceiros
+from telas.parceiros import secao_parceiros
 from componentes.campo_cliente import campo_cliente
 from componentes.campo_mascarado import campo_mascarado
 from componentes.contador_quantidade import contador_quantidade
