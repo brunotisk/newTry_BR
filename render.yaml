@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: sistemabyac-pwa
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn pwa_api:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    envVars:
+      - key: BD
+        sync: false
+      - key: SUPABASE_URL_HOMOLOG
+        sync: false
+      - key: SUPABASE_SERVICE_KEY_HOMOLOG
+        sync: false
+      - key: SUPABASE_URL_PRD
+        sync: false
+      - key: SUPABASE_SERVICE_KEY_PRD
+        sync: false
+      - key: PWA_COOKIE_SECURE
+        value: "true"

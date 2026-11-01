@@ -744,6 +744,8 @@ def inserir_venda_e_baixar_estoque(
         "data_venda": linha["data_venda"],
         "cliente": linha.get("cliente") or "",
     }
+    if linha.get("cliente_id") is not None:
+        dados_venda["cliente_id"] = linha["cliente_id"]
 
     # Compatibilidade com vendas antigas/importações que não possuem esses
     # dados. A tela manual passa os dois campos quando aplicável.

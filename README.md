@@ -1,10 +1,7 @@
 streamlit run app.py
 streamlit run app_mobile.py
+python.exe -m uvicorn pwa_api:app --host 127.0.0.1 --port 8000
 
-O app mobile mantém o login após atualizar a página usando um cookie de sessão
-criptografado. Em produção, configure `AUTH_COOKIE_PASSWORD` como um segredo
-forte e estável (por exemplo, nos Secrets do Streamlit); sem essa configuração,
-o sistema usa a chave Supabase do ambiente atual para criptografar o cookie.
 
 https://appacsj.streamlit.app/
 https://acsjsistema.streamlit.app/
