@@ -67,10 +67,55 @@ h2 { font-size: 1.05rem; margin: 0 0 15px; }
 .hidden { display: none !important; }
 .empty { padding: 14px 0 4px; color: var(--muted); font-size: .9rem; }
 .install-hint { color: var(--muted); font-size: .78rem; margin-top: 16px; text-align: center; }
+.app-shell { padding-bottom: calc(100px + env(safe-area-inset-bottom)); }
+.bottom-nav { position: fixed; z-index: 20; left: 0; right: 0; bottom: 0; display: flex; justify-content: center; gap: 4px; padding: 7px 10px calc(7px + env(safe-area-inset-bottom)); background: var(--surface); border-top: 1px solid var(--line); box-shadow: 0 -5px 18px #17211c0d; }
+.nav-button { display: grid; justify-items: center; align-content: center; gap: 3px; width: min(25%, 170px); min-height: 54px; border: 0; border-radius: 12px; color: var(--muted); background: transparent; }
+.nav-button span { font-size: 1.2rem; line-height: 1.1; }
+.nav-button small { font-size: .68rem; }
+.nav-button.active { color: var(--accent-dark); background: #b08d571c; font-weight: 800; }
+.filter-grid { display: grid; grid-template-columns: 1fr 1fr; align-items: end; gap: 4px 10px; }
+.filter-grid .field { margin: 7px 0; }
+.filter-grid button { width: 100%; margin: 4px 0; }
+.result-count { margin: 8px 0 12px; font-size: .82rem; }
+.client-card, .history-card { margin: 10px 0; padding: 14px; border: 1px solid var(--line); border-radius: 14px; background: var(--surface); }
+.client-heading { display: flex; justify-content: space-between; gap: 8px; }
+.client-heading strong { display: block; }
+.client-heading small { display: block; margin-top: 5px; color: var(--muted); }
+.card-actions { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 12px; }
+.card-actions .button { flex: 1 1 auto; }
+.purchase-detail { margin-top: 13px; padding-top: 12px; border-top: 1px solid var(--line); }
+.purchase-summary { display: grid; grid-template-columns: 1fr auto; gap: 4px 10px; margin-bottom: 10px; }
+.purchase-summary small { grid-column: 1 / -1; color: var(--muted); }
+.purchase-row { display: grid; grid-template-columns: 1fr auto; gap: 3px 10px; padding: 10px 0; border-top: 1px solid var(--line); font-size: .86rem; }
+.purchase-row small { grid-column: 1 / -1; color: var(--muted); }
+.form-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 16px; }
+.form-actions .primary { width: 100%; }
+.summary-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 15px 0; }
+.summary-tile { display: grid; gap: 5px; padding: 13px; background: #f8f7f3; border: 1px solid var(--line); border-radius: 13px; }
+.summary-tile small, .settings-row small { color: var(--muted); font-size: .77rem; }
+.summary-tile strong { font-size: 1rem; }
+.commission-note { font-size: .85rem; }
+.date-heading { margin: 19px 0 8px; font-size: .93rem; }
+.history-heading { display: flex; justify-content: space-between; gap: 8px; }
+.history-card p { margin: 9px 0 5px; }
+.history-card > small { color: var(--muted); line-height: 1.5; }
+.pagination { display: flex; justify-content: center; margin: 16px 0 5px; }
+.settings-row { display: grid; gap: 5px; padding: 12px 0; border-top: 1px solid var(--line); }
+.settings-row strong { overflow-wrap: anywhere; }
+.settings-row + .button { width: 100%; margin-top: 12px; }
+:root[data-theme="dark"] { color-scheme: dark; --ink: #edf0e9; --muted: #aab2a9; --paper: #111712; --surface: #1b241e; --line: #354037; --accent: #c5a06a; --accent-dark: #e0bd83; --danger: #ffb3aa; --success: #8bd1a7; }
+:root[data-theme="dark"] .field label { color: #d2d8d0; }
+:root[data-theme="dark"] .field input, :root[data-theme="dark"] .field select { background: #151d17; color: var(--ink); border-color: var(--line); }
+:root[data-theme="dark"] .product-preview, :root[data-theme="dark"] .summary-tile { background: #202a23; }
+:root[data-theme="dark"] .button.secondary { background: #303b33; color: var(--ink); }
+:root[data-theme="dark"] .button.ghost { color: var(--muted); }
+:root[data-theme="dark"] .button.remove { background: #432a29; }
+:root[data-theme="dark"] .client-card, :root[data-theme="dark"] .history-card { background: #1b241e; }
 @media (max-width: 390px) {
   .app-shell { padding-inline: 12px; }
   .panel { padding: 15px; }
   .product-preview { grid-template-columns: 102px 1fr; }
   .product-photo { width: 102px; height: 102px; }
   .user-email { max-width: 100px; }
+  .filter-grid { grid-template-columns: 1fr; }
 }

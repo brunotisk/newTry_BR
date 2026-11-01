@@ -7,9 +7,10 @@ from __future__ import annotations
 
 import os
 import logging
-from datetime import date
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
@@ -357,6 +358,299 @@ async def create_sale(request: Request) -> Response:
         return _erro_com_sessao("Não foi possível registrar a venda agora.", 500, session)
 
 
+def _escape_like(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+async def list_clients(request: Request) -> Response:
+    user, _auth_client, session = _session_from_request(request)
+    if user is None:
+        response = _json_erro("Sessão expirada. Entre novamente.", 401)
+        _clear_session_cookies(response)
+        return response
+    try:
+        sb = get_client()
+        params = request.query_params
+        search = str(params.get("search") or "").strip()
+        channel = params.get("channel_id")
+        try:
+            offset = max(0, int(params.get("offset", "0")))
+            limit = min(50, max(1, int(params.get("limit", "20"))))
+        except ValueError:
+            raise ValueError("Paginação inválida.")
+        query = sb.table("clientes").select(
+            "id, nome, telefone, canal_id, detalhe_feira_id, data_nascimento, data_casamento",
+            count="exact",
+        )
+        if search:
+            query = query.ilike("nome", f"%{_escape_like(search)}%")
+        if channel:
+            query = query.eq("canal_id", int(channel))
+        result = query.order("nome").order("id").range(offset, offset + limit - 1).execute()
+        data = {"items": result.data or [], "total": result.count or 0, "offset": offset, "limit": limit}
+        response = JSONResponse(data)
+        _set_session_cookies(response, session)
+        return response
+    except ValueError as exc:
+        return _erro_com_sessao(str(exc), 400, session)
+    except Exception:
+        LOGGER.exception("Falha ao consultar clientes no PWA")
+        return _erro_com_sessao("Não foi possível consultar os clientes agora.", 500, session)
+
+
+def _format_phone(value) -> str | None:
+    digits = "".join(char for char in str(value or "") if char.isdigit())[:11]
+    if not digits:
+        return None
+    if len(digits) <= 2:
+        return f"({digits}"
+    if len(digits) <= 7:
+        return f"({digits[:2]}) {digits[2:]}"
+    return f"({digits[:2]}) {digits[2:7]}-{digits[7:]}"
+
+
+def _client_payload(sb, body: dict, existing: dict | None = None) -> dict:
+    name = str(body.get("nome") or "").strip()
+    if not name:
+        raise ValueError("Informe o nome do cliente.")
+    channel_id = _active_id(sb, "canais_venda", body.get("canal_id"), "canal")
+    channel_rows = sb.table("canais_venda").select("nome").eq("id", channel_id).limit(1).execute().data or []
+    channel_name = channel_rows[0].get("nome", "") if channel_rows else ""
+    fair_id = None
+    if channel_name.strip().casefold() == "feira":
+        fair_id = _active_id(sb, "detalhes_feira", body.get("detalhe_feira_id"), "feira")
+    payload = {
+        "nome": name,
+        "telefone": _format_phone(body.get("telefone")),
+        "canal_id": channel_id,
+        "detalhe_feira_id": fair_id,
+        "data_nascimento": body.get("data_nascimento") or None,
+        "data_casamento": body.get("data_casamento") or None,
+    }
+    today = date.today()
+    for field, label in (("data_nascimento", "Data de nascimento"), ("data_casamento", "Data de casamento")):
+        if payload[field]:
+            try:
+                date_value = date.fromisoformat(payload[field])
+            except (TypeError, ValueError):
+                raise ValueError(f"{label} inválida.")
+            if date_value > today:
+                raise ValueError(f"{label} não pode ser futura.")
+    # Regra da base: o nome não pode se repetir no mesmo canal.
+    duplicate_query = sb.table("clientes").select("id, nome").eq("canal_id", channel_id).ilike("nome", _escape_like(name))
+    for duplicate in duplicate_query.execute().data or []:
+        if duplicate.get("nome", "").strip().casefold() == name.casefold() and duplicate.get("id") != (existing or {}).get("id"):
+            raise ValueError(f'Já existe um cliente chamado "{name}" neste canal.')
+    return payload
+
+
+async def save_client(request: Request) -> Response:
+    user, _auth_client, session = _session_from_request(request)
+    if user is None:
+        response = _json_erro("Sessão expirada. Entre novamente.", 401)
+        _clear_session_cookies(response)
+        return response
+    try:
+        body = await request.json()
+        sb = get_client()
+        payload = _client_payload(sb, body)
+        rows = sb.table("clientes").insert(payload).execute().data or []
+        if not rows:
+            raise RuntimeError("Cadastro não retornou o cliente criado.")
+        response = JSONResponse(rows[0], status_code=201)
+        _set_session_cookies(response, session)
+        return response
+    except ValueError as exc:
+        return _erro_com_sessao(str(exc), 400, session)
+    except Exception:
+        LOGGER.exception("Falha ao cadastrar cliente pelo PWA")
+        return _erro_com_sessao("Não foi possível cadastrar o cliente agora.", 500, session)
+
+
+async def update_client(request: Request) -> Response:
+    user, _auth_client, session = _session_from_request(request)
+    if user is None:
+        response = _json_erro("Sessão expirada. Entre novamente.", 401)
+        _clear_session_cookies(response)
+        return response
+    try:
+        client_id = int(request.path_params["client_id"])
+        body = await request.json()
+        sb = get_client()
+        old_rows = sb.table("clientes").select("id, nome, canal_id").eq("id", client_id).limit(1).execute().data or []
+        if not old_rows:
+            return _erro_com_sessao("Cliente não encontrado.", 404, session)
+        payload = _client_payload(sb, body, old_rows[0])
+        rows = sb.table("clientes").update(payload).eq("id", client_id).execute().data or []
+        response = JSONResponse(rows[0] if rows else {"id": client_id, **payload})
+        _set_session_cookies(response, session)
+        return response
+    except ValueError as exc:
+        return _erro_com_sessao(str(exc), 400, session)
+    except Exception:
+        LOGGER.exception("Falha ao atualizar cliente pelo PWA")
+        return _erro_com_sessao("Não foi possível atualizar o cliente agora.", 500, session)
+
+
+def _relation(value):
+    if isinstance(value, list):
+        return value[0] if value else {}
+    return value or {}
+
+
+async def client_purchases(request: Request) -> Response:
+    user, _auth_client, session = _session_from_request(request)
+    if user is None:
+        response = _json_erro("Sessão expirada. Entre novamente.", 401)
+        _clear_session_cookies(response)
+        return response
+    try:
+        client_id = int(request.path_params["client_id"])
+        sb = get_client()
+        client_rows = sb.table("clientes").select("id, nome").eq("id", client_id).limit(1).execute().data or []
+        if not client_rows:
+            return _erro_com_sessao("Cliente não encontrado.", 404, session)
+        columns = "id, data_venda, cliente, quantidade, valor_final, produtos(codigo_interno, descricao), formas_pagamento(descricao)"
+        by_id = _rows(lambda: sb.table("vendas").select(columns).eq("cliente_id", client_id).order("id"))
+        purchases = {row["id"]: row for row in by_id}
+        name = str(client_rows[0].get("nome") or "").strip()
+        if name:
+            like = _escape_like(name)
+            legacy = _rows(lambda: sb.table("vendas").select(
+                columns.replace("id, ", "id, cliente, ", 1)
+            ).is_("cliente_id", "null").ilike("cliente", f"%{like}%").order("id"))
+            for row in legacy:
+                if str(row.get("cliente") or "").strip().casefold() == name.casefold():
+                    purchases.setdefault(row["id"], row)
+        ordered = sorted(purchases.values(), key=lambda row: (str(row.get("data_venda") or ""), row["id"]), reverse=True)
+        total_value = sum(float(row.get("valor_final") or 0) for row in ordered)
+        latest = ordered[0].get("data_venda") if ordered else None
+        response = JSONResponse({
+            "count": len(ordered),
+            "total": total_value,
+            "latest": latest,
+            "items": [{
+                **row,
+                "produto": _relation(row.get("produtos")),
+                "pagamento": _relation(row.get("formas_pagamento")),
+            } for row in ordered[:30]],
+        })
+        _set_session_cookies(response, session)
+        return response
+    except Exception:
+        LOGGER.exception("Falha ao consultar compras do cliente no PWA")
+        return _erro_com_sessao("Não foi possível consultar as compras agora.", 500, session)
+
+
+def _history_dates(params) -> tuple[str | None, str | None]:
+    period = params.get("period", "month")
+    today = datetime.now(ZoneInfo("America/Sao_Paulo")).date()
+    if period == "today":
+        start = end = today
+    elif period == "7days":
+        start, end = today - timedelta(days=6), today
+    elif period == "month":
+        start, end = today.replace(day=1), today
+    elif period == "year":
+        start, end = today.replace(month=1, day=1), today
+    elif period == "all":
+        return None, None
+    elif period == "custom":
+        try:
+            start = date.fromisoformat(params.get("start", "")) if params.get("start") else None
+            end = date.fromisoformat(params.get("end", "")) if params.get("end") else None
+        except ValueError:
+            raise ValueError("Período de datas inválido.")
+        if start and end and start > end:
+            raise ValueError("A data inicial deve ser anterior à data final.")
+    else:
+        raise ValueError("Período inválido.")
+    return start.isoformat() if start else None, end.isoformat() if end else None
+
+
+def _filter_history(query, start, end, channel_id, client_search):
+    if start:
+        query = query.gte("data_venda", start)
+    if end:
+        query = query.lte("data_venda", end)
+    if channel_id:
+        query = query.eq("canal_venda_id", channel_id)
+    if client_search:
+        query = query.ilike("cliente", f"%{_escape_like(client_search)}%")
+    return query
+
+
+async def history(request: Request) -> Response:
+    user, _auth_client, session = _session_from_request(request)
+    if user is None:
+        response = _json_erro("Sessão expirada. Entre novamente.", 401)
+        _clear_session_cookies(response)
+        return response
+    try:
+        params = request.query_params
+        start, end = _history_dates(params)
+        channel_id = int(params["channel_id"]) if params.get("channel_id") else None
+        client_search = str(params.get("client") or "").strip()
+        offset = max(0, int(params.get("offset", "0")))
+        limit = min(50, max(1, int(params.get("limit", "20"))))
+        sb = get_client()
+        columns = (
+            "id, data_venda, cliente, quantidade, valor_lista, valor_desconto, valor_final, comissao_valor, "
+            "produtos(codigo_interno, descricao), canais_venda(nome), status_venda(nome), formas_pagamento(descricao)"
+        )
+        query = _filter_history(
+            sb.table("vendas").select(columns, count="exact"), start, end, channel_id, client_search
+        )
+        rows = query.order("data_venda", desc=True).order("id", desc=True).range(offset, offset + limit - 1).execute()
+        totals = _rows(lambda: _filter_history(
+            sb.table("vendas").select("valor_final, comissao_valor"), start, end, channel_id, client_search
+        ).order("id"))
+        data = {
+            "items": [{
+                **row,
+                "produto": _relation(row.get("produtos")),
+                "canal": _relation(row.get("canais_venda")),
+                "status": _relation(row.get("status_venda")),
+                "pagamento": _relation(row.get("formas_pagamento")),
+            } for row in (rows.data or [])],
+            "count": rows.count or 0,
+            "offset": offset,
+            "limit": limit,
+            "summary": {
+                "items": len(totals),
+                "value": sum(float(row.get("valor_final") or 0) for row in totals),
+                "commission": sum(float(row.get("comissao_valor") or 0) for row in totals),
+            },
+        }
+        response = JSONResponse(data)
+        _set_session_cookies(response, session)
+        return response
+    except ValueError as exc:
+        return _erro_com_sessao(str(exc), 400, session)
+    except Exception:
+        LOGGER.exception("Falha ao consultar histórico no PWA")
+        return _erro_com_sessao("Não foi possível carregar o histórico agora.", 500, session)
+
+
+async def app_config(request: Request) -> Response:
+    user, _auth_client, session = _session_from_request(request)
+    if user is None:
+        response = _json_erro("Sessão expirada. Entre novamente.", 401)
+        _clear_session_cookies(response)
+        return response
+    bd = os.getenv("BD", "").strip().upper()
+    url_var = "SUPABASE_URL_HOMOLOG" if bd == "HML" else "SUPABASE_URL_PRD"
+    from urllib.parse import urlparse
+
+    host = urlparse(os.getenv(url_var, "")).hostname or "-"
+    labels = {"HML": "Homologação", "PRD": "Produção"}
+    manual = os.getenv("APP_ENV", "").strip()
+    environment = manual.capitalize() if manual else labels.get(bd, "Não identificado")
+    response = JSONResponse({"environment": environment, "database_host": host})
+    _set_session_cookies(response, session)
+    return response
+
+
 class SecurityHeaders(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
         response = await call_next(request)
@@ -378,6 +672,12 @@ routes = [
     Route("/api/me", current_user, methods=["GET"]),
     Route("/api/catalog", catalog, methods=["GET"]),
     Route("/api/sales", create_sale, methods=["POST"]),
+    Route("/api/clients", list_clients, methods=["GET"]),
+    Route("/api/clients", save_client, methods=["POST"]),
+    Route("/api/clients/{client_id:int}", update_client, methods=["PUT"]),
+    Route("/api/clients/{client_id:int}/purchases", client_purchases, methods=["GET"]),
+    Route("/api/history", history, methods=["GET"]),
+    Route("/api/config", app_config, methods=["GET"]),
     Mount("/", app=StaticFiles(directory=PWA_DIR, html=True), name="pwa"),
 ]
 app = Starlette(debug=False, routes=routes, middleware=[Middleware(SecurityHeaders)])

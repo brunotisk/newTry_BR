@@ -1,6 +1,6 @@
 # PWA de vendas
 
-Interface instalável para login e lançamento de vendas online. A aplicação Streamlit existente continua disponível; este PWA é servido pela API Starlette no mesmo domínio para que a sessão use cookies `HttpOnly` e `Secure`.
+Interface instalável para login, vendas, clientes, histórico e configurações. A aplicação Streamlit existente continua disponível; este PWA é servido pela API Starlette no mesmo domínio para que a sessão use cookies `HttpOnly` e `Secure`.
 
 ## Executar localmente
 
@@ -18,3 +18,10 @@ O blueprint `render.yaml` cria um serviço web que serve a API e o PWA na mesma 
 ## Operação online
 
 O service worker armazena apenas os arquivos estáticos da interface. Cadastros, autenticação e salvamento de vendas exigem conexão; o PWA informa quando está offline e bloqueia o envio. Vendas não são enfileiradas localmente.
+
+## Telas disponíveis
+
+- **Venda:** carrinho, produto/foto, cliente, canal, pagamento, status e baixa de estoque.
+- **Clientes:** busca, filtro por canal, cadastro/edição, WhatsApp e resumo das compras vinculadas (inclui vendas antigas associadas pelo nome exato).
+- **Histórico:** filtro por período, canal e cliente, totais, comissão e paginação.
+- **Configurações:** tema automático/claro/escuro, conta, sair e ambiente Supabase.

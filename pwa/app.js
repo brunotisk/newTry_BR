@@ -2,9 +2,21 @@ const root = document.querySelector('#app');
 const state = {
   user: null,
   catalog: null,
+  screen: 'sales',
   cart: [],
   online: navigator.onLine,
   installing: null,
+  clientsOffset: 0,
+  clientsSearch: '',
+  clientsChannel: '',
+  clientsTotal: 0,
+  clients: [],
+  clientEdit: null,
+  expandedClient: null,
+  historyParams: { period: 'month', channel_id: '', client: '', start: '', end: '', offset: 0 },
+  historyItems: [],
+  historyCount: 0,
+  historySummary: null,
 };
 
 const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => ({
@@ -14,6 +26,11 @@ const currency = (value) => new Intl.NumberFormat('pt-BR', { style: 'currency', 
 const localISODate = () => {
   const now = new Date();
   return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+};
+const formatDate = (value, compact = false) => {
+  if (!value) return '—';
+  const date = new Date(`${String(value).slice(0, 10)}T12:00:00`);
+  return new Intl.DateTimeFormat('pt-BR', compact ? { day: '2-digit', month: '2-digit', year: '2-digit' } : { day: '2-digit', month: '2-digit', year: 'numeric' }).format(date);
 };
 
 async function api(path, options = {}) {
@@ -165,6 +182,7 @@ function renderSales(message = '') {
           <button id="save-sale" class="button primary" type="submit" ${state.online ? '' : 'disabled'}>Salvar venda</button>
         </section>
       </form>
+      ${renderNav('sales')}
     </div>`;
 
   if (pendingStatus) document.querySelector('#status').value = String(pendingStatus.id);
@@ -192,6 +210,7 @@ function renderSales(message = '') {
     document.querySelector('#new-client-name').required = isNew;
   });
   document.querySelector('#sale-form').addEventListener('submit', submitSale);
+  attachNav();
   renderCart();
   updateOnlineUI();
 }
@@ -315,6 +334,351 @@ function updateOnlineUI() {
   const save = document.querySelector('#save-sale');
   if (banner) banner.classList.toggle('hidden', state.online);
   if (save) save.disabled = !state.online;
+  document.querySelectorAll('[data-online-only]').forEach((button) => { button.disabled = !state.online; });
+}
+
+const NAV_ITEMS = [
+  ['sales', '💰', 'Venda'], ['clients', '👤', 'Clientes'], ['history', '🧾', 'Histórico'], ['settings', '⚙️', 'Config'],
+];
+
+function renderNav(active) {
+  return `<nav class="bottom-nav" aria-label="Navegação principal">${NAV_ITEMS.map(([id, icon, label]) =>
+    `<button type="button" data-route="${id}" class="nav-button ${active === id ? 'active' : ''}" aria-current="${active === id ? 'page' : 'false'}"><span aria-hidden="true">${icon}</span><small>${label}</small></button>`
+  ).join('')}</nav>`;
+}
+
+function attachNav() {
+  document.querySelectorAll('[data-route]').forEach((button) => button.addEventListener('click', () => {
+    const route = button.dataset.route;
+    state.screen = route;
+    if (route === 'sales') renderSales();
+    else if (route === 'clients') openClients(true);
+    else if (route === 'history') openHistory(true);
+    else openSettings();
+  }));
+}
+
+function shellMarkup(title, active, body) {
+  return `<div class="app-shell">
+    <header class="topbar"><div><p class="eyebrow">Sistema de Semijoias</p><h1>${title}</h1></div>
+      <div class="user-actions"><span class="user-email" title="${esc(state.user?.email)}">${esc(state.user?.email)}</span><button id="logout" class="button ghost" type="button">Sair</button></div>
+    </header>
+    <div id="page-message" class="banner hidden"></div>
+    <div id="online-message" class="banner warning ${state.online ? 'hidden' : ''}">Você está sem conexão. As consultas podem estar desatualizadas; vendas e cadastros exigem conexão.</div>
+    ${body}
+    ${renderNav(active)}
+  </div>`;
+}
+
+function bindShell() {
+  document.querySelector('#logout')?.addEventListener('click', logoutFromPwa);
+  attachNav();
+  updateOnlineUI();
+}
+
+async function logoutFromPwa() {
+  try { await api('/api/auth/logout', { method: 'POST', body: '{}' }); } catch (_) {}
+  state.user = null;
+  state.catalog = null;
+  state.cart = [];
+  state.clients = [];
+  state.historyItems = [];
+  renderLogin();
+}
+
+function clientQueryUrl(offset = 0) {
+  const params = new URLSearchParams({ offset: String(offset), limit: '20' });
+  if (state.clientsSearch) params.set('search', state.clientsSearch);
+  if (state.clientsChannel) params.set('channel_id', state.clientsChannel);
+  return `/api/clients?${params}`;
+}
+
+async function openClients(reset = false, message = '') {
+  if (reset) state.clientsOffset = 0;
+  if (state.clientEdit) return renderClientForm();
+  try {
+    const requestedOffset = state.clientsOffset;
+    const result = await api(clientQueryUrl(requestedOffset));
+    state.clients = requestedOffset ? [...state.clients, ...(result.items || [])] : result.items || [];
+    state.clientsTotal = result.total || 0;
+    renderClients(message);
+  } catch (error) {
+    if (!state.user) return;
+    renderClients();
+    showBanner(error.message);
+  }
+}
+
+function renderClients(message = '') {
+  if (state.clientEdit) return renderClientForm();
+  const channels = state.catalog?.canais || [];
+  const clientsMarkup = state.clients.length ? state.clients.map((client) => {
+    const channel = channels.find((item) => String(item.id) === String(client.canal_id))?.nome || 'Canal não informado';
+    const phoneDigits = String(client.telefone || '').replace(/\D/g, '');
+    const whatsapp = phoneDigits.length >= 10 ? `<a class="button ghost" href="https://wa.me/55${esc(phoneDigits)}" target="_blank" rel="noopener noreferrer">WhatsApp</a>` : '';
+    const purchases = state.expandedClient === Number(client.id) ? renderClientPurchases() : '';
+    return `<article class="client-card">
+      <div class="client-heading"><div><strong>${esc(client.nome)}</strong><small>${esc(channel)}${client.telefone ? ` · ${esc(client.telefone)}` : ''}</small></div></div>
+      <div class="card-actions">${whatsapp}<button class="button ghost" type="button" data-edit-client="${esc(client.id)}">Editar</button><button class="button ghost" type="button" data-purchases="${esc(client.id)}">${state.expandedClient === Number(client.id) ? 'Ocultar compras' : 'Ver compras'}</button></div>
+      ${purchases}
+    </article>`;
+  }).join('') : '<p class="empty">Nenhum cliente encontrado.</p>';
+  const channelOptions = '<option value="">Todos os canais</option>' + channels.map((item) => `<option value="${esc(item.id)}" ${String(item.id) === state.clientsChannel ? 'selected' : ''}>${esc(item.nome)}</option>`).join('');
+  root.innerHTML = shellMarkup('Clientes', 'clients', `
+    <section class="panel">
+      <form id="clients-filter" class="filter-grid">
+        <div class="field"><label for="clients-search">Buscar cliente</label><input id="clients-search" value="${esc(state.clientsSearch)}" placeholder="Nome do cliente" /></div>
+        <div class="field"><label for="clients-channel">Canal</label><select id="clients-channel">${channelOptions}</select></div>
+        <button class="button secondary" type="submit">Buscar</button>
+        <button id="new-client" class="button primary" type="button">＋ Novo cliente</button>
+      </form>
+      <p class="muted result-count">${state.clientsTotal} cliente(s)</p>
+      <div class="client-list">${clientsMarkup}</div>
+      <div id="client-pagination" class="pagination ${state.clients.length < state.clientsTotal ? '' : 'hidden'}">
+        <button id="more-clients" class="button secondary" type="button">Mostrar mais</button>
+      </div>
+    </section>`);
+  bindShell();
+  if (message) showBanner(message, 'success');
+  document.querySelector('#clients-filter').addEventListener('submit', (event) => {
+    event.preventDefault();
+    state.clientsSearch = document.querySelector('#clients-search').value.trim();
+    state.clientsChannel = document.querySelector('#clients-channel').value;
+    state.expandedClient = null;
+    openClients(true);
+  });
+  document.querySelector('#new-client').addEventListener('click', () => {
+    state.clientEdit = { isNew: true };
+    renderClientForm();
+  });
+  document.querySelector('#more-clients').addEventListener('click', () => {
+    state.clientsOffset = state.clients.length;
+    openClients();
+  });
+  document.querySelectorAll('[data-edit-client]').forEach((button) => button.addEventListener('click', () => {
+    const item = state.clients.find((client) => String(client.id) === button.dataset.editClient);
+    if (item) { state.clientEdit = item; renderClientForm(); }
+  }));
+  document.querySelectorAll('[data-purchases]').forEach((button) => button.addEventListener('click', async () => {
+    const id = Number(button.dataset.purchases);
+    state.expandedClient = state.expandedClient === id ? null : id;
+    state.purchaseDetails = null;
+    if (state.expandedClient) {
+      try { state.purchaseDetails = await api(`/api/clients/${id}/purchases`); }
+      catch (error) { if (!state.user) return; showBanner(error.message); }
+    }
+    renderClients();
+  }));
+}
+
+function renderClientPurchases() {
+  const data = state.purchaseDetails;
+  if (!data) return '<div class="purchase-detail muted">Carregando compras…</div>';
+  const items = data.items?.length ? data.items.map((sale) => `
+    <div class="purchase-row"><span>${formatDate(sale.data_venda)} · ${esc(sale.produto?.descricao || 'Produto')}</span><strong>${currency(sale.valor_final)}</strong>
+      <small>${esc(sale.quantidade)} un. · ${esc(sale.produto?.codigo_interno || '')}${sale.pagamento?.descricao ? ` · ${esc(sale.pagamento.descricao)}` : ''}</small></div>`).join('') : '<p class="empty">Este cliente ainda não possui compras.</p>';
+  return `<div class="purchase-detail"><div class="purchase-summary"><span>${data.count} compra(s)</span><strong>${currency(data.total)}</strong><small>Última: ${formatDate(data.latest)}</small></div>${items}</div>`;
+}
+
+function renderClientForm() {
+  const client = state.clientEdit || { isNew: true };
+  const isNew = Boolean(client.isNew);
+  const channels = state.catalog?.canais || [];
+  const fairs = state.catalog?.feiras || [];
+  const channelOptions = optionList(channels, 'id', 'nome', 'Escolha um canal');
+  const fairOptions = optionList(fairs, 'id', 'nome_feira', 'Escolha uma feira');
+  const channelName = channels.find((item) => String(item.id) === String(client.canal_id))?.nome || '';
+  const isFair = channelName.trim().toLowerCase() === 'feira';
+  root.innerHTML = shellMarkup(isNew ? 'Novo cliente' : 'Editar cliente', 'clients', `
+    <form id="client-form" class="panel">
+      <div class="field"><label for="client-name">Nome *</label><input id="client-name" maxlength="150" value="${esc(client.nome || '')}" required /></div>
+      <div class="field"><label for="client-phone">Telefone</label><input id="client-phone" type="tel" inputmode="tel" placeholder="(11) 91234-5678" value="${esc(client.telefone || '')}" /></div>
+      <div class="field"><label for="client-channel">Canal *</label><select id="client-channel" required>${channelOptions}</select></div>
+      <div id="client-fair-field" class="field ${isFair ? '' : 'hidden'}"><label for="client-fair">Feira *</label><select id="client-fair">${fairOptions}</select></div>
+      <div class="grid-two">
+        <div class="field"><label for="client-birth">Nascimento</label><input id="client-birth" type="date" max="${localISODate()}" value="${esc(client.data_nascimento || '')}" /></div>
+        <div class="field"><label for="client-wedding">Casamento</label><input id="client-wedding" type="date" max="${localISODate()}" value="${esc(client.data_casamento || '')}" /></div>
+      </div>
+      <div class="form-actions"><button id="cancel-client" class="button secondary" type="button">Cancelar</button><button class="button primary" data-online-only type="submit">Salvar cliente</button></div>
+    </form>`);
+  bindShell();
+  if (client.canal_id) document.querySelector('#client-channel').value = String(client.canal_id);
+  document.querySelector('#client-fair').required = isFair;
+  if (client.detalhe_feira_id) document.querySelector('#client-fair').value = String(client.detalhe_feira_id);
+  document.querySelector('#client-channel').addEventListener('change', (event) => {
+    const selected = channels.find((item) => String(item.id) === event.target.value);
+    const required = selected?.nome.trim().toLowerCase() === 'feira';
+    document.querySelector('#client-fair-field').classList.toggle('hidden', !required);
+    document.querySelector('#client-fair').required = required;
+  });
+  document.querySelector('#cancel-client').addEventListener('click', () => { state.clientEdit = null; openClients(true); });
+  document.querySelector('#client-form').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const channelId = Number(document.querySelector('#client-channel').value);
+    const selected = channels.find((item) => Number(item.id) === channelId);
+    const fairId = selected?.nome.trim().toLowerCase() === 'feira' ? Number(document.querySelector('#client-fair').value) : null;
+    const payload = {
+      nome: document.querySelector('#client-name').value.trim(),
+      telefone: document.querySelector('#client-phone').value.trim(),
+      canal_id: channelId,
+      detalhe_feira_id: fairId,
+      data_nascimento: document.querySelector('#client-birth').value || null,
+      data_casamento: document.querySelector('#client-wedding').value || null,
+    };
+    const submit = event.currentTarget.querySelector('[type="submit"]');
+    submit.disabled = true;
+    try {
+      await api(isNew ? '/api/clients' : `/api/clients/${client.id}`, { method: isNew ? 'POST' : 'PUT', body: JSON.stringify(payload) });
+      state.clientEdit = null;
+      state.expandedClient = null;
+      await openClients(true, isNew ? 'Cliente cadastrado.' : 'Cliente atualizado.');
+    } catch (error) {
+      submit.disabled = false;
+      updateOnlineUI();
+      showBanner(error.message);
+    }
+  });
+}
+
+async function openHistory(reset = false, message = '') {
+  if (reset) {
+    state.historyParams.offset = 0;
+    state.historyItems = [];
+  }
+  try {
+    const params = new URLSearchParams();
+    Object.entries(state.historyParams).forEach(([key, value]) => { if (value !== '' && value !== null && value !== undefined) params.set(key, String(value)); });
+    const result = await api(`/api/history?${params}`);
+    state.historyItems = reset ? result.items || [] : [...state.historyItems, ...(result.items || [])];
+    state.historyCount = result.count || 0;
+    state.historySummary = result.summary || { items: 0, value: 0, commission: 0 };
+    renderHistory(message);
+  } catch (error) {
+    if (!state.user) return;
+    renderHistory();
+    showBanner(error.message);
+  }
+}
+
+function renderHistory(message = '') {
+  const channels = state.catalog?.canais || [];
+  const channelOptions = '<option value="">Todos os canais</option>' + channels.map((item) =>
+    `<option value="${esc(item.id)}" ${String(item.id) === state.historyParams.channel_id ? 'selected' : ''}>${esc(item.nome)}</option>`
+  ).join('');
+  const periods = [['today', 'Hoje'], ['7days', '7 dias'], ['month', 'Este mês'], ['year', 'Este ano'], ['all', 'Tudo'], ['custom', 'Escolher datas']];
+  const periodOptions = periods.map(([value, label]) => `<option value="${value}" ${state.historyParams.period === value ? 'selected' : ''}>${label}</option>`).join('');
+  let lastDay = '';
+  const itemsMarkup = state.historyItems.length ? state.historyItems.map((sale) => {
+    const day = String(sale.data_venda || '').slice(0, 10);
+    const heading = day !== lastDay ? `<h3 class="date-heading">${formatDate(day)}</h3>` : '';
+    lastDay = day;
+    const parts = [sale.canal?.nome, sale.pagamento?.descricao, sale.status?.nome].filter(Boolean).map(esc);
+    const discount = Number(sale.valor_desconto || 0);
+    return `${heading}<article class="history-card">
+      <div class="history-heading"><strong>${esc(sale.cliente || 'Sem cliente')}</strong><strong>${currency(sale.valor_final)}</strong></div>
+      <p>${esc(sale.quantidade)} × ${esc(sale.produto?.descricao || 'Produto')} <small>(${esc(sale.produto?.codigo_interno || '—')})</small></p>
+      <small>${parts.join(' · ')}${discount ? `${parts.length ? ' · ' : ''}desconto ${currency(discount)}` : ''}</small>
+    </article>`;
+  }).join('') : '<p class="empty">Nenhuma venda encontrada para estes filtros.</p>';
+  const summary = state.historySummary || { items: 0, value: 0, commission: 0 };
+  root.innerHTML = shellMarkup('Histórico', 'history', `
+    <section class="panel">
+      <form id="history-filter">
+        <div class="grid-two">
+          <div class="field"><label for="history-period">Período</label><select id="history-period">${periodOptions}</select></div>
+          <div class="field"><label for="history-channel">Canal</label><select id="history-channel">${channelOptions}</select></div>
+        </div>
+        <div id="history-custom-dates" class="grid-two ${state.historyParams.period === 'custom' ? '' : 'hidden'}">
+          <div class="field"><label for="history-start">De</label><input id="history-start" type="date" value="${esc(state.historyParams.start)}" max="${localISODate()}" /></div>
+          <div class="field"><label for="history-end">Até</label><input id="history-end" type="date" value="${esc(state.historyParams.end)}" max="${localISODate()}" /></div>
+        </div>
+        <div class="field"><label for="history-client">Cliente</label><input id="history-client" placeholder="Buscar por nome" value="${esc(state.historyParams.client)}" /></div>
+        <button class="button secondary" type="submit">Aplicar filtros</button>
+      </form>
+      <div class="summary-grid">
+        <div class="summary-tile"><small>Itens vendidos</small><strong>${summary.items}</strong></div>
+        <div class="summary-tile"><small>Total vendido</small><strong>${currency(summary.value)}</strong></div>
+      </div>
+      ${summary.commission ? `<p class="muted commission-note">Comissão no período: ${currency(summary.commission)}</p>` : ''}
+      <div id="history-list">${itemsMarkup}</div>
+      <div class="pagination ${state.historyItems.length < state.historyCount ? '' : 'hidden'}"><button id="more-history" class="button secondary" type="button">Mostrar mais</button></div>
+    </section>`);
+  bindShell();
+  if (message) showBanner(message, 'success');
+  document.querySelector('#history-period').addEventListener('change', (event) => {
+    document.querySelector('#history-custom-dates').classList.toggle('hidden', event.target.value !== 'custom');
+  });
+  document.querySelector('#history-filter').addEventListener('submit', (event) => {
+    event.preventDefault();
+    state.historyParams = {
+      period: document.querySelector('#history-period').value,
+      channel_id: document.querySelector('#history-channel').value,
+      client: document.querySelector('#history-client').value.trim(),
+      start: document.querySelector('#history-start')?.value || '',
+      end: document.querySelector('#history-end')?.value || '',
+      offset: 0,
+    };
+    openHistory(true);
+  });
+  document.querySelector('#more-history')?.addEventListener('click', () => {
+    state.historyParams.offset = state.historyItems.length;
+    openHistory(false);
+  });
+}
+
+function currentTheme() {
+  return localStorage.getItem('semijoias-theme') || 'auto';
+}
+
+function applyTheme(theme) {
+  if (theme === 'auto') {
+    document.documentElement.removeAttribute('data-theme');
+    localStorage.removeItem('semijoias-theme');
+  } else {
+    document.documentElement.dataset.theme = theme;
+    localStorage.setItem('semijoias-theme', theme);
+  }
+}
+
+async function openSettings() {
+  try {
+    state.appConfig = await api('/api/config');
+    renderSettings();
+  } catch (error) {
+    if (!state.user) return;
+    renderSettings();
+    showBanner(error.message);
+  }
+}
+
+function renderSettings() {
+  const config = state.appConfig || { environment: 'Não identificado', database_host: '—' };
+  const theme = currentTheme();
+  root.innerHTML = shellMarkup('Configurações', 'settings', `
+    <section class="panel">
+      <h2>Aparência</h2>
+      <div class="field"><label for="theme-select">Tema</label><select id="theme-select">
+        <option value="auto" ${theme === 'auto' ? 'selected' : ''}>Automático</option>
+        <option value="light" ${theme === 'light' ? 'selected' : ''}>Claro</option>
+        <option value="dark" ${theme === 'dark' ? 'selected' : ''}>Escuro</option>
+      </select></div>
+      <p class="muted">Automático acompanha a preferência de aparência do celular.</p>
+    </section>
+    <section class="panel">
+      <h2>Conta</h2>
+      <div class="settings-row"><small>Usuário logado</small><strong>${esc(state.user?.email || '—')}</strong></div>
+      <button id="settings-logout" class="button primary" type="button">Sair da conta</button>
+    </section>
+    <section class="panel">
+      <h2>Ambiente</h2>
+      <div class="settings-row"><small>Rodando em</small><strong>${esc(config.environment)}</strong></div>
+      <div class="settings-row"><small>Banco de dados</small><strong>${esc(config.database_host)}</strong></div>
+      <div class="settings-row"><small>Aplicativo</small><strong>PWA de vendas</strong></div>
+    </section>`);
+  bindShell();
+  applyTheme(theme);
+  document.querySelector('#theme-select').addEventListener('change', (event) => applyTheme(event.target.value));
+  document.querySelector('#settings-logout').addEventListener('click', logoutFromPwa);
 }
 
 window.addEventListener('online', updateOnlineUI);
@@ -323,6 +687,8 @@ window.addEventListener('beforeinstallprompt', (event) => {
   event.preventDefault();
   state.installing = event;
 });
+
+applyTheme(currentTheme());
 
 api('/api/me').then(async (user) => {
   await openSales(user);
