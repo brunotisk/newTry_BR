@@ -13,7 +13,11 @@ def _cookies_mobile():
         # semântica para a derivação determinística da chave Fernet.
         if not hasattr(st, "cache"):
             st.cache = st.cache_data
-        from streamlit_cookies_manager import EncryptedCookieManager
+        try:
+            from streamlit_cookies_manager import EncryptedCookieManager
+        except Exception:
+            st.session_state["_auth_cookie_ready"] = False
+            return None
 
         senha_cookie = os.getenv("AUTH_COOKIE_PASSWORD", "")
         if not senha_cookie:
@@ -27,8 +31,10 @@ def _cookies_mobile():
             password=senha_cookie,
         )
         st.session_state["_auth_cookies"] = cookies
-    if not cookies.ready():
-        st.stop()
+    try:
+        st.session_state["_auth_cookie_ready"] = bool(cookies.ready())
+    except Exception:
+        st.session_state["_auth_cookie_ready"] = False
     return cookies
 
 
@@ -224,7 +230,9 @@ def autenticar_usuario():
     if "user" not in st.session_state:
         st.session_state.user = None
 
-    cookies = _cookies_mobile() if st.session_state.get("mobile_auth") else None
+    mobile_auth = bool(st.session_state.get("mobile_auth"))
+    cookies = _cookies_mobile() if mobile_auth else None
+    cookie_ready = bool(st.session_state.get("_auth_cookie_ready"))
 
     # Bypass de login para desenvolvimento local
     if _skip_auth():
@@ -235,7 +243,7 @@ def autenticar_usuario():
     if st.session_state.user is not None:
         return st.session_state.user
 
-    if cookies is not None:
+    if cookies is not None and cookie_ready:
         usuario = _restaurar_sessao_mobile(cookies)
         if usuario is not None:
             st.session_state.user = usuario
@@ -266,14 +274,16 @@ def autenticar_usuario():
 
             if btn_entrar:
                 try:
-                    cliente_auth = _cliente_auth_mobile() if cookies is not None else supabase
+                    cliente_auth = _cliente_auth_mobile() if mobile_auth else supabase
                     resposta = cliente_auth.auth.sign_in_with_password({
                         "email": email.strip(),
                         "password": senha
                     })
                     st.session_state.user = resposta.user
-                    if cookies is not None and getattr(resposta, "session", None):
+                    if cookies is not None and cookie_ready and getattr(resposta, "session", None):
                         _salvar_cookie_sessao(cookies, resposta.session)
+                    elif mobile_auth:
+                        st.warning("Login efetuado, mas o salvamento da sessão ainda não está disponível neste navegador.")
                     st.success("Login efetuado com sucesso!")
                     st.rerun()
                 except Exception:
@@ -305,7 +315,7 @@ def logout():
             cookies = _cookies_mobile()
             cliente = _cliente_auth_mobile()
             cliente.auth.sign_out()
-            if cookies.get("session"):
+            if cookies is not None and st.session_state.get("_auth_cookie_ready") and cookies.get("session"):
                 del cookies["session"]
                 cookies.save()
         else:
