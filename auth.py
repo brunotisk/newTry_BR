@@ -8,6 +8,11 @@ def _cookies_mobile():
     """Retorna o gerenciador de cookies da sessão Streamlit atual."""
     cookies = st.session_state.get("_auth_cookies")
     if cookies is None:
+        # streamlit-cookies-manager 0.2.0 ainda decora uma função com st.cache.
+        # Streamlit 1.62 removeu esse alias; st.cache_data mantém a mesma
+        # semântica para a derivação determinística da chave Fernet.
+        if not hasattr(st, "cache"):
+            st.cache = st.cache_data
         from streamlit_cookies_manager import EncryptedCookieManager
 
         senha_cookie = os.getenv("AUTH_COOKIE_PASSWORD", "")
