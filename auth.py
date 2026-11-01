@@ -1,6 +1,75 @@
+import json
 import os
 import streamlit as st
-from db import supabase
+from db import supabase, SUPABASE_URL, SUPABASE_KEY
+
+
+def _cookies_mobile():
+    """Retorna o gerenciador de cookies da sessão Streamlit atual."""
+    cookies = st.session_state.get("_auth_cookies")
+    if cookies is None:
+        from streamlit_cookies_manager import EncryptedCookieManager
+
+        senha_cookie = os.getenv("AUTH_COOKIE_PASSWORD", "")
+        if not senha_cookie:
+            try:
+                senha_cookie = st.secrets.get("AUTH_COOKIE_PASSWORD", "")
+            except Exception:
+                senha_cookie = ""
+        senha_cookie = senha_cookie or SUPABASE_KEY
+        cookies = EncryptedCookieManager(
+            prefix="sistemabyac/mobile-auth/",
+            password=senha_cookie,
+        )
+        st.session_state["_auth_cookies"] = cookies
+    if not cookies.ready():
+        st.stop()
+    return cookies
+
+
+def _cliente_auth_mobile():
+    """Cliente Supabase isolado por sessão Streamlit (nunca compartilha auth global)."""
+    cliente = st.session_state.get("_auth_client")
+    if cliente is None:
+        from supabase import create_client
+
+        cliente = create_client(SUPABASE_URL, SUPABASE_KEY)
+        st.session_state["_auth_client"] = cliente
+    return cliente
+
+
+def _salvar_cookie_sessao(cookies, sessao):
+    dados = {
+        "access_token": sessao.access_token,
+        "refresh_token": sessao.refresh_token,
+    }
+    cookies["session"] = json.dumps(dados, separators=(",", ":"))
+    cookies.save()
+
+
+def _restaurar_sessao_mobile(cookies):
+    """Valida/renova os tokens do cookie usando um cliente de auth isolado."""
+    valor = cookies.get("session")
+    if not valor:
+        return None
+    try:
+        dados = json.loads(valor)
+        if not dados.get("access_token") or not dados.get("refresh_token"):
+            raise ValueError("Sessão incompleta")
+        cliente = _cliente_auth_mobile()
+        sessao = cliente.auth.set_session(dados["access_token"], dados["refresh_token"])
+        sessao = getattr(sessao, "session", None) or cliente.auth.get_session()
+        if not sessao or not getattr(sessao, "user", None):
+            raise ValueError("Sessão inválida")
+        _salvar_cookie_sessao(cookies, sessao)
+        return sessao.user
+    except Exception:
+        try:
+            del cookies["session"]
+            cookies.save()
+        except Exception:
+            pass
+        return None
 
 
 def _skip_auth() -> bool:
@@ -150,6 +219,8 @@ def autenticar_usuario():
     if "user" not in st.session_state:
         st.session_state.user = None
 
+    cookies = _cookies_mobile() if st.session_state.get("mobile_auth") else None
+
     # Bypass de login para desenvolvimento local
     if _skip_auth():
         if st.session_state.user is None:
@@ -159,7 +230,15 @@ def autenticar_usuario():
     if st.session_state.user is not None:
         return st.session_state.user
 
-    st.set_page_config(layout="wide")
+    if cookies is not None:
+        usuario = _restaurar_sessao_mobile(cookies)
+        if usuario is not None:
+            st.session_state.user = usuario
+            return usuario
+
+    # app_mobile.py já configura a página antes de chamar a autenticação.
+    if cookies is None:
+        st.set_page_config(layout="wide")
     _injetar_estilo()
 
     col_form, col_painel = st.columns([5, 4])
@@ -182,11 +261,14 @@ def autenticar_usuario():
 
             if btn_entrar:
                 try:
-                    resposta = supabase.auth.sign_in_with_password({
+                    cliente_auth = _cliente_auth_mobile() if cookies is not None else supabase
+                    resposta = cliente_auth.auth.sign_in_with_password({
                         "email": email.strip(),
                         "password": senha
                     })
                     st.session_state.user = resposta.user
+                    if cookies is not None and getattr(resposta, "session", None):
+                        _salvar_cookie_sessao(cookies, resposta.session)
                     st.success("Login efetuado com sucesso!")
                     st.rerun()
                 except Exception:
@@ -214,7 +296,15 @@ def autenticar_usuario():
 def logout():
     """Realiza o logout no Supabase e limpa o estado da sessão."""
     try:
-        supabase.auth.sign_out()
+        if st.session_state.get("mobile_auth"):
+            cookies = _cookies_mobile()
+            cliente = _cliente_auth_mobile()
+            cliente.auth.sign_out()
+            if cookies.get("session"):
+                del cookies["session"]
+                cookies.save()
+        else:
+            supabase.auth.sign_out()
     except Exception:
         pass
     st.session_state.user = None

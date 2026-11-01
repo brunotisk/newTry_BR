@@ -49,6 +49,8 @@ ROTAS = {
 
 
 def main() -> None:
+    # Ativa persistência de autenticação por cookie apenas na interface mobile.
+    st.session_state["mobile_auth"] = True
     autenticar_usuario()
     aplicar_estilo()
     aplicar_tema()  # depois de aplicar_estilo(), para o tema prevalecer

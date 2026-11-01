@@ -44,7 +44,7 @@ def _form_item() -> None:
     p = por_id[pid]
     foto = str(p.get("foto_url") or "").strip()
     if foto.startswith("http"):
-        st.image(foto, width=96)
+        st.image(foto, width=220)
 
     no_carrinho = sum(i["quantidade"] for i in itens if i["produto"]["id"] == pid)
     disponivel = p["saldo"] - no_carrinho

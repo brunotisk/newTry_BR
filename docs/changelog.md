@@ -61,3 +61,4 @@ Retirada Peças
 ## 2.0.1-melhorias_App_Mobile-15/10/2026
 ## 2.0.2-melhorias_App_Mobile-20/10/2026
 ## 2.1.1-Tela_Parcerias_conciliacao-22/10/2026
+## 2.2.1-Tela_Mobile-01/11/2026
