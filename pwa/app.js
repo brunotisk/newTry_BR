@@ -6,13 +6,15 @@ const state = {
   cart: [],
   online: navigator.onLine,
   installing: null,
+  productMode: 'list',
   clientsOffset: 0,
   clientsSearch: '',
   clientsChannel: '',
   clientsTotal: 0,
   clients: [],
   clientEdit: null,
-  expandedClient: null,
+  clientDetail: null,
+  clientReturnDetail: false,
   historyParams: { period: 'month', channel_id: '', client: '', start: '', end: '', offset: 0 },
   historyItems: [],
   historyCount: 0,
@@ -138,8 +140,19 @@ function renderSales(message = '') {
       <form id="sale-form">
         <section class="panel">
           <h2>Produto</h2>
-          <div class="field"><label for="product">Produto com saldo</label>
-            <select id="product" required>${productOptions}</select>
+          <div class="segmented-control" role="group" aria-label="Forma de localizar produto">
+            <button id="product-mode-list" type="button" class="${state.productMode === 'list' ? 'selected' : ''}">Escolher na lista</button>
+            <button id="product-mode-code" type="button" class="${state.productMode === 'code' ? 'selected' : ''}">Digitar código</button>
+          </div>
+          <div id="product-list-field" class="field ${state.productMode === 'list' ? '' : 'hidden'}"><label for="product-search">Buscar na lista</label>
+            <input id="product-search" type="search" autocomplete="off" placeholder="Código ou descrição" />
+            <label for="product">Produto com saldo</label>
+            <select id="product" ${state.productMode === 'list' ? 'required' : ''}>${productOptions}</select>
+          </div>
+          <div id="product-code-field" class="field ${state.productMode === 'code' ? '' : 'hidden'}">
+            <label for="product-code">Código interno</label>
+            <div class="inline-search"><input id="product-code" type="search" inputmode="text" autocomplete="off" placeholder="Digite o código do produto" /><button id="find-product-code" class="button secondary" type="button">Buscar</button></div>
+            <small id="product-code-message" class="field-hint">Digite o código completo, como aparece na etiqueta.</small>
           </div>
           <div id="product-preview" class="empty">Escolha um produto para ver foto e saldo.</div>
           <div class="grid-two">
@@ -193,7 +206,28 @@ function renderSales(message = '') {
   });
 
   const productSelect = document.querySelector('#product');
-  productSelect.addEventListener('change', () => updateProductPreview(products));
+  document.querySelector('#product-search').addEventListener('input', () => filterProductOptions(products));
+  productSelect.addEventListener('change', () => {
+    const selected = products.find((product) => String(product.id) === productSelect.value);
+    if (selected) {
+      document.querySelector('#product-code').value = String(selected.codigo_interno || '');
+      document.querySelector('#product-search').value = String(selected.codigo_interno || '');
+    }
+    filterProductOptions(products);
+  });
+  document.querySelector('#product-mode-list').addEventListener('click', () => setProductMode('list'));
+  document.querySelector('#product-mode-code').addEventListener('click', () => setProductMode('code'));
+  document.querySelector('#find-product-code').addEventListener('click', () => selectProductByCode(products));
+  document.querySelector('#product-code').addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') { event.preventDefault(); selectProductByCode(products); }
+  });
+  document.querySelector('#product-code').addEventListener('input', () => {
+    const selected = products.find((product) => String(product.id) === productSelect.value);
+    if (selected && String(selected.codigo_interno || '').toLowerCase() !== document.querySelector('#product-code').value.trim().toLowerCase()) {
+      productSelect.value = '';
+      updateProductPreview(products);
+    }
+  });
   document.querySelector('#add-item').addEventListener('click', () => addCartItem(products));
   document.querySelector('#channel').addEventListener('change', (event) => {
     const selected = catalog.canais.find((item) => String(item.id) === event.target.value);
@@ -213,6 +247,50 @@ function renderSales(message = '') {
   attachNav();
   renderCart();
   updateOnlineUI();
+}
+
+function setProductMode(mode) {
+  state.productMode = mode;
+  const isList = mode === 'list';
+  document.querySelector('#product-list-field').classList.toggle('hidden', !isList);
+  document.querySelector('#product-code-field').classList.toggle('hidden', isList);
+  document.querySelector('#product').required = isList;
+  document.querySelector('#product-mode-list').classList.toggle('selected', isList);
+  document.querySelector('#product-mode-code').classList.toggle('selected', !isList);
+  document.querySelector('#product-code-message').textContent = 'Digite o código completo, como aparece na etiqueta.';
+}
+
+function filterProductOptions(products) {
+  const select = document.querySelector('#product');
+  const current = select.value;
+  const query = document.querySelector('#product-search').value.trim().toLocaleLowerCase('pt-BR');
+  const matches = products.filter((product) =>
+    `${product.codigo_interno || ''} ${product.descricao || ''}`.toLocaleLowerCase('pt-BR').includes(query)
+  );
+  const options = '<option value="">Selecione um produto</option>' + matches.map((product) =>
+    `<option value="${esc(product.id)}">${esc(product.codigo_interno)} — ${esc(product.descricao)} · saldo ${esc(product.saldo)}</option>`
+  ).join('');
+  select.innerHTML = options;
+  if (matches.some((product) => String(product.id) === current)) select.value = current;
+  updateProductPreview(products);
+}
+
+function selectProductByCode(products) {
+  const code = document.querySelector('#product-code').value.trim().toLocaleLowerCase('pt-BR');
+  const match = products.find((product) => String(product.codigo_interno || '').trim().toLocaleLowerCase('pt-BR') === code);
+  const message = document.querySelector('#product-code-message');
+  if (!match) {
+    message.textContent = 'Não encontrei esse código entre os produtos com saldo.';
+    message.classList.add('field-hint-error');
+    return;
+  }
+  document.querySelector('#product').value = '';
+  document.querySelector('#product-search').value = String(match.codigo_interno || '');
+  filterProductOptions(products);
+  document.querySelector('#product').value = String(match.id);
+  message.textContent = `${match.codigo_interno} selecionado.`;
+  message.classList.remove('field-hint-error');
+  updateProductPreview(products);
 }
 
 function updateProductPreview(products) {
@@ -352,7 +430,7 @@ function attachNav() {
     const route = button.dataset.route;
     state.screen = route;
     if (route === 'sales') renderSales();
-    else if (route === 'clients') openClients(true);
+    else if (route === 'clients') { state.clientDetail = null; openClients(true); }
     else if (route === 'history') openHistory(true);
     else openSettings();
   }));
@@ -396,6 +474,7 @@ function clientQueryUrl(offset = 0) {
 async function openClients(reset = false, message = '') {
   if (reset) state.clientsOffset = 0;
   if (state.clientEdit) return renderClientForm();
+  if (state.clientDetail) return renderClientDetail(message);
   try {
     const requestedOffset = state.clientsOffset;
     const result = await api(clientQueryUrl(requestedOffset));
@@ -416,11 +495,9 @@ function renderClients(message = '') {
     const channel = channels.find((item) => String(item.id) === String(client.canal_id))?.nome || 'Canal não informado';
     const phoneDigits = String(client.telefone || '').replace(/\D/g, '');
     const whatsapp = phoneDigits.length >= 10 ? `<a class="button ghost" href="https://wa.me/55${esc(phoneDigits)}" target="_blank" rel="noopener noreferrer">WhatsApp</a>` : '';
-    const purchases = state.expandedClient === Number(client.id) ? renderClientPurchases() : '';
     return `<article class="client-card">
       <div class="client-heading"><div><strong>${esc(client.nome)}</strong><small>${esc(channel)}${client.telefone ? ` · ${esc(client.telefone)}` : ''}</small></div></div>
-      <div class="card-actions">${whatsapp}<button class="button ghost" type="button" data-edit-client="${esc(client.id)}">Editar</button><button class="button ghost" type="button" data-purchases="${esc(client.id)}">${state.expandedClient === Number(client.id) ? 'Ocultar compras' : 'Ver compras'}</button></div>
-      ${purchases}
+      <div class="card-actions">${whatsapp}<button class="button secondary" type="button" data-consult-client="${esc(client.id)}">Consultar dados</button></div>
     </article>`;
   }).join('') : '<p class="empty">Nenhum cliente encontrado.</p>';
   const channelOptions = '<option value="">Todos os canais</option>' + channels.map((item) => `<option value="${esc(item.id)}" ${String(item.id) === state.clientsChannel ? 'selected' : ''}>${esc(item.nome)}</option>`).join('');
@@ -444,10 +521,11 @@ function renderClients(message = '') {
     event.preventDefault();
     state.clientsSearch = document.querySelector('#clients-search').value.trim();
     state.clientsChannel = document.querySelector('#clients-channel').value;
-    state.expandedClient = null;
+    state.clientDetail = null;
     openClients(true);
   });
   document.querySelector('#new-client').addEventListener('click', () => {
+    state.clientReturnDetail = false;
     state.clientEdit = { isNew: true };
     renderClientForm();
   });
@@ -455,20 +533,61 @@ function renderClients(message = '') {
     state.clientsOffset = state.clients.length;
     openClients();
   });
-  document.querySelectorAll('[data-edit-client]').forEach((button) => button.addEventListener('click', () => {
-    const item = state.clients.find((client) => String(client.id) === button.dataset.editClient);
-    if (item) { state.clientEdit = item; renderClientForm(); }
+  document.querySelectorAll('[data-consult-client]').forEach((button) => button.addEventListener('click', () => {
+    const item = state.clients.find((client) => String(client.id) === button.dataset.consultClient);
+    if (item) openClientDetail(item);
   }));
-  document.querySelectorAll('[data-purchases]').forEach((button) => button.addEventListener('click', async () => {
-    const id = Number(button.dataset.purchases);
-    state.expandedClient = state.expandedClient === id ? null : id;
+}
+
+async function openClientDetail(client, message = '') {
+  state.clientDetail = client;
+  state.purchaseDetails = null;
+  renderClientDetail(message);
+  try {
+    const details = await api(`/api/clients/${client.id}/purchases`);
+    if (String(state.clientDetail?.id) !== String(client.id)) return;
+    state.purchaseDetails = details;
+    renderClientDetail(message);
+  } catch (error) {
+    if (!state.user) return;
+    renderClientDetail(message);
+    showBanner(error.message);
+  }
+}
+
+function renderClientDetail(message = '') {
+  const client = state.clientDetail;
+  if (!client) return openClients(true);
+  const channels = state.catalog?.canais || [];
+  const fairs = state.catalog?.feiras || [];
+  const channel = channels.find((item) => String(item.id) === String(client.canal_id))?.nome || '—';
+  const fair = fairs.find((item) => String(item.id) === String(client.detalhe_feira_id))?.nome_feira || '—';
+  const isFair = channel.trim().toLowerCase() === 'feira';
+  root.innerHTML = shellMarkup('Consultar cliente', 'clients', `
+    <section class="panel">
+      <div class="detail-title"><div><p class="eyebrow">Cadastro do cliente</p><h2>${esc(client.nome)}</h2></div></div>
+      <div class="detail-grid">
+        <div class="detail-cell"><small>Telefone</small><strong>${esc(client.telefone || '—')}</strong></div>
+        <div class="detail-cell"><small>Canal</small><strong>${esc(channel)}</strong></div>
+        ${isFair ? `<div class="detail-cell"><small>Feira</small><strong>${esc(fair)}</strong></div>` : ''}
+        <div class="detail-cell"><small>Nascimento</small><strong>${formatDate(client.data_nascimento)}</strong></div>
+        <div class="detail-cell"><small>Casamento</small><strong>${formatDate(client.data_casamento)}</strong></div>
+      </div>
+      <div class="form-actions detail-actions"><button id="back-to-clients" class="button secondary" type="button">Voltar</button><button id="edit-client-detail" class="button primary" type="button">Editar cadastro</button></div>
+    </section>
+    <section class="panel"><h2>Compras</h2>${renderClientPurchases()}</section>`);
+  bindShell();
+  if (message) showBanner(message, 'success');
+  document.querySelector('#back-to-clients').addEventListener('click', () => {
+    state.clientDetail = null;
     state.purchaseDetails = null;
-    if (state.expandedClient) {
-      try { state.purchaseDetails = await api(`/api/clients/${id}/purchases`); }
-      catch (error) { if (!state.user) return; showBanner(error.message); }
-    }
-    renderClients();
-  }));
+    openClients(true);
+  });
+  document.querySelector('#edit-client-detail').addEventListener('click', () => {
+    state.clientReturnDetail = true;
+    state.clientEdit = client;
+    renderClientForm();
+  });
 }
 
 function renderClientPurchases() {
@@ -511,7 +630,16 @@ function renderClientForm() {
     document.querySelector('#client-fair-field').classList.toggle('hidden', !required);
     document.querySelector('#client-fair').required = required;
   });
-  document.querySelector('#cancel-client').addEventListener('click', () => { state.clientEdit = null; openClients(true); });
+  document.querySelector('#cancel-client').addEventListener('click', () => {
+    state.clientEdit = null;
+    if (state.clientReturnDetail && state.clientDetail) {
+      state.clientReturnDetail = false;
+      renderClientDetail();
+    } else {
+      state.clientReturnDetail = false;
+      openClients(true);
+    }
+  });
   document.querySelector('#client-form').addEventListener('submit', async (event) => {
     event.preventDefault();
     const channelId = Number(document.querySelector('#client-channel').value);
@@ -528,10 +656,17 @@ function renderClientForm() {
     const submit = event.currentTarget.querySelector('[type="submit"]');
     submit.disabled = true;
     try {
-      await api(isNew ? '/api/clients' : `/api/clients/${client.id}`, { method: isNew ? 'POST' : 'PUT', body: JSON.stringify(payload) });
+      const saved = await api(isNew ? '/api/clients' : `/api/clients/${client.id}`, { method: isNew ? 'POST' : 'PUT', body: JSON.stringify(payload) });
       state.clientEdit = null;
-      state.expandedClient = null;
-      await openClients(true, isNew ? 'Cliente cadastrado.' : 'Cliente atualizado.');
+      if (!isNew && state.clientReturnDetail) {
+        state.clientReturnDetail = false;
+        state.clientDetail = { ...client, ...saved };
+        await openClientDetail(state.clientDetail, 'Cliente atualizado.');
+      } else {
+        state.clientReturnDetail = false;
+        state.clientDetail = null;
+        await openClients(true, 'Cliente cadastrado.');
+      }
     } catch (error) {
       submit.disabled = false;
       updateOnlineUI();

@@ -64,3 +64,4 @@ Retirada Peças
 ## 2.2.2-Tela_Mobile-01/11/2026
 2.3.1-APP_PWA-Base-01/11/2026
 2.3.2-APP_PWA-V1-01/11/2026
+2.3.3-APP_PWA-Melhorias-01/11/2026
