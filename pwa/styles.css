@@ -118,18 +118,38 @@ h2 { font-size: 1.05rem; margin: 0 0 15px; }
 .detail-cell small { color: var(--muted); font-size: .75rem; }
 .detail-cell strong { overflow-wrap: anywhere; font-size: .9rem; }
 .detail-actions { margin-top: 18px; }
+.sale-progress { display: flex; align-items: center; gap: 10px; padding: 12px 14px; margin-top: 12px; border: 1px solid var(--line); border-radius: 12px; font-size: .88rem; line-height: 1.45; }
+.sale-progress.pending { background: color-mix(in srgb, var(--accent) 12%, var(--surface)); }
+.sale-progress.success { color: var(--success); background: color-mix(in srgb, var(--success) 12%, var(--surface)); }
+.sale-progress.error { color: var(--danger); background: color-mix(in srgb, var(--danger) 10%, var(--surface)); }
+.hourglass { font-size: 1.2rem; animation: hourglass-pulse 1s ease-in-out infinite; }
+.button-spinner { display: inline-block; width: 16px; height: 16px; margin: 0 7px -3px 0; border: 2px solid #ffffff70; border-top-color: #fff; border-radius: 50%; animation: spin .8s linear infinite; }
+@keyframes hourglass-pulse { 50% { transform: rotate(12deg) scale(1.08); } }
 :root[data-theme="dark"] { color-scheme: dark; --ink: #edf0e9; --muted: #aab2a9; --paper: #111712; --surface: #1b241e; --line: #354037; --accent: #c5a06a; --accent-dark: #e0bd83; --danger: #ffb3aa; --success: #8bd1a7; }
+:root[data-theme="dark"] body { background: radial-gradient(ellipse at 50% -20%, #26362a 0, var(--paper) 52%); }
+:root[data-theme="dark"] .app-shell { max-width: 680px; }
+:root[data-theme="dark"] .panel { background: linear-gradient(145deg, #202a23, #1a231d 72%); border-color: #35443a; box-shadow: 0 12px 32px #0004; }
+:root[data-theme="dark"] .topbar { padding: 12px 14px; border: 1px solid var(--line); border-radius: 18px; background: #1b241ed9; }
+:root[data-theme="dark"] .eyebrow { color: var(--accent-dark); }
+:root[data-theme="dark"] .field input, :root[data-theme="dark"] .field select { background-color: #111a14; }
+:root[data-theme="dark"] .field input::placeholder { color: #89948b; }
+:root[data-theme="dark"] .product-preview, :root[data-theme="dark"] .summary-tile, :root[data-theme="dark"] .detail-cell { background: #18221b; border-color: #35443a; }
+:root[data-theme="dark"] .segmented-control { background: #151e18; border-color: #35443a; }
+:root[data-theme="dark"] .segmented-control button.selected { background: #303d33; color: var(--ink); }
+:root[data-theme="dark"] .button.secondary { background: #303d33; color: var(--ink); }
+:root[data-theme="dark"] .button.ghost { border-color: #46534a; }
+:root[data-theme="dark"] .button.remove { background: #432a29; color: #ffb3aa; }
+:root[data-theme="dark"] .banner { background: #26342b; color: #d3ded5; }
+:root[data-theme="dark"] .banner.error { background: #422c2b; color: #ffc0b8; }
+:root[data-theme="dark"] .banner.success { background: #203c2c; color: #a6e2ba; }
+:root[data-theme="dark"] .banner.warning { background: #41371f; color: #f0d390; }
+:root[data-theme="dark"] .bottom-nav { background: #151e18ed; border-color: #35443a; box-shadow: 0 -8px 24px #0005; backdrop-filter: blur(14px); }
+:root[data-theme="dark"] .nav-button.active { color: #e0bd83; background: #c5a06a20; }
+:root[data-theme="dark"] .product-photo { background: #26342b; }
 :root[data-theme="dark"] .field label { color: #d2d8d0; }
 :root[data-theme="dark"] .field input, :root[data-theme="dark"] .field select { background: #151d17; color: var(--ink); border-color: var(--line); }
 :root[data-theme="dark"] .field select { background-image: linear-gradient(45deg, transparent 50%, #aab2a9 50%), linear-gradient(135deg, #aab2a9 50%, transparent 50%); }
-:root[data-theme="dark"] .segmented-control { background: #303b33; }
-:root[data-theme="dark"] .segmented-control button.selected { background: #151d17; }
-:root[data-theme="dark"] .product-preview, :root[data-theme="dark"] .summary-tile { background: #202a23; }
-:root[data-theme="dark"] .detail-cell { background: #202a23; }
-:root[data-theme="dark"] .button.secondary { background: #303b33; color: var(--ink); }
-:root[data-theme="dark"] .button.ghost { color: var(--muted); }
-:root[data-theme="dark"] .button.remove { background: #432a29; }
-:root[data-theme="dark"] .client-card, :root[data-theme="dark"] .history-card { background: #1b241e; }
+:root[data-theme="dark"] .client-card, :root[data-theme="dark"] .history-card { background: #1b241e; border-color: #35443a; }
 @media (max-width: 390px) {
   .app-shell { padding-inline: 12px; }
   .panel { padding: 15px; }

@@ -193,6 +193,7 @@ function renderSales(message = '') {
             <div class="field"><label for="new-client-phone">Telefone (opcional)</label><input id="new-client-phone" type="tel" inputmode="tel" placeholder="(11) 91234-5678" /></div>
           </div>
           <button id="save-sale" class="button primary" type="submit" ${state.online ? '' : 'disabled'}>Salvar venda</button>
+          <div id="sale-progress" class="sale-progress hidden" role="status" aria-live="polite"></div>
         </section>
       </form>
       ${renderNav('sales')}
@@ -382,8 +383,11 @@ async function submitSale(event) {
     items: state.cart.map(({ product_id, quantity, unit_price, discount, discount_type }) => ({ product_id, quantity, unit_price, discount, discount_type })),
   };
   const button = document.querySelector('#save-sale');
+  const progress = document.querySelector('#sale-progress');
   button.disabled = true;
-  button.textContent = 'Salvando…';
+  button.innerHTML = '<span class="button-spinner" aria-hidden="true"></span> Salvando venda…';
+  progress.className = 'sale-progress pending';
+  progress.innerHTML = '<span class="hourglass" aria-hidden="true">⏳</span><span>Registrando produtos e atualizando o estoque…</span>';
   try {
     const result = await api('/api/sales', { method: 'POST', body: JSON.stringify(payload) });
     const done = new Set((result.created || []).map((item) => item.index));
@@ -392,17 +396,28 @@ async function submitSale(event) {
     if (failed.length) {
       renderCart();
       showBanner(`${done.size} item(ns) registrado(s). ${failed.length} permaneceram no carrinho: ${failed.map((item) => item.message).join(' · ')}`, 'warning');
+      progress.className = 'sale-progress error';
+      progress.textContent = `⚠️ ${failed.length} item(ns) não foram registrados. Confira o aviso e tente novamente.`;
       button.disabled = !state.online;
-      button.textContent = 'Salvar venda';
+      button.textContent = 'Tentar novamente';
       return;
     }
     state.cart = [];
-    await loadCatalog();
-    renderSales(`${done.size} item(ns) registrados e estoque atualizado.`);
+    progress.className = 'sale-progress success';
+    progress.textContent = `✅ ${done.size} item(ns) registrado(s) e estoque atualizado com sucesso.`;
+    let refreshMessage = `${done.size} item(ns) registrados e estoque atualizado com sucesso.`;
+    try {
+      await loadCatalog();
+    } catch (_) {
+      refreshMessage += ' Atualize a tela para carregar os saldos mais recentes.';
+    }
+    renderSales(refreshMessage);
   } catch (error) {
     showBanner(error.message);
+    progress.className = 'sale-progress error';
+    progress.textContent = `❌ Não foi possível salvar a venda: ${error.message}`;
     button.disabled = !state.online;
-    button.textContent = 'Salvar venda';
+    button.textContent = 'Tentar novamente';
   }
 }
 
