@@ -4,6 +4,7 @@ import os
 from urllib.parse import urlparse
 
 import streamlit as st
+from docs.version import APP_VERSION
 
 from auth import logout
 from tema import seletor_tema_persistente
@@ -76,4 +77,5 @@ def tela_configuracoes_mobile() -> None:
         _linha("Rodando em", ambiente)
         st.caption(f"Detectado por: {detalhe}")
         _linha("Banco de dados (Supabase)", supabase_host)
+        _linha("Versão do deploy", f"v{APP_VERSION}")
         _linha("Streamlit", st.__version__)
