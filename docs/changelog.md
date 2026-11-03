@@ -67,3 +67,4 @@ Retirada Peças
 2.3.3-APP_PWA-Melhorias-01/11/2026
 2.3.4-APP_PWA-Melhorias_temaescuro_finalavendas-02/11/2026
 2.3.5-APP_PWA-Melhorias_temaescuro_versao-02/11/2026
+2.3.6-APP_PWA-Melhorias_temaescuro_versaoV2-02/11/2026

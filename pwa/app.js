@@ -144,10 +144,12 @@ function renderSales(message = '') {
             <button id="product-mode-list" type="button" class="${state.productMode === 'list' ? 'selected' : ''}">Escolher na lista</button>
             <button id="product-mode-code" type="button" class="${state.productMode === 'code' ? 'selected' : ''}">Digitar código</button>
           </div>
-          <div id="product-list-field" class="field ${state.productMode === 'list' ? '' : 'hidden'}"><label for="product-search">Buscar na lista</label>
-            <input id="product-search" type="search" autocomplete="off" placeholder="Código ou descrição" />
-            <label for="product">Produto com saldo</label>
-            <select id="product" ${state.productMode === 'list' ? 'required' : ''}>${productOptions}</select>
+          <div id="product-list-field" class="field ${state.productMode === 'list' ? '' : 'hidden'}"><label for="product-search">Produto com saldo</label>
+            <div class="product-picker" id="product-picker">
+              <div class="product-picker-control"><input id="product-search" type="search" role="combobox" aria-autocomplete="list" aria-controls="product-options" aria-expanded="false" autocomplete="off" placeholder="Buscar código ou descrição" /><button id="product-picker-toggle" type="button" aria-label="Mostrar produtos" aria-expanded="false">⌄</button></div>
+              <div id="product-options" class="product-options hidden" role="listbox" aria-label="Produtos disponíveis"></div>
+            </div>
+            <select id="product" class="internal-select" tabindex="-1" aria-hidden="true">${productOptions}</select>
           </div>
           <div id="product-code-field" class="field ${state.productMode === 'code' ? '' : 'hidden'}">
             <label for="product-code">Código interno</label>
@@ -200,6 +202,7 @@ function renderSales(message = '') {
     </div>`;
 
   if (pendingStatus) document.querySelector('#status').value = String(pendingStatus.id);
+  enhanceDropdowns();
   document.querySelector('#logout').addEventListener('click', async () => {
     try { await api('/api/auth/logout', { method: 'POST', body: '{}' }); } catch (_) {}
     state.user = null; state.catalog = null; state.cart = [];
@@ -208,6 +211,24 @@ function renderSales(message = '') {
 
   const productSelect = document.querySelector('#product');
   document.querySelector('#product-search').addEventListener('input', () => filterProductOptions(products));
+  document.querySelector('#product-search').addEventListener('focus', () => filterProductOptions(products, true));
+  document.querySelector('#product-picker-toggle').addEventListener('click', () => {
+    const options = document.querySelector('#product-options');
+    if (options.classList.contains('hidden')) {
+      document.querySelector('#product-search').focus();
+      filterProductOptions(products, true);
+    } else closeProductOptions();
+  });
+  document.querySelector('#product-search').addEventListener('keydown', (event) => {
+    const options = document.querySelector('#product-options');
+    const choices = [...options.querySelectorAll('[role="option"]')];
+    if (event.key === 'Escape') closeProductOptions();
+    if (event.key === 'ArrowDown' && choices.length) { event.preventDefault(); choices[0].focus(); }
+    if (event.key === 'Enter' && !options.classList.contains('hidden') && choices.length) { event.preventDefault(); choices[0].click(); }
+  });
+  document.addEventListener('click', (event) => {
+    if (!document.querySelector('#product-picker')?.contains(event.target)) closeProductOptions();
+  });
   productSelect.addEventListener('change', () => {
     const selected = products.find((product) => String(product.id) === productSelect.value);
     if (selected) {
@@ -255,24 +276,59 @@ function setProductMode(mode) {
   const isList = mode === 'list';
   document.querySelector('#product-list-field').classList.toggle('hidden', !isList);
   document.querySelector('#product-code-field').classList.toggle('hidden', isList);
-  document.querySelector('#product').required = isList;
+  if (!isList) closeProductOptions();
   document.querySelector('#product-mode-list').classList.toggle('selected', isList);
   document.querySelector('#product-mode-code').classList.toggle('selected', !isList);
   document.querySelector('#product-code-message').textContent = 'Digite o código completo, como aparece na etiqueta.';
 }
 
-function filterProductOptions(products) {
+function closeProductOptions() {
+  const options = document.querySelector('#product-options');
+  const search = document.querySelector('#product-search');
+  const toggle = document.querySelector('#product-picker-toggle');
+  if (!options || !search || !toggle) return;
+  options.classList.add('hidden');
+  search.setAttribute('aria-expanded', 'false');
+  toggle.setAttribute('aria-expanded', 'false');
+}
+
+function filterProductOptions(products, open = true) {
   const select = document.querySelector('#product');
   const current = select.value;
   const query = document.querySelector('#product-search').value.trim().toLocaleLowerCase('pt-BR');
   const matches = products.filter((product) =>
     `${product.codigo_interno || ''} ${product.descricao || ''}`.toLocaleLowerCase('pt-BR').includes(query)
   );
-  const options = '<option value="">Selecione um produto</option>' + matches.map((product) =>
+  select.innerHTML = '<option value="">Selecione um produto</option>' + products.map((product) =>
     `<option value="${esc(product.id)}">${esc(product.codigo_interno)} — ${esc(product.descricao)} · saldo ${esc(product.saldo)}</option>`
   ).join('');
-  select.innerHTML = options;
   if (matches.some((product) => String(product.id) === current)) select.value = current;
+  const list = document.querySelector('#product-options');
+  list.innerHTML = matches.length ? matches.slice(0, 80).map((product) => `
+    <button type="button" class="product-option" role="option" aria-selected="${String(product.id) === current}" data-product-id="${esc(product.id)}">
+      <span class="product-option-main"><strong>${esc(product.codigo_interno)} — ${esc(product.descricao)}</strong><small>Saldo disponível: ${esc(product.saldo)}</small></span>
+      <span class="product-option-check" aria-hidden="true">${String(product.id) === current ? '✓' : ''}</span>
+    </button>`).join('') : '<div class="product-options-empty">Nenhum produto encontrado.</div>';
+  list.querySelectorAll('[data-product-id]').forEach((button) => button.addEventListener('click', () => {
+    select.value = button.dataset.productId;
+    const selected = products.find((product) => String(product.id) === select.value);
+    document.querySelector('#product-search').value = selected ? `${selected.codigo_interno} — ${selected.descricao}` : '';
+    document.querySelector('#product-code').value = selected?.codigo_interno || '';
+    closeProductOptions();
+    updateProductPreview(products);
+  }));
+  list.querySelectorAll('[role="option"]').forEach((button) => button.addEventListener('keydown', (event) => {
+    if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
+    event.preventDefault();
+    const all = [...list.querySelectorAll('[role="option"]')];
+    const next = all.indexOf(button) + (event.key === 'ArrowDown' ? 1 : -1);
+    (all[next] || document.querySelector('#product-search')).focus();
+  }));
+  if (open) {
+    list.classList.remove('hidden');
+    document.querySelector('#product-search').setAttribute('aria-expanded', 'true');
+    document.querySelector('#product-picker-toggle').setAttribute('aria-expanded', 'true');
+  }
   updateProductPreview(products);
 }
 
@@ -285,10 +341,9 @@ function selectProductByCode(products) {
     message.classList.add('field-hint-error');
     return;
   }
-  document.querySelector('#product').value = '';
-  document.querySelector('#product-search').value = String(match.codigo_interno || '');
-  filterProductOptions(products);
   document.querySelector('#product').value = String(match.id);
+  document.querySelector('#product-search').value = `${match.codigo_interno} — ${match.descricao}`;
+  closeProductOptions();
   message.textContent = `${match.codigo_interno} selecionado.`;
   message.classList.remove('field-hint-error');
   updateProductPreview(products);
@@ -465,8 +520,65 @@ function shellMarkup(title, active, body) {
 
 function bindShell() {
   document.querySelector('#logout')?.addEventListener('click', logoutFromPwa);
+  enhanceDropdowns();
   attachNav();
   updateOnlineUI();
+}
+
+function enhanceDropdowns() {
+  if (!document.documentElement.dataset.dropdownOutsideHandler) {
+    document.documentElement.dataset.dropdownOutsideHandler = 'true';
+    document.addEventListener('click', (event) => {
+      if (!event.target.closest('.select-picker')) {
+        document.querySelectorAll('.select-picker-menu').forEach((menu) => menu.classList.add('hidden'));
+        document.querySelectorAll('.select-picker-trigger').forEach((button) => button.setAttribute('aria-expanded', 'false'));
+      }
+    });
+  }
+  document.querySelectorAll('select:not(.internal-select):not([data-custom-dropdown])').forEach((select) => {
+    select.dataset.customDropdown = 'true';
+    const picker = document.createElement('div');
+    picker.className = 'select-picker';
+    const trigger = document.createElement('button');
+    trigger.type = 'button';
+    trigger.className = 'select-picker-trigger';
+    trigger.setAttribute('aria-haspopup', 'listbox');
+    trigger.setAttribute('aria-expanded', 'false');
+    const label = document.createElement('span');
+    const arrow = document.createElement('span');
+    arrow.className = 'select-picker-arrow';
+    arrow.setAttribute('aria-hidden', 'true');
+    arrow.textContent = '⌄';
+    trigger.append(label, arrow);
+    const menu = document.createElement('div');
+    menu.className = 'select-picker-menu hidden';
+    menu.setAttribute('role', 'listbox');
+    picker.append(trigger, menu);
+    select.classList.add('select-picker-source');
+    select.insertAdjacentElement('afterend', picker);
+
+    const sync = () => {
+      const option = select.selectedOptions[0];
+      label.textContent = option?.textContent || 'Selecione';
+      trigger.disabled = select.disabled;
+      menu.innerHTML = [...select.options].map((item, index) => `
+        <button type="button" role="option" class="select-picker-option ${item.disabled ? 'disabled' : ''} ${item.selected ? 'selected' : ''}" aria-selected="${item.selected}" data-index="${index}" ${item.disabled ? 'disabled' : ''}>${esc(item.textContent)}</button>`).join('');
+      menu.querySelectorAll('[data-index]').forEach((button) => button.addEventListener('click', () => {
+        select.selectedIndex = Number(button.dataset.index);
+        select.dispatchEvent(new Event('change', { bubbles: true }));
+        menu.classList.add('hidden');
+        trigger.setAttribute('aria-expanded', 'false');
+      }));
+    };
+    select.addEventListener('change', sync);
+    trigger.addEventListener('click', () => {
+      const opening = menu.classList.contains('hidden');
+      document.querySelectorAll('.select-picker-menu').forEach((other) => other.classList.add('hidden'));
+      menu.classList.toggle('hidden', !opening);
+      trigger.setAttribute('aria-expanded', String(opening));
+    });
+    sync();
+  });
 }
 
 async function logoutFromPwa() {
