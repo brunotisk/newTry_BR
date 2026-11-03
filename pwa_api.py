@@ -22,6 +22,7 @@ from starlette.staticfiles import StaticFiles
 
 from servicos.supabase_admin import get_client
 from servicos.vendas_import import calcular_comissao_venda, inserir_venda_e_baixar_estoque
+from docs.version import APP_VERSION
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -646,7 +647,7 @@ async def app_config(request: Request) -> Response:
     labels = {"HML": "Homologação", "PRD": "Produção"}
     manual = os.getenv("APP_ENV", "").strip()
     environment = manual.capitalize() if manual else labels.get(bd, "Não identificado")
-    response = JSONResponse({"environment": environment, "database_host": host})
+    response = JSONResponse({"environment": environment, "database_host": host, "app_version": APP_VERSION})
     _set_session_cookies(response, session)
     return response
 

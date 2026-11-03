@@ -802,7 +802,7 @@ async function openSettings() {
 }
 
 function renderSettings() {
-  const config = state.appConfig || { environment: 'Não identificado', database_host: '—' };
+  const config = state.appConfig || { environment: 'Não identificado', database_host: '—', app_version: '—' };
   const theme = currentTheme();
   root.innerHTML = shellMarkup('Configurações', 'settings', `
     <section class="panel">
@@ -823,6 +823,7 @@ function renderSettings() {
       <h2>Ambiente</h2>
       <div class="settings-row"><small>Rodando em</small><strong>${esc(config.environment)}</strong></div>
       <div class="settings-row"><small>Banco de dados</small><strong>${esc(config.database_host)}</strong></div>
+      <div class="settings-row"><small>Versão do deploy</small><strong>v${esc(config.app_version)}</strong></div>
       <div class="settings-row"><small>Aplicativo</small><strong>PWA de vendas</strong></div>
     </section>`);
   bindShell();

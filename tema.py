@@ -27,16 +27,9 @@ input, textarea, [data-baseweb="select"] > div,
 [data-baseweb="input"], [data-baseweb="textarea"] {
     background-color: #262730 !important; color: #fafafa !important;
 }
-[data-baseweb="popover"] [data-baseweb="popover"] { background: #20232b !important; }
-[data-baseweb="popover"] [role="listbox"],
-[data-baseweb="popover"] [role="listbox"] > div,
-[data-baseweb="menu"] { background-color: #20232b !important; color: #f5f6f8 !important; }
-[data-baseweb="popover"] [role="option"] { background-color: transparent !important; color: #f5f6f8 !important; }
-[data-baseweb="popover"] [role="option"]:hover,
-[data-baseweb="popover"] [role="option"][aria-selected="true"] { background-color: #343946 !important; color: #ffffff !important; }
-[data-baseweb="popover"] [role="option"] [data-testid="stMarkdownContainer"] { color: inherit !important; }
-[data-baseweb="select"] > div { border-color: #454b58 !important; }
-[data-baseweb="select"] svg { fill: #d8dbe2 !important; }
+[data-baseweb="popover"] *, [data-baseweb="menu"] {
+    background-color: #262730 !important; color: #fafafa !important;
+}
 [data-testid="stVerticalBlockBorderWrapper"] { border-color: #3a3f4b !important; }
 hr { border-color: #3a3f4b !important; }
 .stButton > button__BTN__, .stFormSubmitButton > button__BTN__ {
