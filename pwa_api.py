@@ -655,6 +655,11 @@ async def app_config(request: Request) -> Response:
 class SecurityHeaders(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
         response = await call_next(request)
+        if request.url.path in {
+            "/", "/index.html", "/sw.js", "/register-sw.js",
+            "/styles.css", "/app.js", "/manifest.webmanifest",
+        }:
+            response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
         response.headers.setdefault("X-Frame-Options", "DENY")

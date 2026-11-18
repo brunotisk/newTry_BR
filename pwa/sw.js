@@ -1,4 +1,4 @@
-const CACHE_NAME = 'semijoias-shell-v2';
+const CACHE_NAME = 'semijoias-shell-v3';
 const APP_SHELL = ['/', '/index.html', '/styles.css', '/app.js', '/register-sw.js', '/manifest.webmanifest', '/icons/icon.svg', '/icons/icon-192.png', '/icons/icon-512.png'];
 
 self.addEventListener('install', (event) => {
@@ -18,12 +18,17 @@ self.addEventListener('fetch', (event) => {
   if (url.origin !== self.location.origin || url.pathname.startsWith('/api/')) return;
   if (event.request.method !== 'GET') return;
   event.respondWith(
-    fetch(event.request).then((response) => {
+    fetch(event.request, { cache: 'no-store' }).then((response) => {
       if (response.ok) {
         const copy = response.clone();
         caches.open(CACHE_NAME).then((cache) => cache.put(event.request, copy));
       }
       return response;
-    }).catch(async () => (await caches.match(event.request)) || (await caches.match('/')))
+    }).catch(async () => {
+      const cached = await caches.match(event.request);
+      if (cached) return cached;
+      if (event.request.mode === 'navigate') return (await caches.match('/index.html')) || Response.error();
+      return new Response('Recurso indisponível offline.', { status: 503, statusText: 'Offline' });
+    })
   );
 });
