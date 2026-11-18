@@ -1,4 +1,9 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
-  "framework": "python"
+  "framework": "python",
+  "functions": {
+    "pwa_api.py": {
+      "includeFiles": "pwa/**"
+    }
+  }
 }
