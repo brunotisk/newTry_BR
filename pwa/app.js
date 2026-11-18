@@ -1,9 +1,14 @@
 const root = document.querySelector('#app');
+let cartFromSync = [];
+try {
+  cartFromSync = JSON.parse(sessionStorage.getItem('semijoias-pwa-cart-on-sync') || '[]');
+  sessionStorage.removeItem('semijoias-pwa-cart-on-sync');
+} catch (_) {}
 const state = {
   user: null,
   catalog: null,
   screen: 'sales',
-  cart: [],
+  cart: Array.isArray(cartFromSync) ? cartFromSync : [],
   online: navigator.onLine,
   installing: null,
   productMode: 'list',
@@ -942,11 +947,48 @@ function renderSettings() {
       <div class="settings-row"><small>Banco de dados</small><strong>${esc(config.database_host)}</strong></div>
       <div class="settings-row"><small>Versão do deploy</small><strong>v${esc(config.app_version)}</strong></div>
       <div class="settings-row"><small>Aplicativo</small><strong>PWA de vendas</strong></div>
+    </section>
+    <section class="panel">
+      <h2>Sincronização</h2>
+      <p class="muted">Atualiza os arquivos do PWA caso a tela continue mostrando uma versão antiga.</p>
+      <button id="sync-app" class="button secondary" type="button">Sincronizar aplicativo</button>
     </section>`);
   bindShell();
   applyTheme(theme);
   document.querySelector('#theme-select').addEventListener('change', (event) => applyTheme(event.target.value));
   document.querySelector('#settings-logout').addEventListener('click', logoutFromPwa);
+  document.querySelector('#sync-app').addEventListener('click', sincronizarAplicativo);
+}
+
+async function sincronizarAplicativo() {
+  const button = document.querySelector('#sync-app');
+  if (!navigator.onLine) return showBanner('Conecte-se à internet para sincronizar o aplicativo.', 'warning');
+  button.disabled = true;
+  button.textContent = 'Sincronizando…';
+  try {
+    sessionStorage.setItem('semijoias-pwa-cart-on-sync', JSON.stringify(state.cart));
+    const registration = await navigator.serviceWorker?.getRegistration();
+    if (registration) {
+      await registration.update();
+      const installing = registration.installing;
+      if (installing && installing.state !== 'activated') {
+        await Promise.race([
+          new Promise((resolve) => installing.addEventListener('statechange', () => {
+            if (installing.state === 'activated' || installing.state === 'redundant') resolve();
+          })),
+          new Promise((resolve) => setTimeout(resolve, 5000)),
+        ]);
+      }
+    }
+    const appCaches = await caches.keys();
+    await Promise.all(appCaches.filter((name) => name.startsWith('semijoias-shell-')).map((name) => caches.delete(name)));
+    window.location.reload();
+  } catch (error) {
+    sessionStorage.removeItem('semijoias-pwa-cart-on-sync');
+    button.disabled = false;
+    button.textContent = 'Sincronizar aplicativo';
+    showBanner(`Não foi possível sincronizar agora: ${error.message}`, 'error');
+  }
 }
 
 window.addEventListener('online', updateOnlineUI);

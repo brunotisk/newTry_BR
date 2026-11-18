@@ -1,5 +1,5 @@
-const CACHE_NAME = 'semijoias-shell-v3';
-const APP_SHELL = ['/', '/index.html', '/styles.css', '/app.js', '/register-sw.js', '/manifest.webmanifest', '/icons/icon.svg', '/icons/icon-192.png', '/icons/icon-512.png'];
+const CACHE_NAME = 'semijoias-shell-v5';
+const APP_SHELL = ['/', '/index.html', '/styles.css?v=5', '/app.js?v=5', '/register-sw.js?v=5', '/manifest.webmanifest?v=5', '/icons/icon.svg', '/icons/icon-192.png', '/icons/icon-512.png'];
 
 self.addEventListener('install', (event) => {
   event.waitUntil(caches.open(CACHE_NAME).then((cache) => cache.addAll(APP_SHELL)));
