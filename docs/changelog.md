@@ -54,14 +54,14 @@ Melhoria Performance Maleta envio Parceiro
 ## 1.9.0 - 10/10/2026
 Retirada Peças
 
-## 1.9.1-Gráficos e Retiradas-11/10/2026
-## 1.9.2-melhoria Parceiros-11/10/2026
-## 1.9.3-melhoria Parceiros:PDF-14/10/2026
-## 2.0.0-App_Mobile-15/10/2026
-## 2.0.1-melhorias_App_Mobile-15/10/2026
-## 2.0.2-melhorias_App_Mobile-20/10/2026
-## 2.1.1-Tela_Parcerias_conciliacao-22/10/2026
-## 2.2.2-Tela_Mobile-01/11/2026
+1.9.1-Gráficos e Retiradas-11/10/2026
+1.9.2-melhoria Parceiros-11/10/2026
+1.9.3-melhoria Parceiros:PDF-14/10/2026
+2.0.0-App_Mobile-15/10/2026
+2.0.1-melhorias_App_Mobile-15/10/2026
+2.0.2-melhorias_App_Mobile-20/10/2026
+2.1.1-Tela_Parcerias_conciliacao-22/10/2026
+2.2.2-Tela_Mobile-01/11/2026
 2.3.1-APP_PWA-Base-01/11/2026
 2.3.2-APP_PWA-V1-01/11/2026
 2.3.3-APP_PWA-Melhorias-01/11/2026

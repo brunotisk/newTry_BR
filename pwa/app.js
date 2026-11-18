@@ -64,8 +64,8 @@ function renderLogin(message = '') {
   root.innerHTML = `
     <section class="login-wrap">
       <div class="login-card">
-        <div class="brand-mark" aria-hidden="true">◇</div>
-        <p class="eyebrow">Sistema de Semijoias</p>
+        <div class="brand-mark" aria-hidden="true">SA</div>
+        <p class="eyebrow">Semijoias Alexandra</p>
         <h1>Bem-vindo de volta</h1>
         <p class="muted">Entre para lançar uma venda e atualizar o estoque.</p>
         <div id="login-message" class="banner error ${message ? '' : 'hidden'}">${esc(message)}</div>
@@ -132,7 +132,7 @@ function renderSales(message = '') {
   root.innerHTML = `
     <div class="app-shell">
       <header class="topbar">
-        <div><p class="eyebrow">Sistema de Semijoias</p><h1>Nova venda</h1></div>
+        <div><p class="eyebrow">Semijoias Alexandra</p><h1>Nova venda</h1></div>
         <div class="user-actions"><span class="user-email" title="${esc(state.user?.email)}">${esc(state.user?.email)}</span><button id="logout" class="button ghost" type="button">Sair</button></div>
       </header>
       <div id="page-message" class="banner ${message ? 'success' : 'hidden'}">${esc(message)}</div>
@@ -146,7 +146,7 @@ function renderSales(message = '') {
           </div>
           <div id="product-list-field" class="field ${state.productMode === 'list' ? '' : 'hidden'}"><label for="product-search">Produto com saldo</label>
             <div class="product-picker" id="product-picker">
-              <div class="product-picker-control"><input id="product-search" type="search" role="combobox" aria-autocomplete="list" aria-controls="product-options" aria-expanded="false" autocomplete="off" placeholder="Buscar código ou descrição" /><button id="product-picker-toggle" type="button" aria-label="Mostrar produtos" aria-expanded="false">⌄</button></div>
+              <div class="product-picker-control"><input id="product-search" type="search" role="combobox" aria-autocomplete="list" aria-controls="product-options" aria-expanded="false" autocomplete="off" placeholder="Buscar código ou descrição" /><button id="product-picker-toggle" type="button" aria-label="Mostrar produtos" aria-expanded="false"></button></div>
               <div id="product-options" class="product-options hidden" role="listbox" aria-label="Produtos disponíveis"></div>
             </div>
             <select id="product" class="internal-select" tabindex="-1" aria-hidden="true">${productOptions}</select>
@@ -498,17 +498,23 @@ function renderNav(active) {
 function attachNav() {
   document.querySelectorAll('[data-route]').forEach((button) => button.addEventListener('click', () => {
     const route = button.dataset.route;
+    if (route === state.screen) {
+      window.scrollTo({ top: 0, behavior: 'auto' });
+      return;
+    }
     state.screen = route;
+    window.scrollTo({ top: 0, behavior: 'auto' });
     if (route === 'sales') renderSales();
     else if (route === 'clients') { state.clientDetail = null; openClients(true); }
     else if (route === 'history') openHistory(true);
     else openSettings();
+    requestAnimationFrame(() => window.scrollTo({ top: 0, behavior: 'auto' }));
   }));
 }
 
 function shellMarkup(title, active, body) {
   return `<div class="app-shell">
-    <header class="topbar"><div><p class="eyebrow">Sistema de Semijoias</p><h1>${title}</h1></div>
+    <header class="topbar"><div><p class="eyebrow">Semijoias Alexandra</p><h1>${title}</h1></div>
       <div class="user-actions"><span class="user-email" title="${esc(state.user?.email)}">${esc(state.user?.email)}</span><button id="logout" class="button ghost" type="button">Sair</button></div>
     </header>
     <div id="page-message" class="banner hidden"></div>
@@ -548,7 +554,6 @@ function enhanceDropdowns() {
     const arrow = document.createElement('span');
     arrow.className = 'select-picker-arrow';
     arrow.setAttribute('aria-hidden', 'true');
-    arrow.textContent = '⌄';
     trigger.append(label, arrow);
     const menu = document.createElement('div');
     menu.className = 'select-picker-menu hidden';

@@ -3,6 +3,33 @@ from db import supabase
 from telas.cadastros_gerais import tela_categorias
 from componentes.paginacao import render_paginacao, get_itens_por_pagina, reset_paginacao
 from componentes.busca_produto import busca_produto
+from servicos.vendas_import import normalizar_codigo_interno
+
+# Compatibilidade com versões do Streamlit que usam experimental_dialog.
+_dialog = getattr(st, "dialog", None) or st.experimental_dialog
+
+TIPOS_FOTO = ["jpg", "jpeg", "png", "webp", "bmp", "tif", "tiff"]
+
+
+def _flash(tipo: str, msg: str) -> None:
+    """Mensagem que sobrevive ao st.rerun()."""
+    st.session_state["produtos_flash"] = (tipo, msg)
+
+
+def _mostrar_flash() -> None:
+    flash = st.session_state.pop("produtos_flash", None)
+    if flash:
+        getattr(st, flash[0], st.info)(flash[1])
+
+
+def _enviar_foto(produto_id, codigo, arquivo) -> str:
+    """Sobe a foto ao Storage (JPEG até 1200 px) e grava produtos.foto_url. Devolve a URL."""
+    from servicos.busca_fotos_produtos import enviar_foto_do_produto
+    return enviar_foto_do_produto(supabase, produto_id, str(codigo), arquivo.getvalue())
+
+
+def _limpar_caches() -> None:
+    _produtos_busca_cache.clear()
 
 
 def _carregar_produtos_para_busca():
@@ -36,6 +63,84 @@ def _carregar_produtos_para_busca():
 @st.cache_data(ttl=30, show_spinner=False)
 def _produtos_busca_cache():
     return _carregar_produtos_para_busca()
+
+
+@_dialog("➕ Novo produto", width="large")
+def _dialog_novo_produto(cat_dict: dict):
+    c_cod, c_desc = st.columns([1, 3])
+    codigo_txt = c_cod.text_input("Código interno *", placeholder="Ex.: 11389", key="np_codigo")
+    descricao = c_desc.text_input("Descrição *", key="np_descricao")
+
+    desc_site = st.text_input("Descrição do site (opcional)", key="np_desc_site")
+
+    c_ncm, c_un, c_cat = st.columns([1, 1, 2])
+    ncm = c_ncm.text_input("NCM (opcional)", key="np_ncm")
+    unidade = c_un.text_input("Unidade", value="UN", key="np_unidade")
+    cat_ids = list(cat_dict.keys())
+    categoria_id = c_cat.selectbox(
+        "Categoria | Banho (opcional)",
+        options=cat_ids,
+        index=None,
+        placeholder="Sem categoria",
+        format_func=lambda cid: cat_dict[cid]["rotulo_dropdown"],
+        key="np_categoria",
+    )
+
+    foto = st.file_uploader(
+        "Foto do produto (opcional)", type=TIPOS_FOTO, key="np_foto",
+        help="Convertida para JPEG (máx. 1200 px) e enviada ao bucket público.",
+    )
+    if foto is not None:
+        st.image(foto, width=140)
+
+    if not st.button("💾 Salvar produto", type="primary", use_container_width=True, key="np_salvar"):
+        return
+
+    codigo = normalizar_codigo_interno(codigo_txt)
+    descricao = descricao.strip()
+    if not codigo:
+        st.error("Informe o código interno.")
+        return
+    if not descricao:
+        st.error("Informe a descrição.")
+        return
+
+    try:
+        existente = (
+            supabase.table("produtos").select("id, descricao")
+            .eq("codigo_interno", codigo).limit(1).execute().data or []
+        )
+        if existente:
+            st.error(f"Já existe o produto {codigo} — {existente[0].get('descricao')}.")
+            return
+
+        criado = supabase.table("produtos").insert({
+            "codigo_interno": codigo,
+            "descricao": descricao,
+            "produto_descricao_site": desc_site.strip() or None,
+            "ncm": ncm.strip() or None,
+            "unidade": unidade.strip() or None,
+            "categoria_id": categoria_id,
+            "nr_compras": 0,
+        }).execute().data
+        produto_id = criado[0]["id"]
+    except Exception as e:
+        st.error(f"Erro ao cadastrar o produto: {e}")
+        return
+
+    _limpar_caches()
+
+    if foto is not None:
+        try:
+            _enviar_foto(produto_id, codigo, foto)
+        except Exception as e:
+            # O produto já foi criado; só a foto falhou.
+            _flash("warning", f"Produto {codigo} cadastrado, mas a foto não foi enviada: {e}")
+            st.rerun()
+            return
+
+    _flash("success", f"Produto {codigo} cadastrado com sucesso.")
+    st.rerun()
 
 
 def _secao_consulta():
@@ -275,8 +380,8 @@ def _secao_consulta():
                 col_ult_compra.write(str(prod.get("ultima_compra")) if prod.get("ultima_compra") else "-")
                 col_nr_compra.write(str(prod.get("nr_compras", 0)))
 
-                if cat_ids:
-                    with col_acao.popover("✏️"):
+                with col_acao.popover("✏️"):
+                    if cat_ids:
                         st.markdown("**Vincular Categoria**")
                         st.caption(f"Produto ID: {prod['id']}")
 
@@ -290,15 +395,31 @@ def _secao_consulta():
                             key=f"select_cat_{prod['id']}"
                         )
 
-                        if st.button("💾 Salvar", key=f"btn_save_{prod['id']}", use_container_width=True):
+                        if st.button("💾 Salvar categoria", key=f"btn_save_{prod['id']}", use_container_width=True):
                             try:
                                 supabase.table("produtos").update({"categoria_id": nova_cat_id}).eq("id", prod["id"]).execute()
                                 st.toast("Categoria atualizada com sucesso!", icon="✅")
                                 st.rerun()
                             except Exception as err:
                                 st.error(f"Erro ao salvar: {err}")
-                else:
-                    col_acao.caption("-")
+                        st.divider()
+
+                    st.markdown("**Foto do produto**")
+                    nova_foto = st.file_uploader(
+                        "Selecionar foto", type=TIPOS_FOTO, key=f"foto_up_{prod['id']}",
+                    )
+                    if st.button(
+                        "📷 Enviar foto", key=f"btn_foto_{prod['id']}",
+                        use_container_width=True, disabled=nova_foto is None,
+                    ):
+                        try:
+                            with st.spinner("Enviando..."):
+                                _enviar_foto(prod["id"], prod.get("codigo_interno"), nova_foto)
+                            _limpar_caches()
+                            st.toast("Foto atualizada!", icon="✅")
+                            st.rerun()
+                        except Exception as err:
+                            st.error(f"Erro ao enviar a foto: {err}")
 
         # 5. Paginação reutilizável
         render_paginacao(
@@ -322,7 +443,23 @@ def tela_produtos():
     except Exception:
         total_itens = 0
 
-    st.header(f"📦 Produtos ({total_itens} Itens)")
+    col_titulo, col_novo = st.columns([5, 1.3], vertical_alignment="center")
+    col_titulo.header(f"📦 Produtos ({total_itens} Itens)")
+    if col_novo.button("➕ Novo produto", type="primary", use_container_width=True, key="produtos_btn_novo"):
+        try:
+            cats = (
+                supabase.table("categorias_produtos")
+                .select("id, categoria, banho, ordem_exibicao")
+                .order("ordem_exibicao").execute().data or []
+            )
+        except Exception:
+            cats = []
+        _dialog_novo_produto({
+            c["id"]: {"rotulo_dropdown": f"{c['categoria']} | {c.get('banho') or '-'}"}
+            for c in cats
+        })
+
+    _mostrar_flash()
 
     aba_consulta, aba_categorias = st.tabs(["Consulta Produto", "Cadastrar categorias"])
 

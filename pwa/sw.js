@@ -1,4 +1,4 @@
-const CACHE_NAME = 'semijoias-shell-v1';
+const CACHE_NAME = 'semijoias-shell-v2';
 const APP_SHELL = ['/', '/index.html', '/styles.css', '/app.js', '/register-sw.js', '/manifest.webmanifest', '/icons/icon.svg', '/icons/icon-192.png', '/icons/icon-512.png'];
 
 self.addEventListener('install', (event) => {

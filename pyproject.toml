@@ -1,0 +1,2 @@
+[tool.vercel]
+entrypoint = "pwa_api:app"
