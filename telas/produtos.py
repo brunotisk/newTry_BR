@@ -5,6 +5,7 @@ from db import supabase
 from telas.cadastros_gerais import tela_categorias
 from componentes.paginacao import render_paginacao, get_itens_por_pagina, reset_paginacao
 from componentes.busca_produto import busca_produto
+from componentes.foto_produto import campo_foto, salvar_foto
 from servicos.produtos_manual import (
     cadastrar_produto_manual,
     atualizar_estoque_e_precos,
@@ -130,24 +131,36 @@ def _dialog_produto(produto=None):
             placeholder="Ex.: contagem física, produto sem NF...",
         )
 
+    arquivo_foto = campo_foto(
+        f"p_foto_{sufixo}", None if novo else produto.get("foto_url"), "Foto do produto (opcional)"
+    )
+
     if not novo and quantidade != saldo_atual:
         st.info(f"Será registrado um ajuste de {quantidade - saldo_atual:+g} (saldo {saldo_atual:g} → {quantidade:g}).")
 
     if st.button("💾 Salvar", type="primary", use_container_width=True, key=f"p_salvar_{sufixo}"):
         try:
             if novo:
-                cadastrar_produto_manual(
+                produto_id = cadastrar_produto_manual(
                     supabase, codigo, descricao, data_mov.isoformat(),
                     categoria_id=categoria_id, unidade=unidade, quantidade=quantidade,
                     preco_compra=preco_compra or None, preco_venda=preco_venda or None,
                 )
+                codigo_foto = codigo.strip()
                 st.toast("Produto cadastrado!", icon="✅")
             else:
                 atualizar_estoque_e_precos(
                     supabase, produto["id"], quantidade, data_mov.isoformat(),
                     preco_compra or None, preco_venda or None, motivo,
                 )
+                produto_id, codigo_foto = produto["id"], produto.get("codigo_interno")
                 st.toast("Estoque e preços atualizados!", icon="✅")
+            if arquivo_foto is not None:
+                erro_foto = salvar_foto(supabase, produto_id, codigo_foto, arquivo_foto)
+                if erro_foto:
+                    st.toast(f"Salvo, mas a foto não foi enviada: {erro_foto}", icon="⚠️")
+                else:
+                    st.toast("Foto enviada!", icon="📷")
             _produtos_busca_cache.clear()
             st.rerun()
         except ValueError as e:
@@ -420,7 +433,7 @@ def _secao_consulta():
                 else:
                     col_pop.caption("-")
 
-                if col_est.button("📦", key=f"btn_estoque_{prod['id']}", help="Editar estoque e preços"):
+                if col_est.button("📦", key=f"btn_estoque_{prod['id']}", help="Editar estoque, preços e foto"):
                     _dialog_produto(prod)
 
         # 5. Paginação reutilizável

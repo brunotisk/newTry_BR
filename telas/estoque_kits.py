@@ -12,6 +12,7 @@ from datetime import date
 
 import streamlit as st
 
+from componentes.foto_produto import campo_foto, salvar_foto
 from db import supabase
 from servicos import kits as kits_srv
 from servicos.estoque import SaldoInsuficienteError, obter_custo_unitario
@@ -56,7 +57,7 @@ def _rotulo_kit(k: dict) -> str:
 def _listar_kits() -> list:
     return (
         supabase.table("produtos")
-        .select("id, codigo_interno, descricao")
+        .select("id, codigo_interno, descricao, foto_url")
         .eq("eh_kit", True)
         .order("codigo_interno")
         .execute()
@@ -268,6 +269,7 @@ def _secao_receitas():
         kit_id = st.selectbox(
             "Kit", list(por_id), format_func=lambda i: _rotulo_kit(por_id[i]), key="kits_receita_kit"
         )
+        _foto_kit_existente(por_id[kit_id])
 
     # O rascunho da receita é refeito sempre que muda o kit (ou o modo).
     ref = ("editar", kit_id) if kit_id else ("novo", None)
@@ -283,11 +285,13 @@ def _secao_receitas():
     n = ss.get("kits_novo_n", 0)  # entra nas keys: limpa os campos depois de criar um kit
 
     codigo_txt = descricao = desc_site = ""
+    arquivo_foto = None
     if not kit_id:
         c_cod, c_desc = st.columns([1, 3])
         codigo_txt = c_cod.text_input("Código do kit *", placeholder="Ex.: 90001", key=f"kits_novo_codigo_{n}")
         descricao = c_desc.text_input("Descrição *", placeholder="Ex.: Kit Natal Colar + Bola", key=f"kits_novo_desc_{n}")
         desc_site = st.text_input("Descrição do site (opcional)", key=f"kits_novo_site_{n}")
+        arquivo_foto = campo_foto(f"kits_novo_foto_{n}", rotulo="Foto do kit (opcional)")
         st.caption("Use um código que ainda não exista. Códigos numéricos ganham zeros à esquerda (7 dígitos).")
 
     st.markdown("**Componentes do kit**")
@@ -392,14 +396,35 @@ def _secao_receitas():
         st.error(f"Não foi possível criar o kit: {e}")
         return
 
+    erro_foto = salvar_foto(supabase, novo["id"], codigo, arquivo_foto)
     _limpar_cache_busca()
-    ss[CHAVE_MSG_OK] = (
-        f"Kit {codigo} criado. Monte o primeiro lote na seção Montar; "
-        "a foto pode ser enviada em Produtos (✏️ da linha)."
-    )
+    if arquivo_foto is None:
+        sobre_foto = "a foto pode ser enviada depois em Editar receita ou em Produtos (📦 da linha)."
+    elif erro_foto:
+        sobre_foto = f"a foto NÃO foi enviada ({erro_foto}); tente de novo em Editar receita."
+    else:
+        sobre_foto = "foto enviada."
+    ss[CHAVE_MSG_OK] = f"Kit {codigo} criado. Monte o primeiro lote na seção Montar; {sobre_foto}"
     ss["kits_novo_n"] = n + 1
     ss.pop(CHAVE_RASCUNHO_REF, None)
     st.rerun()
+
+
+def _foto_kit_existente(kit: dict) -> None:
+    """Foto do kit em edição: mostra a atual e permite trocar sem mexer na receita."""
+    with st.expander("📷 Foto do kit", expanded=not kit.get("foto_url")):
+        arquivo = campo_foto(f"kits_foto_{kit['id']}", kit.get("foto_url"), "Foto do kit")
+        if st.button(
+            "📷 Salvar foto", disabled=arquivo is None, key=f"kits_foto_salvar_{kit['id']}",
+        ):
+            with st.spinner("Enviando a foto..."):
+                erro = salvar_foto(supabase, kit["id"], kit["codigo_interno"], arquivo)
+            if erro:
+                st.error(f"Não foi possível enviar a foto: {erro}")
+                return
+            _limpar_cache_busca()
+            st.session_state[CHAVE_MSG_OK] = f"Foto do kit {kit['codigo_interno']} atualizada."
+            st.rerun()
 
 
 # ----------------------------------------------------------------------
