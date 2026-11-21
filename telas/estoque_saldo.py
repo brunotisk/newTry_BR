@@ -1043,11 +1043,11 @@ def render_estoque_saldo():
 
 
 def tela_estoque_saldo():
-    """Página principal de Estoque. Mantém as três visões como abas internas."""
+    """Página principal de Estoque. Mantém as visões como abas internas."""
     st.header("📊 Controle de Estoque")
 
-    aba_atual, aba_mov, aba_ajuste, aba_retirada = st.tabs(
-        ["Estoque atual", "Movimentações", "Ajuste manual", "Retiradas pessoais"]
+    aba_atual, aba_mov, aba_ajuste, aba_retirada, aba_kits = st.tabs(
+        ["Estoque atual", "Movimentações", "Ajuste manual", "Retiradas pessoais", "Kits"]
     )
 
     with aba_atual:
@@ -1064,3 +1064,7 @@ def tela_estoque_saldo():
     with aba_retirada:
         from telas.estoque_retirada import tela_estoque_retirada
         tela_estoque_retirada()
+
+    with aba_kits:
+        from telas.estoque_kits import tela_estoque_kits
+        tela_estoque_kits()

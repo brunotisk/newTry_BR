@@ -1,35 +1,22 @@
+from datetime import date
+
 import streamlit as st
 from db import supabase
 from telas.cadastros_gerais import tela_categorias
 from componentes.paginacao import render_paginacao, get_itens_por_pagina, reset_paginacao
 from componentes.busca_produto import busca_produto
-from servicos.vendas_import import normalizar_codigo_interno
+from servicos.produtos_manual import (
+    cadastrar_produto_manual,
+    atualizar_estoque_e_precos,
+    preco_venda_sugerido,
+)
 
 # Compatibilidade com versões do Streamlit que usam experimental_dialog.
 _dialog = getattr(st, "dialog", None) or st.experimental_dialog
 
-TIPOS_FOTO = ["jpg", "jpeg", "png", "webp", "bmp", "tif", "tiff"]
 
-
-def _flash(tipo: str, msg: str) -> None:
-    """Mensagem que sobrevive ao st.rerun()."""
-    st.session_state["produtos_flash"] = (tipo, msg)
-
-
-def _mostrar_flash() -> None:
-    flash = st.session_state.pop("produtos_flash", None)
-    if flash:
-        getattr(st, flash[0], st.info)(flash[1])
-
-
-def _enviar_foto(produto_id, codigo, arquivo) -> str:
-    """Sobe a foto ao Storage (JPEG até 1200 px) e grava produtos.foto_url. Devolve a URL."""
-    from servicos.busca_fotos_produtos import enviar_foto_do_produto
-    return enviar_foto_do_produto(supabase, produto_id, str(codigo), arquivo.getvalue())
-
-
-def _limpar_caches() -> None:
-    _produtos_busca_cache.clear()
+def _fmt_moeda(v) -> str:
+    return "R$ " + f"{float(v or 0):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
 def _carregar_produtos_para_busca():
@@ -65,82 +52,108 @@ def _produtos_busca_cache():
     return _carregar_produtos_para_busca()
 
 
-@_dialog("➕ Novo produto", width="large")
-def _dialog_novo_produto(cat_dict: dict):
-    c_cod, c_desc = st.columns([1, 3])
-    codigo_txt = c_cod.text_input("Código interno *", placeholder="Ex.: 11389", key="np_codigo")
-    descricao = c_desc.text_input("Descrição *", key="np_descricao")
+@_dialog("📦 Produto", width="large")
+def _dialog_produto(produto=None):
+    """Popup único: cadastra um produto novo ou edita estoque e preços de um existente."""
+    novo = produto is None
+    sufixo = "novo" if novo else str(produto["id"])
 
-    desc_site = st.text_input("Descrição do site (opcional)", key="np_desc_site")
+    # Valores atuais (edição)
+    saldo_atual, compra_atual, venda_atual = 0.0, 0.0, 0.0
+    if not novo:
+        linha = (
+            supabase.table("estoque")
+            .select("quantidade_atual, estoque_preco_ultima_compra, estoque_preco_venda_sugerida")
+            .eq("produto_id", produto["id"])
+            .execute()
+            .data
+            or [{}]
+        )[0]
+        saldo_atual = float(linha.get("quantidade_atual") or 0)
+        compra_atual = float(linha.get("estoque_preco_ultima_compra") or 0)
+        venda_atual = float(linha.get("estoque_preco_venda_sugerida") or 0)
 
-    c_ncm, c_un, c_cat = st.columns([1, 1, 2])
-    ncm = c_ncm.text_input("NCM (opcional)", key="np_ncm")
-    unidade = c_un.text_input("Unidade", value="UN", key="np_unidade")
-    cat_ids = list(cat_dict.keys())
-    categoria_id = c_cat.selectbox(
-        "Categoria | Banho (opcional)",
-        options=cat_ids,
-        index=None,
-        placeholder="Sem categoria",
-        format_func=lambda cid: cat_dict[cid]["rotulo_dropdown"],
-        key="np_categoria",
-    )
+    st.caption("Novo produto" if novo else f"{produto['codigo_interno']} — {produto.get('descricao') or ''}")
 
-    foto = st.file_uploader(
-        "Foto do produto (opcional)", type=TIPOS_FOTO, key="np_foto",
-        help="Convertida para JPEG (máx. 1200 px) e enviada ao bucket público.",
-    )
-    if foto is not None:
-        st.image(foto, width=140)
-
-    if not st.button("💾 Salvar produto", type="primary", use_container_width=True, key="np_salvar"):
-        return
-
-    codigo = normalizar_codigo_interno(codigo_txt)
-    descricao = descricao.strip()
-    if not codigo:
-        st.error("Informe o código interno.")
-        return
-    if not descricao:
-        st.error("Informe a descrição.")
-        return
-
-    try:
-        existente = (
-            supabase.table("produtos").select("id, descricao")
-            .eq("codigo_interno", codigo).limit(1).execute().data or []
+    categoria_id = None
+    unidade = ""
+    codigo = descricao = ""
+    if novo:
+        cats = (
+            supabase.table("categorias_produtos")
+            .select("id, categoria, banho")
+            .eq("ativo", True)
+            .order("ordem_exibicao")
+            .execute()
+            .data
+            or []
         )
-        if existente:
-            st.error(f"Já existe o produto {codigo} — {existente[0].get('descricao')}.")
-            return
+        rotulos = {c["id"]: f"{c['categoria']} | {c.get('banho') or '-'}" for c in cats}
+        c1, c2 = st.columns([1, 2])
+        codigo = c1.text_input("Código interno *", key=f"p_cod_{sufixo}")
+        descricao = c2.text_input("Descrição *", key=f"p_desc_{sufixo}")
+        c3, c4 = st.columns([2, 1])
+        categoria_id = c3.selectbox(
+            "Categoria | Banho (opcional)",
+            list(rotulos),
+            index=None,
+            format_func=lambda i: rotulos[i],
+            placeholder="Selecione...",
+            key=f"p_cat_{sufixo}",
+        )
+        unidade = c4.text_input("Unidade (opcional)", value="UN", key=f"p_un_{sufixo}")
 
-        criado = supabase.table("produtos").insert({
-            "codigo_interno": codigo,
-            "descricao": descricao,
-            "produto_descricao_site": desc_site.strip() or None,
-            "ncm": ncm.strip() or None,
-            "unidade": unidade.strip() or None,
-            "categoria_id": categoria_id,
-            "nr_compras": 0,
-        }).execute().data
-        produto_id = criado[0]["id"]
-    except Exception as e:
-        st.error(f"Erro ao cadastrar o produto: {e}")
-        return
+    c1, c2, c3 = st.columns(3)
+    quantidade = c1.number_input(
+        "Quantidade em estoque" if novo else "Quantidade em estoque (novo saldo)",
+        min_value=0.0, step=1.0, value=saldo_atual, format="%g", key=f"p_qtd_{sufixo}",
+    )
+    preco_compra = c2.number_input(
+        "Valor de compra (R$)", min_value=0.0, step=0.01, value=compra_atual,
+        format="%.2f", key=f"p_compra_{sufixo}",
+    )
+    preco_venda = c3.number_input(
+        "Valor de venda (R$)", min_value=0.0, step=0.01, value=venda_atual,
+        format="%.2f", key=f"p_venda_{sufixo}",
+        help="Deixe 0 para usar o sugerido (2× o valor de compra).",
+    )
+    sug = preco_venda_sugerido(preco_compra)
+    if not preco_venda and sug:
+        st.caption(f"Valor de venda sugerido (2× compra): **{_fmt_moeda(sug)}** — será usado ao salvar.")
 
-    _limpar_caches()
+    c4, c5 = st.columns([1, 3])
+    data_mov = c4.date_input("Data do movimento", value=date.today(), format="DD/MM/YYYY", key=f"p_data_{sufixo}")
+    motivo = ""
+    if not novo:
+        motivo = c5.text_input(
+            "Motivo (opcional)", key=f"p_motivo_{sufixo}",
+            placeholder="Ex.: contagem física, produto sem NF...",
+        )
 
-    if foto is not None:
+    if not novo and quantidade != saldo_atual:
+        st.info(f"Será registrado um ajuste de {quantidade - saldo_atual:+g} (saldo {saldo_atual:g} → {quantidade:g}).")
+
+    if st.button("💾 Salvar", type="primary", use_container_width=True, key=f"p_salvar_{sufixo}"):
         try:
-            _enviar_foto(produto_id, codigo, foto)
-        except Exception as e:
-            # O produto já foi criado; só a foto falhou.
-            _flash("warning", f"Produto {codigo} cadastrado, mas a foto não foi enviada: {e}")
+            if novo:
+                cadastrar_produto_manual(
+                    supabase, codigo, descricao, data_mov.isoformat(),
+                    categoria_id=categoria_id, unidade=unidade, quantidade=quantidade,
+                    preco_compra=preco_compra or None, preco_venda=preco_venda or None,
+                )
+                st.toast("Produto cadastrado!", icon="✅")
+            else:
+                atualizar_estoque_e_precos(
+                    supabase, produto["id"], quantidade, data_mov.isoformat(),
+                    preco_compra or None, preco_venda or None, motivo,
+                )
+                st.toast("Estoque e preços atualizados!", icon="✅")
+            _produtos_busca_cache.clear()
             st.rerun()
-            return
-
-    _flash("success", f"Produto {codigo} cadastrado com sucesso.")
-    st.rerun()
+        except ValueError as e:
+            st.error(str(e))
+        except Exception as e:
+            st.error(f"Erro ao salvar: {e}")
 
 
 def _secao_consulta():
@@ -333,8 +346,9 @@ def _secao_consulta():
         )
 
         # 4. Tabela dentro de Container
+        larguras = [1, 2, 1, 3, 2, 2, 2, 1, 1.6]
         with st.container(border=True):
-            c_id, c_cod, c_foto, c_desc, c_cat, c_banho, c_ult_compra, c_nr_compra, c_acao = st.columns([1, 2, 1, 3, 2, 2, 2, 1, 1])
+            c_id, c_cod, c_foto, c_desc, c_cat, c_banho, c_ult_compra, c_nr_compra, c_acao = st.columns(larguras)
 
             c_id.markdown("**id**")
             c_cod.markdown("**codigo_interno**")
@@ -349,7 +363,7 @@ def _secao_consulta():
             st.divider()
 
             for prod in produtos:
-                col_id, col_cod, col_foto, col_desc, col_cat, col_banho, col_ult_compra, col_nr_compra, col_acao = st.columns([1, 2, 1, 3, 2, 2, 2, 1, 1])
+                col_id, col_cod, col_foto, col_desc, col_cat, col_banho, col_ult_compra, col_nr_compra, col_acao = st.columns(larguras)
 
                 col_id.write(prod["id"])
                 col_cod.write(prod.get("codigo_interno", "-"))
@@ -380,8 +394,9 @@ def _secao_consulta():
                 col_ult_compra.write(str(prod.get("ultima_compra")) if prod.get("ultima_compra") else "-")
                 col_nr_compra.write(str(prod.get("nr_compras", 0)))
 
-                with col_acao.popover("✏️"):
-                    if cat_ids:
+                col_pop, col_est = col_acao.columns(2)
+                if cat_ids:
+                    with col_pop.popover("✏️"):
                         st.markdown("**Vincular Categoria**")
                         st.caption(f"Produto ID: {prod['id']}")
 
@@ -395,31 +410,18 @@ def _secao_consulta():
                             key=f"select_cat_{prod['id']}"
                         )
 
-                        if st.button("💾 Salvar categoria", key=f"btn_save_{prod['id']}", use_container_width=True):
+                        if st.button("💾 Salvar", key=f"btn_save_{prod['id']}", use_container_width=True):
                             try:
                                 supabase.table("produtos").update({"categoria_id": nova_cat_id}).eq("id", prod["id"]).execute()
                                 st.toast("Categoria atualizada com sucesso!", icon="✅")
                                 st.rerun()
                             except Exception as err:
                                 st.error(f"Erro ao salvar: {err}")
-                        st.divider()
+                else:
+                    col_pop.caption("-")
 
-                    st.markdown("**Foto do produto**")
-                    nova_foto = st.file_uploader(
-                        "Selecionar foto", type=TIPOS_FOTO, key=f"foto_up_{prod['id']}",
-                    )
-                    if st.button(
-                        "📷 Enviar foto", key=f"btn_foto_{prod['id']}",
-                        use_container_width=True, disabled=nova_foto is None,
-                    ):
-                        try:
-                            with st.spinner("Enviando..."):
-                                _enviar_foto(prod["id"], prod.get("codigo_interno"), nova_foto)
-                            _limpar_caches()
-                            st.toast("Foto atualizada!", icon="✅")
-                            st.rerun()
-                        except Exception as err:
-                            st.error(f"Erro ao enviar a foto: {err}")
+                if col_est.button("📦", key=f"btn_estoque_{prod['id']}", help="Editar estoque e preços"):
+                    _dialog_produto(prod)
 
         # 5. Paginação reutilizável
         render_paginacao(
@@ -443,23 +445,10 @@ def tela_produtos():
     except Exception:
         total_itens = 0
 
-    col_titulo, col_novo = st.columns([5, 1.3], vertical_alignment="center")
-    col_titulo.header(f"📦 Produtos ({total_itens} Itens)")
-    if col_novo.button("➕ Novo produto", type="primary", use_container_width=True, key="produtos_btn_novo"):
-        try:
-            cats = (
-                supabase.table("categorias_produtos")
-                .select("id, categoria, banho, ordem_exibicao")
-                .order("ordem_exibicao").execute().data or []
-            )
-        except Exception:
-            cats = []
-        _dialog_novo_produto({
-            c["id"]: {"rotulo_dropdown": f"{c['categoria']} | {c.get('banho') or '-'}"}
-            for c in cats
-        })
+    st.header(f"📦 Produtos ({total_itens} Itens)")
 
-    _mostrar_flash()
+    if st.button("➕ Novo produto", key="produtos_btn_novo"):
+        _dialog_produto(None)
 
     aba_consulta, aba_categorias = st.tabs(["Consulta Produto", "Cadastrar categorias"])
 
